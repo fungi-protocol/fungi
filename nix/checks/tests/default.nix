@@ -15,8 +15,8 @@
           // {
             inherit cargoArtifacts;
             CARGO_PROFILE = profile;
-            cargoNextestExtraArgs = "--user-config-file ${./nextest-record.toml}";
-            nativeBuildInputs = [ pkgs.unzip ];
+            cargoNextestExtraArgs = "--all-features --user-config-file ${./nextest-record.toml}";
+            nativeBuildInputs = cargoWorkspace.commonArgs.nativeBuildInputs ++ [ pkgs.unzip ];
             preCheck = ''
               export NEXTEST_STATE_DIR="$TMPDIR/nextest-state"
               mkdir -p "$NEXTEST_STATE_DIR"

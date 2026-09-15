@@ -1,0 +1,31 @@
+[package]
+name = "fungi-transport-capnp"
+description = "Cap'n Proto RPC bridge for Fungi message channels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+capnp = "0.21"
+capnp-rpc = "0.21"
+fungi-transport = { path = "../transport" }
+futures-util = "0.3"
+thiserror = "2"
+tokio = { version = "1", features = [
+  "io-util",
+  "macros",
+  "rt",
+  "sync",
+  "time",
+] }
+tokio-util = { version = "0.7", features = ["compat"] }
+
+[build-dependencies]
+capnpc = "0.21"
+
+[dev-dependencies]
+fungi-transport-testkit = { path = "../transport-testkit" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true
