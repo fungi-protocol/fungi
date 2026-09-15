@@ -3,7 +3,42 @@
 //! What it costs, in satoshis, to put something in a block. Everything here falls out of
 //! consensus rules and the feerate.
 
-use bitcoin::{Amount, FeeRate, TxOut};
+use bitcoin::{Amount, FeeRate, SignedAmount, TxOut, Weight, transaction::InputWeightPrediction};
+
+use crate::wallet::Utxo;
+
+/// The non-witness fields every input carries: a 36 byte outpoint and a 4 byte nsequence.
+/// [`InputWeightPrediction`] covers only the parts that depend on how the coin is spent. i.e what witness data is needed.
+const OUTPOINT_AND_SEQUENCE: Weight = Weight::from_vb_unchecked(40);
+
+impl Utxo {
+    /// Weight an input spending this coin adds, witness included.
+    ///
+    /// `None` for anything whose spend size depends on a policy we don't have: P2WSH,
+    /// legacy, script path taproot.
+    fn input_weight(&self) -> Option<Weight> {
+        let spend = if self.prev_out.script_pubkey.is_p2tr() {
+            InputWeightPrediction::P2TR_KEY_DEFAULT_SIGHASH
+        } else if self.prev_out.script_pubkey.is_p2wpkh() {
+            InputWeightPrediction::P2WPKH_MAX
+        } else if self.prev_out.script_pubkey.is_p2pk() {
+            InputWeightPrediction::P2PKH_COMPRESSED_MAX
+        } else {
+            return None;
+        };
+
+        Some(spend.weight() + OUTPOINT_AND_SEQUENCE)
+    }
+
+    /// Value minus the blockspace needed to spend it, which is the number coin selection
+    /// adds up.
+    ///
+    /// Negative means the coin costs more to spend than it carries. Dust at a given feerate.
+    pub fn effective_value(&self, feerate: FeeRate) -> Option<SignedAmount> {
+        let spend_cost = feerate.fee_wu(self.input_weight()?)?;
+        Some(self.prev_out.value.to_signed().ok()? - spend_cost.to_signed().ok()?)
+    }
+}
 
 /// Blockspace accounting for an output the wallet is considering creating.
 pub trait EffectiveCost {
@@ -24,15 +59,36 @@ impl EffectiveCost for TxOut {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitcoin::{ScriptBuf, Weight};
+    use bitcoin::{OutPoint, ScriptBuf, Txid, WPubkeyHash, hashes::Hash};
 
-    fn p2tr_txout(sats: u64) -> TxOut {
+    fn p2tr_spk() -> ScriptBuf {
         let mut spk = vec![0x51, 0x20]; // OP_1 PUSH32
         spk.extend_from_slice(&[0xab; 32]);
+        ScriptBuf::from_bytes(spk)
+    }
 
+    fn p2pk_spk() -> ScriptBuf {
+        let key = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+            .parse()
+            .expect("a valid compressed public key");
+
+        ScriptBuf::new_p2pk(&key)
+    }
+
+    fn utxo_with(script_pubkey: ScriptBuf, sats: u64) -> Utxo {
+        Utxo {
+            outpoint: OutPoint::new(Txid::all_zeros(), 0),
+            prev_out: TxOut {
+                value: Amount::from_sat(sats),
+                script_pubkey,
+            },
+        }
+    }
+
+    fn p2tr_txout(sats: u64) -> TxOut {
         TxOut {
             value: Amount::from_sat(sats),
-            script_pubkey: ScriptBuf::from_bytes(spk),
+            script_pubkey: p2tr_spk(),
         }
     }
 
@@ -56,6 +112,87 @@ mod tests {
     #[test]
     fn an_output_priced_past_the_money_supply_has_no_cost() {
         assert!(p2tr_txout(30_000).effective_cost(FeeRate::MAX).is_none());
+    }
+
+    #[test]
+    fn a_taproot_coin_is_worth_its_value_less_the_spend() {
+        let coin = utxo_with(p2tr_spk(), 100_000);
+
+        // 40 vB outpoint and sequence, plus 70 WU for the scriptSig length and a default
+        // sighash key path signature: 230 WU, or 57.5 vB.
+        assert_eq!(coin.input_weight().unwrap(), Weight::from_wu(230));
+
+        // At 10 sat/vB that spend costs 575 sat.
+        let feerate = FeeRate::from_sat_per_vb(10).unwrap();
+        assert_eq!(
+            coin.effective_value(feerate).unwrap(),
+            SignedAmount::from_sat(99_425)
+        );
+    }
+
+    #[test]
+    fn a_segwit_v0_coin_pays_for_a_bigger_witness() {
+        let coin = utxo_with(
+            ScriptBuf::new_p2wpkh(&WPubkeyHash::from_byte_array([0xcd; 20])),
+            100_000,
+        );
+
+        // The same 40 vB, plus 112 WU for a DER signature and a compressed key.
+        assert_eq!(coin.input_weight().unwrap(), Weight::from_wu(272));
+    }
+
+    /// A bare pubkey spend is a signature in the scriptSig, which is what the P2PKH
+    /// prediction covers too. It overcharges by the 34 byte key P2PKH also pushes.
+    #[test]
+    fn a_bare_pubkey_coin_is_priced_as_a_legacy_spend() {
+        let coin = utxo_with(p2pk_spk(), 100_000);
+
+        // The same 40 vB, plus 432 WU for a scriptSig carrying a signature and a key.
+        assert_eq!(coin.input_weight().unwrap(), Weight::from_wu(592));
+    }
+
+    /// A coin worth less than its own input is dust: spending it loses money.
+    #[test]
+    fn dust_has_negative_effective_value() {
+        let coin = utxo_with(p2tr_spk(), 400);
+        let feerate = FeeRate::from_sat_per_vb(10).unwrap();
+
+        assert_eq!(
+            coin.effective_value(feerate).unwrap(),
+            SignedAmount::from_sat(-175)
+        );
+    }
+
+    /// Script types whose spend size depends on a policy we don't have.
+    #[test]
+    fn a_coin_we_cannot_price_the_spend_of_has_no_effective_value() {
+        let coin = utxo_with(ScriptBuf::new(), 100_000);
+
+        assert!(coin.input_weight().is_none());
+        assert!(
+            coin.effective_value(FeeRate::from_sat_per_vb(10).unwrap())
+                .is_none()
+        );
+    }
+
+    /// A coin's effective value and an output's effective cost have to agree, or coin
+    /// selection cannot balance anything: paying a coin straight through to an identical
+    /// output leaves exactly the transaction overhead unfunded.
+    #[test]
+    fn effective_value_and_cost_are_mirrors() {
+        let feerate = FeeRate::from_sat_per_vb(10).unwrap();
+        let coin = utxo_with(p2tr_spk(), 100_000);
+        let payment = p2tr_txout(100_000);
+
+        let have = coin.effective_value(feerate).unwrap();
+        let need = payment
+            .effective_cost(feerate)
+            .unwrap()
+            .to_signed()
+            .unwrap();
+
+        // Short by the input's 575 sat and the output's 430 sat.
+        assert_eq!(need - have, SignedAmount::from_sat(1_005));
     }
 
     mod prop_tests {
