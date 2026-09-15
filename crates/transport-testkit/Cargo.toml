@@ -1,6 +1,6 @@
 [package]
 name = "fungi-transport-testkit"
-description = "Reusable transport conformance checks for Fungi"
+description = "In-memory transport and reusable conformance checks for Fungi"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,11 +8,16 @@ license.workspace = true
 [dependencies]
 fungi-transport = { path = "../transport" }
 futures-util = { version = "0.3", default-features = false }
+thiserror = "2"
 tokio = { version = "1", features = ["macros", "sync", "time"] }
 
 [dev-dependencies]
-thiserror = "2"
+futures-util = "0.3"
 tokio = { version = "1", features = ["macros", "rt", "test-util"] }
+
+[[example]]
+name = "offline-peers"
+test = true
 
 [lints]
 workspace = true
