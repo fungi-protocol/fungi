@@ -1,5 +1,5 @@
 use crate::channel::{CapnpChannel, CapnpDuplex};
-use crate::client::{Bootstrap, BuildCommand, Link, new_link, runtime, start_client};
+use crate::client::{Bootstrap, BuildCommand, Link, new_link, run_client, runtime, start_client};
 use crate::error::BuildError;
 use fungi_transport::{ChannelBuilder, Unspecified};
 use std::io;
@@ -46,6 +46,54 @@ impl CapnpBuilder {
         self.max_recv_message_len = max;
     }
 
+    /// Spawn a builder server process speaking RPC on stdin/stdout.
+    ///
+    /// Dropping the last handle schedules termination and reaping. Startup errors
+    /// are returned before a handle is exposed. `max_message_len` limits outgoing
+    /// payloads on created channels.
+    pub fn spawn(mut command: tokio::process::Command, max_message_len: usize) -> io::Result<Self> {
+        let (link, lifetime) = new_link(max_message_len);
+        let (commands, receiver) = mpsc::channel(1);
+        let boot = Bootstrap::Builder(receiver, Arc::downgrade(&link));
+        let (ready, started) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("capnp-client".into())
+            .spawn(move || {
+                let mut setup = || -> io::Result<_> {
+                    let runtime = runtime()?;
+                    let entered = runtime.enter();
+                    let child = command
+                        .stdin(std::process::Stdio::piped())
+                        .stdout(std::process::Stdio::piped())
+                        .kill_on_drop(true)
+                        .spawn();
+                    drop(entered);
+                    Ok((runtime, child?))
+                };
+                match setup() {
+                    Ok((runtime, mut child)) => {
+                        let reader = child.stdout.take().unwrap();
+                        let writer = child.stdin.take().unwrap();
+                        let _ = ready.send(Ok(()));
+                        let local = tokio::task::LocalSet::new();
+                        local.block_on(&runtime, async move {
+                            run_client(reader, writer, boot, lifetime).await;
+                            reap_child(&mut child).await;
+                        });
+                    }
+                    Err(error) => {
+                        let _ = ready.send(Err(error));
+                    }
+                }
+            })?;
+        started.recv().map_err(io::Error::other)??;
+        Ok(Self {
+            commands,
+            _link: link,
+            max_recv_message_len: usize::MAX,
+        })
+    }
+
     /// Treat this remote builder as an inbound builder with unit input.
     pub fn into_acceptor(self) -> CapnpAcceptor {
         CapnpAcceptor(self)
@@ -82,5 +130,15 @@ impl ChannelBuilder for CapnpAcceptor {
     type BuildError = BuildError;
     async fn build(&mut self, _: &()) -> Result<CapnpDuplex, BuildError> {
         self.0.build(&Vec::new()).await
+    }
+}
+
+pub(super) async fn reap_child(child: &mut tokio::process::Child) {
+    if tokio::time::timeout(std::time::Duration::from_millis(100), child.wait())
+        .await
+        .is_err()
+    {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
     }
 }

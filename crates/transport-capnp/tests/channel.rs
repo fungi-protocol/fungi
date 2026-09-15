@@ -453,6 +453,53 @@ async fn builders_reconnect_and_keep_channels_alive_after_builder_drop() {
     stopped(vec![first, second]).await;
 }
 
+#[cfg(feature = "test-utils")]
+#[tokio::test(flavor = "multi_thread")]
+async fn subprocess_supports_concurrent_channels_and_reports_crashes() {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("child.pid");
+    let mut command = tokio::process::Command::new("sh");
+    command
+        .args(["-c", "echo $$ > \"$1\"; exec \"$2\"", "capnp-test"])
+        .arg(&pid_file)
+        .arg(env!("CARGO_BIN_EXE_capnp-echo"));
+    let mut builder = CapnpBuilder::spawn(command, MAX).unwrap();
+    builder.set_max_recv_message_len(6);
+    let pid = read_pid(&pid_file).await;
+    let mut blocked = tokio::time::timeout(Duration::from_secs(30), builder.build(&Vec::new()))
+        .await
+        .expect("RPC subprocess initialization timed out")
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(5), blocked.recv())
+            .await
+            .is_err()
+    );
+    let mut active = deadline(builder.build(&Vec::new())).await.unwrap();
+    drop(builder);
+    deadline(async {
+        active.send(vec![0; 7]).await.unwrap();
+        assert!(matches!(
+            active.recv().await,
+            Err(RecvError::TooLarge { max: 6 })
+        ));
+        active.send(b"echo".to_vec()).await.unwrap();
+        assert_eq!(active.recv().await.unwrap(), b"echo");
+        blocked.send(b"resume".to_vec()).await.unwrap();
+        assert_eq!(blocked.recv().await.unwrap(), b"resume");
+    })
+    .await;
+    assert!(process_exists(pid));
+    drop((active, blocked));
+    reaped(pid).await;
+    dir.close().unwrap();
+    assert!(
+        CapnpBuilder::spawn(tokio::process::Command::new("/no/such/capnp-plugin"), MAX).is_err()
+    );
+    let mut crashed = CapnpBuilder::spawn(tokio::process::Command::new("false"), MAX).unwrap();
+    assert!(deadline(crashed.build(&Vec::new())).await.is_err());
+}
+
 #[derive(Debug)]
 struct RejectBuilder;
 impl ChannelBuilder for RejectBuilder {
@@ -553,6 +600,22 @@ async fn receive_backend_error_closes_both_directions_with_diagnostics() {
     ));
     drop(channel);
     stopped(vec![server]).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dropping_the_last_handle_kills_and_reaps_an_unresponsive_plugin() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("child.pid");
+    let mut command = tokio::process::Command::new("sh");
+    command
+        .args(["-c", "echo $$ > \"$1\"; exec sleep 60", "capnp-test"])
+        .arg(&path);
+    let builder = CapnpBuilder::spawn(command, MAX).unwrap();
+    let pid = read_pid(&path).await;
+    assert!(process_exists(pid));
+    drop(builder);
+    reaped(pid).await;
+    dir.close().unwrap();
 }
 
 #[derive(Debug)]
@@ -725,6 +788,56 @@ async fn canceled_builds_are_bounded_and_mass_drops_release_backends() {
     .await;
     drop(builder);
     stopped(vec![server]).await;
+}
+
+async fn read_pid(path: &std::path::Path) -> std::num::NonZeroU32 {
+    deadline(async {
+        loop {
+            if let Ok(record) = std::fs::read_to_string(path)
+                && let Some(pid) = record.strip_suffix('\n')
+                && let Ok(pid) = pid.parse()
+            {
+                break pid;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+}
+fn process_exists(pid: std::num::NonZeroU32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+async fn reaped(pid: std::num::NonZeroU32) {
+    deadline(async {
+        while process_exists(pid) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn pid_reader_waits_for_a_complete_positive_pid() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("child.pid");
+    for incomplete in ["", "123", "0\n", "invalid\n"] {
+        std::fs::write(&path, incomplete).unwrap();
+        let reading = read_pid(&path);
+        tokio::pin!(reading);
+        std::future::poll_fn(|cx| {
+            assert!(reading.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        std::fs::write(&path, "123\n").unwrap();
+        assert_eq!(reading.await.get(), 123);
+    }
+    dir.close().unwrap();
 }
 
 impl PeerChannel for LimitedSend {
