@@ -392,6 +392,45 @@ async fn builders_reconnect_and_keep_channels_alive_after_builder_drop() {
     stopped(vec![first, second]).await;
 }
 
+#[cfg(feature = "test-utils")]
+#[tokio::test(flavor = "multi_thread")]
+async fn subprocess_supports_concurrent_channels_and_reports_crashes() {
+    let pid_file = pid_path();
+    let mut command = tokio::process::Command::new("sh");
+    command
+        .args(["-c", "echo $$ > \"$1\"; exec \"$2\"", "capnp-test"])
+        .arg(&pid_file)
+        .arg(env!("CARGO_BIN_EXE_capnp-echo"));
+    let mut builder = CapnpBuilder::spawn(command, MAX).unwrap();
+    let pid = read_pid(&pid_file).await;
+    let mut blocked = tokio::time::timeout(Duration::from_secs(30), builder.build(&Vec::new()))
+        .await
+        .expect("RPC subprocess initialization timed out")
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(5), blocked.recv())
+            .await
+            .is_err()
+    );
+    let mut active = deadline(builder.build(&Vec::new())).await.unwrap();
+    drop(builder);
+    deadline(async {
+        active.send(b"echo".to_vec()).await.unwrap();
+        assert_eq!(active.recv().await.unwrap(), b"echo");
+        blocked.send(b"resume".to_vec()).await.unwrap();
+        assert_eq!(blocked.recv().await.unwrap(), b"resume");
+    })
+    .await;
+    drop((active, blocked));
+    reaped(&pid).await;
+    std::fs::remove_file(pid_file).unwrap();
+    assert!(
+        CapnpBuilder::spawn(tokio::process::Command::new("/no/such/capnp-plugin"), MAX).is_err()
+    );
+    let mut crashed = CapnpBuilder::spawn(tokio::process::Command::new("false"), MAX).unwrap();
+    assert!(deadline(crashed.build(&Vec::new())).await.is_err());
+}
+
 #[derive(Debug)]
 struct RejectBuilder;
 impl ChannelBuilder for RejectBuilder {
@@ -488,6 +527,20 @@ async fn receive_backend_error_terminates_the_stream_with_diagnostics() {
     assert!(deadline(stream.next()).await.is_none());
     drop(stream);
     stopped(vec![server]).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dropping_the_last_handle_kills_and_reaps_an_unresponsive_plugin() {
+    let path = pid_path();
+    let mut command = tokio::process::Command::new("sh");
+    command
+        .args(["-c", "echo $$ > \"$1\"; exec sleep 60", "capnp-test"])
+        .arg(&path);
+    let builder = CapnpBuilder::spawn(command, MAX).unwrap();
+    let pid = read_pid(&path).await;
+    drop(builder);
+    reaped(&pid).await;
+    std::fs::remove_file(path).unwrap();
 }
 
 #[derive(Debug)]
@@ -660,6 +713,42 @@ async fn canceled_builds_are_bounded_and_mass_drops_release_backends() {
     .await;
     drop(builder);
     stopped(vec![server]).await;
+}
+
+fn pid_path() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "capnp-child-{}-{}.pid",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ))
+}
+async fn read_pid(path: &std::path::Path) -> String {
+    deadline(async {
+        loop {
+            if let Ok(pid) = std::fs::read_to_string(path) {
+                break pid.trim().to_owned();
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+}
+async fn reaped(pid: &str) {
+    deadline(async {
+        while std::process::Command::new("kill")
+            .args(["-0", pid])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
 }
 
 impl PeerChannel for LimitedSend {

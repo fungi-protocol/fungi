@@ -315,6 +315,56 @@ impl CapnpBuilder {
         })
     }
 
+    /// Spawn a builder server process speaking RPC on stdin/stdout.
+    ///
+    /// Inherited stderr keeps backend diagnostics visible. Dropping the last
+    /// derived handle schedules asynchronous termination and reaping so handle
+    /// destruction stays immediate. Spawn errors are reported before returning
+    /// a handle so callers can act on process startup failures.
+    /// `max_message_len` sets the maximum outgoing payload size in bytes
+    /// for channels created by this builder.
+    pub fn spawn(mut command: tokio::process::Command, max_message_len: usize) -> io::Result<Self> {
+        let (link, lifetime) = new_link(max_message_len);
+        let (commands, receiver) = mpsc::channel(1);
+        let boot = Bootstrap::Builder(receiver, Arc::downgrade(&link));
+        let (ready, started) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("capnp-client".into())
+            .spawn(move || {
+                let mut setup = || -> io::Result<_> {
+                    let runtime = runtime()?;
+                    let entered = runtime.enter();
+                    let child = command
+                        .stdin(std::process::Stdio::piped())
+                        .stdout(std::process::Stdio::piped())
+                        .kill_on_drop(true)
+                        .spawn();
+                    drop(entered);
+                    Ok((runtime, child?))
+                };
+                match setup() {
+                    Ok((runtime, mut child)) => {
+                        let reader = child.stdout.take().unwrap();
+                        let writer = child.stdin.take().unwrap();
+                        let _ = ready.send(Ok(()));
+                        let local = tokio::task::LocalSet::new();
+                        local.block_on(&runtime, async move {
+                            run_client(reader, writer, boot, lifetime).await;
+                            reap_child(&mut child).await;
+                        });
+                    }
+                    Err(error) => {
+                        let _ = ready.send(Err(error));
+                    }
+                }
+            })?;
+        started.recv().map_err(io::Error::other)??;
+        Ok(Self {
+            commands,
+            _link: link,
+        })
+    }
+
     /// Treat this remote builder as an inbound builder with unit input.
     pub fn into_acceptor(self) -> CapnpAcceptor {
         CapnpAcceptor(self)
@@ -361,6 +411,16 @@ fn new_link(max_message_len: usize) -> (Arc<Link>, mpsc::Receiver<()>) {
         receiver,
     )
 }
+async fn reap_child(child: &mut tokio::process::Child) {
+    if tokio::time::timeout(std::time::Duration::from_millis(100), child.wait())
+        .await
+        .is_err()
+    {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+    }
+}
+
 fn runtime() -> io::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -831,6 +891,37 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn cleanup_reaps_a_process_that_exited_successfully() {
+        let mut child = tokio::process::Command::new("true")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(status.success());
+        reap_child(&mut child).await;
+        assert!(child.id().is_none());
+        assert!(child.wait().await.unwrap().success());
+    }
+
+    #[tokio::test]
+    async fn cleanup_kills_and_reaps_a_process_that_exceeds_the_grace_period() {
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        assert!(child.try_wait().unwrap().is_none());
+        tokio::time::timeout(std::time::Duration::from_secs(5), reap_child(&mut child))
+            .await
+            .unwrap();
+        assert!(child.id().is_none());
+        assert!(!child.wait().await.unwrap().success());
+    }
+
     fn mem_send(_: fungi_transport_testkit::mem::MemError) -> SendError {
         SendError::Closed
     }
