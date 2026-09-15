@@ -1,17 +1,20 @@
-//! Cap'n Proto RPC channels for the Fungi transport contract.
+//! Cap'n Proto RPC channels and builders for the Fungi transport contract.
 //!
 //! A dedicated current-thread executor isolates thread-local RPC capabilities
-//! so client handles and their operation futures can be `Send`. Channels retain the connection for their operations. Dropping the last handle
+//! so client handles and their operation futures can be `Send`. Channels and
+//! builders retain the connection for their operations. Dropping the last handle
 //! schedules asynchronous cleanup so handle destruction stays immediate.
 //! Peer authentication and delivery confirmation belong to the backend protocol.
 
 use std::io;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use capnp::{capability::Promise, data};
 use capnp_rpc::{RpcSystem, rpc_twoparty_capnp::Side, twoparty};
-use fungi_transport::{Channel, PeerChannel, RecvChannel, SendChannel, Unspecified};
+use fungi_transport::{
+    Channel, ChannelBuilder, PeerChannel, RecvChannel, SendChannel, Unspecified,
+};
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
@@ -45,6 +48,17 @@ pub enum RecvError {
     Transport(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
+/// A remote construction or RPC link failure.
+#[derive(Debug, thiserror::Error)]
+pub enum BuildError {
+    /// The RPC link or backend connection is unavailable.
+    #[error("RPC construction path unavailable")]
+    Unreachable,
+    /// An RPC or backend failure, preserving its cause locally.
+    #[error("transport: {0}")]
+    Transport(#[source] Box<dyn std::error::Error + Send + Sync>),
+}
+
 /// Identity of one remote capability within this process.
 #[derive(Debug, Clone)]
 pub struct CapnpPeer(Arc<()>);
@@ -63,9 +77,13 @@ mod channel_capnp {
     #![allow(dead_code, missing_docs, missing_debug_implementations, clippy::all)]
     include!(concat!(env!("OUT_DIR"), "/channel_capnp.rs"));
 }
-use channel_capnp::{channel, recv_failure, result as rpc_result, send_failure};
+use channel_capnp::{
+    build_failure, builder, channel, recv_failure, result as rpc_result, send_failure,
+};
 
+type ChannelSchema = channel::Owned<data::Owned, send_failure::Owned, recv_failure::Owned>;
 type RemoteChannel = channel::Client<data::Owned, send_failure::Owned, recv_failure::Owned>;
+type RemoteBuilder = builder::Client<data::Owned, ChannelSchema, build_failure::Owned>;
 
 type Reply<T> = oneshot::Sender<T>;
 type PendingReceive = Option<oneshot::Receiver<Result<Vec<u8>, RecvError>>>;
@@ -74,6 +92,10 @@ enum ChannelCommand {
     Send(Vec<u8>, Reply<Result<(), SendError>>, OwnedSemaphorePermit),
     Recv(Reply<Result<Vec<u8>, RecvError>>),
 }
+struct BuildCommand {
+    input: Vec<u8>,
+    reply: Reply<Result<CapnpChannel, BuildError>>,
+}
 #[derive(Debug)]
 struct Link {
     _lifetime: mpsc::Sender<()>,
@@ -81,6 +103,7 @@ struct Link {
 }
 enum Bootstrap {
     Channel(mpsc::Receiver<ChannelCommand>),
+    Builder(mpsc::Receiver<BuildCommand>, Weak<Link>),
 }
 
 /// One remote byte channel. Retained receiving state preserves responses across
@@ -262,6 +285,72 @@ impl RecvChannel for CapnpRecvHalf {
         receive_message(&self.commands, &mut self.pending).await
     }
 }
+/// Remote builder accepting opaque byte tokens interpreted by the backend.
+///
+/// Each connection runs one build RPC at a time and queues at most one request.
+/// Dispatched RPCs retain their slot across caller cancellation until completion
+/// or connection closure, keeping outstanding builds bounded. Abandoned queued
+/// requests are discarded to avoid constructing unused channels.
+#[derive(Debug)]
+pub struct CapnpBuilder {
+    commands: mpsc::Sender<BuildCommand>,
+    _link: Arc<Link>,
+}
+impl CapnpBuilder {
+    /// Connect to a builder bootstrap over an owned RPC stream.
+    ///
+    /// `max_message_len` sets the maximum outgoing payload size in bytes
+    /// for channels created by this builder.
+    pub fn connect<Io>(io: Io, max_message_len: usize) -> io::Result<Self>
+    where
+        Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        let (link, lifetime) = new_link(max_message_len);
+        let (commands, receiver) = mpsc::channel(1);
+        let bootstrap = Bootstrap::Builder(receiver, Arc::downgrade(&link));
+        start_client(io, bootstrap, lifetime, runtime)?;
+        Ok(Self {
+            commands,
+            _link: link,
+        })
+    }
+
+    /// Treat this remote builder as an inbound builder with unit input.
+    pub fn into_acceptor(self) -> CapnpAcceptor {
+        CapnpAcceptor(self)
+    }
+}
+impl ChannelBuilder for CapnpBuilder {
+    type Input = Vec<u8>;
+    type Channel = CapnpDuplex;
+    type BuildError = BuildError;
+    async fn build(&mut self, input: &Vec<u8>) -> Result<CapnpDuplex, BuildError> {
+        let (reply, result) = oneshot::channel();
+        self.commands
+            .send(BuildCommand {
+                input: input.clone(),
+                reply,
+            })
+            .await
+            .map_err(|_| BuildError::Unreachable)?;
+        result
+            .await
+            .map_err(|_| BuildError::Unreachable)?
+            .map(CapnpChannel::into_channel)
+    }
+}
+/// Inbound remote builder. Sends an empty token for each acceptance request.
+#[derive(Debug)]
+pub struct CapnpAcceptor(CapnpBuilder);
+impl ChannelBuilder for CapnpAcceptor {
+    type Input = ();
+    type Channel = CapnpDuplex;
+    type BuildError = BuildError;
+    async fn build(&mut self, _: &()) -> Result<CapnpDuplex, BuildError> {
+        self.0.build(&Vec::new()).await
+    }
+}
+
 fn new_link(max_message_len: usize) -> (Arc<Link>, mpsc::Receiver<()>) {
     let (sender, receiver) = mpsc::channel(1);
     (
@@ -319,6 +408,10 @@ where
         Bootstrap::Channel(receiver) => {
             let remote = rpc.bootstrap::<RemoteChannel>(Side::Server);
             tokio::task::spawn_local(channel_actor(remote, receiver));
+        }
+        Bootstrap::Builder(receiver, link) => {
+            let remote = rpc.bootstrap::<RemoteBuilder>(Side::Server);
+            tokio::task::spawn_local(builder_actor(remote, receiver, link));
         }
     }
     tokio::select! { _ = rpc => {}, _ = lifetime.recv() => {} }
@@ -422,6 +515,68 @@ async fn dispatch_channel(remote: RemoteChannel, command: ChannelCommand) {
         }
     }
 }
+async fn builder_actor(
+    remote: RemoteBuilder,
+    mut commands: mpsc::Receiver<BuildCommand>,
+    link: Weak<Link>,
+) {
+    while let Some(command) = commands.recv().await {
+        if !command.reply.is_closed() {
+            dispatch_build(remote.clone(), command, link.clone()).await;
+        }
+    }
+}
+async fn dispatch_build(remote: RemoteBuilder, command: BuildCommand, link: Weak<Link>) {
+    let result = async {
+        let mut request = remote.build_request();
+        request
+            .get()
+            .set_input(command.input.as_slice())
+            .map_err(rpc_build_error)?;
+        let response = request.send().promise.await.map_err(rpc_build_error)?;
+        let result = response
+            .get()
+            .and_then(|r| r.get_result())
+            .map_err(rpc_build_error)?;
+        match result
+            .which()
+            .map_err(capnp::Error::from)
+            .map_err(rpc_build_error)?
+        {
+            rpc_result::Ok(remote) => {
+                let remote = remote.map_err(rpc_build_error)?;
+                let link = link.upgrade().ok_or(BuildError::Unreachable)?;
+                let (commands, receiver) = mpsc::channel(2);
+                tokio::task::spawn_local(channel_actor(remote, receiver));
+                Ok(CapnpChannel {
+                    commands,
+                    send_slot: Arc::new(Semaphore::new(1)),
+                    pending: None,
+                    link,
+                    peer: CapnpPeer(Arc::new(())),
+                })
+            }
+            rpc_result::Err(error) => match error
+                .map_err(rpc_build_error)?
+                .which()
+                .map_err(capnp::Error::from)
+                .map_err(rpc_build_error)?
+            {
+                build_failure::Unreachable(()) => Err(BuildError::Unreachable),
+                build_failure::Failed(error) => Err(BuildError::Transport(
+                    error
+                        .and_then(|t| t.to_str().map_err(Into::into))
+                        .map_err(rpc_build_error)?
+                        .to_owned()
+                        .into(),
+                )),
+            },
+        }
+    }
+    .await;
+    // Failed reply delivery drops the channel to release an abandoned build's actor.
+    let _ = command.reply.send(result);
+}
 fn rpc_send_error(error: capnp::Error) -> SendError {
     if error.kind == capnp::ErrorKind::Disconnected {
         SendError::Closed
@@ -436,6 +591,14 @@ fn rpc_recv_error(error: capnp::Error) -> RecvError {
         RecvError::Transport(error.into())
     }
 }
+fn rpc_build_error(error: capnp::Error) -> BuildError {
+    if error.kind == capnp::ErrorKind::Disconnected {
+        BuildError::Unreachable
+    } else {
+        BuildError::Transport(error.into())
+    }
+}
+
 type QueuedSend = (Vec<u8>, Reply<Result<(), SendError>>);
 type Received = mpsc::Receiver<Result<Vec<u8>, RecvError>>;
 struct ChannelServer {
@@ -536,6 +699,63 @@ impl channel::Server<data::Owned, send_failure::Owned, recv_failure::Owned> for 
         })
     }
 }
+struct BuilderServer<B, D, SE, RE, BE> {
+    backend: Rc<Mutex<B>>,
+    decode: Rc<D>,
+    map_send: Rc<SE>,
+    map_recv: Rc<RE>,
+    map_build: Rc<BE>,
+}
+impl<B, D, S, R, SE, RE, BE> builder::Server<data::Owned, ChannelSchema, build_failure::Owned>
+    for BuilderServer<B, D, SE, RE, BE>
+where
+    B: ChannelBuilder<Channel = Channel<S, R>> + 'static,
+    S: SendChannel + 'static,
+    R: RecvChannel + 'static,
+    SE: Fn(S::SendError) -> SendError + 'static,
+    RE: Fn(R::RecvError) -> RecvError + 'static,
+    BE: Fn(B::BuildError) -> BuildError + 'static,
+    D: Fn(Vec<u8>) -> Result<B::Input, BuildError> + 'static,
+{
+    fn build(
+        &mut self,
+        params: builder::BuildParams<data::Owned, ChannelSchema, build_failure::Owned>,
+        mut results: builder::BuildResults<data::Owned, ChannelSchema, build_failure::Owned>,
+    ) -> Promise<(), capnp::Error> {
+        let input = capnp_rpc::pry!(capnp_rpc::pry!(params.get()).get_input()).to_vec();
+        let input = (self.decode)(input);
+        let backend = self.backend.clone();
+        let map_send = self.map_send.clone();
+        let map_recv = self.map_recv.clone();
+        let map_build = self.map_build.clone();
+        Promise::from_future(async move {
+            let result = match input {
+                Ok(input) => backend
+                    .lock()
+                    .await
+                    .build(&input)
+                    .await
+                    .map_err(|error| map_build(error)),
+                Err(error) => Err(error),
+            };
+            let mut output = results.get().init_result();
+            match result {
+                Ok(channel) => {
+                    let remote = serve_channel(
+                        channel,
+                        move |error| map_send(error),
+                        move |error| map_recv(error),
+                    );
+                    return output.set_ok(remote);
+                }
+                Err(BuildError::Unreachable) => output.init_err().set_unreachable(()),
+                Err(error) => output.init_err().set_failed(error.to_string().as_str()),
+            }
+            Ok(())
+        })
+    }
+}
+
 async fn run_server<Io>(io: Io, bootstrap: capnp::capability::Client) -> Result<(), capnp::Error>
 where
     Io: AsyncRead + AsyncWrite + Unpin + 'static,
@@ -571,6 +791,44 @@ where
 {
     run_server(io, serve_channel(backend, map_send, map_recv).client).await
 }
+/// Serve a builder on the caller's `LocalSet`, decoding opaque input tokens.
+///
+/// The decoder runs synchronously before the backend is borrowed. Backend
+/// channel errors cross the RPC boundary as structured results; diagnostic text
+/// preserves the context of opaque failures across process boundaries.
+/// Error callbacks preserve backend-specific closure and size-limit semantics
+/// when translating failures into the wire protocol.
+/// Receiving stops after its first error; sends continue only after size rejection.
+/// Returns the RPC connection's result, including capnp-rpc's normalization of
+/// some disconnects to successful termination.
+pub async fn serve_builder<B, D, S, R, SE, RE, BE, Io>(
+    backend: B,
+    decode: D,
+    map_send: SE,
+    map_recv: RE,
+    map_build: BE,
+    io: Io,
+) -> Result<(), capnp::Error>
+where
+    B: ChannelBuilder<Channel = Channel<S, R>> + 'static,
+    S: SendChannel + 'static,
+    R: RecvChannel + 'static,
+    SE: Fn(S::SendError) -> SendError + 'static,
+    RE: Fn(R::RecvError) -> RecvError + 'static,
+    BE: Fn(B::BuildError) -> BuildError + 'static,
+    D: Fn(Vec<u8>) -> Result<B::Input, BuildError> + 'static,
+    Io: AsyncRead + AsyncWrite + Unpin + 'static,
+{
+    let bootstrap: RemoteBuilder = capnp_rpc::new_client(BuilderServer {
+        backend: Rc::new(Mutex::new(backend)),
+        decode: Rc::new(decode),
+        map_send: Rc::new(map_send),
+        map_recv: Rc::new(map_recv),
+        map_build: Rc::new(map_build),
+    });
+    run_server(io, bootstrap.client).await
+}
+
 #[cfg(test)]
 mod tests {
     fn mem_send(_: fungi_transport_testkit::mem::MemError) -> SendError {
@@ -578,6 +836,9 @@ mod tests {
     }
     fn mem_recv(_: fungi_transport_testkit::mem::MemError) -> RecvError {
         RecvError::Closed
+    }
+    fn mem_build(_: fungi_transport_testkit::mem::MemError) -> BuildError {
+        BuildError::Unreachable
     }
 
     use super::*;
@@ -715,6 +976,27 @@ mod tests {
                 drained.unwrap();
                 let error = result.unwrap_err();
                 assert_eq!(error.kind, capnp::ErrorKind::Failed);
+
+                let (backend, _listener) =
+                    fungi_transport_testkit::mem::network(MemConfig::default());
+                let (mut peer, io) = tokio::io::duplex(64);
+                peer.write_all(&[1, 2, 3, 4, 0, 0, 0, 0]).await.unwrap();
+                peer.shutdown().await.unwrap();
+                let (result, drained) = futures_util::future::join(
+                    serve_builder(
+                        backend,
+                        |_| Ok(fungi_transport_testkit::mem::MemAddr),
+                        mem_send,
+                        mem_recv,
+                        mem_build,
+                        io,
+                    ),
+                    async { peer.read_to_end(&mut Vec::new()).await },
+                )
+                .await;
+                drained.unwrap();
+                let error = result.unwrap_err();
+                assert_eq!(error.kind, capnp::ErrorKind::Failed);
             }),
         )
         .await
@@ -722,7 +1004,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stopped_actors_report_closed_channels() {
+    async fn stopped_actors_report_closed_channels_and_unreachable_builders() {
         let (commands, receiver) = mpsc::channel(1);
         drop(receiver);
         assert!(matches!(
@@ -735,6 +1017,18 @@ mod tests {
             Err(RecvError::Closed)
         ));
         assert!(pending.is_none());
+
+        let (commands, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let (link, _lifetime) = new_link(1024);
+        let mut builder = CapnpBuilder {
+            commands,
+            _link: link,
+        };
+        assert!(matches!(
+            builder.build(&vec![1]).await,
+            Err(BuildError::Unreachable)
+        ));
     }
 
     #[tokio::test]
@@ -782,6 +1076,69 @@ mod tests {
         .unwrap();
     }
 
+    #[tokio::test]
+    async fn abandoned_actor_reply_reports_an_unreachable_builder() {
+        let (commands, mut receiver) = mpsc::channel::<BuildCommand>(1);
+        let (link, _lifetime) = new_link(1024);
+        let mut builder = CapnpBuilder {
+            commands,
+            _link: link,
+        };
+        let actor = async {
+            drop(receiver.recv().await.unwrap());
+        };
+        let (result, ()) = futures_util::future::join(builder.build(&Vec::new()), actor).await;
+        assert!(matches!(result, Err(BuildError::Unreachable)));
+    }
+
+    #[derive(Debug)]
+    struct OnceBuilder(Option<fungi_transport_testkit::mem::MemChannel>);
+    impl ChannelBuilder for OnceBuilder {
+        type Input = ();
+        type Channel = fungi_transport_testkit::mem::MemChannel;
+        type BuildError = fungi_transport_testkit::mem::MemError;
+        async fn build(&mut self, _: &()) -> Result<Self::Channel, Self::BuildError> {
+            self.0
+                .take()
+                .ok_or(fungi_transport_testkit::mem::MemError::Closed)
+        }
+    }
+
+    #[tokio::test]
+    async fn builder_channel_errors_are_translated_by_the_backend_callbacks() {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::task::LocalSet::new().run_until(async {
+                let (backend, peer) = duplex(MemConfig::default());
+                let (peer_sender, peer_receiver) = peer.into_split();
+                drop(peer_receiver);
+                let (client, io) = tokio::io::duplex(64);
+                let server = tokio::task::spawn_local(serve_builder(
+                    OnceBuilder(Some(backend)),
+                    |_| Ok(()),
+                    mem_send,
+                    mem_recv,
+                    mem_build,
+                    io,
+                ));
+                let mut builder = CapnpBuilder::connect(client, 1024).unwrap();
+                let mut channel = builder.build(&Vec::new()).await.unwrap();
+                assert!(matches!(
+                    channel.send(vec![1]).await,
+                    Err(SendError::Closed)
+                ));
+                assert!(matches!(
+                    builder.build(&Vec::new()).await,
+                    Err(BuildError::Unreachable)
+                ));
+                drop((channel, builder, peer_sender));
+                server.await.unwrap().unwrap();
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
     #[test]
     fn rpc_disconnects_and_protocol_failures_have_distinct_diagnostics() {
         assert!(matches!(
@@ -792,46 +1149,16 @@ mod tests {
             rpc_recv_error(capnp::Error::disconnected("gone".into())),
             RecvError::Closed
         ));
+        assert!(matches!(
+            rpc_build_error(capnp::Error::disconnected("gone".into())),
+            BuildError::Unreachable
+        ));
         let send = rpc_send_error(capnp::Error::failed("bad response".into()));
         let recv = rpc_recv_error(capnp::Error::failed("bad response".into()));
-        for error in [&send as &dyn std::error::Error, &recv] {
+        let build = rpc_build_error(capnp::Error::failed("bad response".into()));
+        for error in [&send as &dyn std::error::Error, &recv, &build] {
             assert!(error.to_string().contains("bad response"));
             assert!(error.source().is_some());
         }
-    }
-
-    #[tokio::test]
-    async fn channel_errors_are_translated_by_backend_callbacks() {
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            tokio::task::LocalSet::new().run_until(async {
-                for sending in [true, false] {
-                    let (backend, peer) = duplex(MemConfig::default());
-                    let (peer_sender, peer_receiver) = peer.into_split();
-                    let retained = if sending {
-                        drop(peer_receiver);
-                        (Some(peer_sender), None)
-                    } else {
-                        drop(peer_sender);
-                        (None, Some(peer_receiver))
-                    };
-                    let (client, io) = tokio::io::duplex(64);
-                    let server = tokio::task::spawn_local(serve(backend, mem_send, mem_recv, io));
-                    let mut channel = CapnpChannel::connect(client, 1024).unwrap();
-                    if sending {
-                        assert!(matches!(
-                            channel.send(vec![1]).await,
-                            Err(SendError::Closed)
-                        ));
-                    } else {
-                        assert!(matches!(channel.recv().await, Err(RecvError::Closed)));
-                    }
-                    drop((channel, retained));
-                    server.await.unwrap().unwrap();
-                }
-            }),
-        )
-        .await
-        .unwrap();
     }
 }

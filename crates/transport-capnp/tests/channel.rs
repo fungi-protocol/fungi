@@ -5,11 +5,14 @@ use std::future::Future;
 use std::time::Duration;
 
 use fungi_transport::{
-    Anonymous, Channel, Decode, Encode, PeerChannel, RecvChannel, SendChannel, into_stream,
+    Anonymous, Channel, ChannelBuilder, Decode, Encode, PeerChannel, RecvChannel, SendChannel,
+    into_stream,
 };
-use fungi_transport_capnp::{CapnpChannel, CapnpDuplex, RecvError, SendError, serve};
+use fungi_transport_capnp::{
+    BuildError, CapnpBuilder, CapnpChannel, CapnpDuplex, RecvError, SendError, serve, serve_builder,
+};
 use fungi_transport_testkit::{
-    mem::{MemConfig, MemError, MemPeer, MemReceiver, MemSender, duplex},
+    mem::{MemChannel, MemConfig, MemError, MemPeer, MemReceiver, MemSender, duplex, network},
     testkit,
 };
 fn mem_send(_: MemError) -> SendError {
@@ -17,6 +20,9 @@ fn mem_send(_: MemError) -> SendError {
 }
 fn mem_recv(_: MemError) -> RecvError {
     RecvError::Closed
+}
+fn mem_build(_: MemError) -> BuildError {
+    BuildError::Unreachable
 }
 trait SendFailure {
     fn into_rpc(self) -> SendError;
@@ -304,6 +310,147 @@ async fn backend_failure_keeps_diagnostics() {
     stopped(vec![server]).await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn builders_reconnect_and_keep_channels_alive_after_builder_drop() {
+    let (connector, listener) = network(MemConfig::default());
+    let (client, io) = tokio::io::duplex(64);
+    let first = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tokio::task::LocalSet::new()
+            .block_on(
+                &rt,
+                serve_builder(
+                    connector,
+                    |_| Ok(fungi_transport_testkit::mem::MemAddr),
+                    mem_send,
+                    mem_recv,
+                    mem_build,
+                    io,
+                ),
+            )
+            .unwrap();
+    });
+    let (inbound, io) = tokio::io::duplex(64);
+    let second = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tokio::task::LocalSet::new()
+            .block_on(
+                &rt,
+                serve_builder(
+                    listener,
+                    |token| {
+                        if token.is_empty() {
+                            Ok(())
+                        } else {
+                            Err(BuildError::Transport("inbound input must be empty".into()))
+                        }
+                    },
+                    mem_send,
+                    mem_recv,
+                    mem_build,
+                    io,
+                ),
+            )
+            .unwrap();
+    });
+    let mut connector = CapnpBuilder::connect(client, MAX).unwrap();
+    let mut listener = CapnpBuilder::connect(inbound, MAX).unwrap().into_acceptor();
+    for _ in 0..2 {
+        let (left, right) = deadline(futures_util::future::join(
+            connector.build(&Vec::new()),
+            listener.build(&()),
+        ))
+        .await;
+        let (mut left, mut right) = (left.unwrap(), right.unwrap());
+        deadline(async {
+            left.send(vec![1]).await.unwrap();
+            assert_eq!(right.recv().await.unwrap(), vec![1]);
+            drop(right);
+            assert!(left.recv().await.is_err());
+        })
+        .await;
+    }
+    let (left, right) = deadline(futures_util::future::join(
+        connector.build(&Vec::new()),
+        listener.build(&()),
+    ))
+    .await;
+    let (mut left, mut right) = (left.unwrap(), right.unwrap());
+    drop((connector, listener));
+    deadline(async {
+        left.send(vec![42]).await.unwrap();
+        assert_eq!(right.recv().await.unwrap(), vec![42]);
+    })
+    .await;
+    drop((left, right));
+    stopped(vec![first, second]).await;
+}
+
+#[derive(Debug)]
+struct RejectBuilder;
+impl ChannelBuilder for RejectBuilder {
+    type Input = Vec<u8>;
+    type Channel = MemChannel;
+    type BuildError = BuildError;
+    async fn build(&mut self, input: &Vec<u8>) -> Result<MemChannel, BuildError> {
+        if input == b"unreachable" {
+            Err(BuildError::Unreachable)
+        } else {
+            Err(BuildError::Transport("backend refused token".into()))
+        }
+    }
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn builder_errors_preserve_semantics_and_decoder_diagnostics() {
+    let (client, io) = tokio::io::duplex(64);
+    let server = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tokio::task::LocalSet::new()
+            .block_on(
+                &rt,
+                serve_builder(
+                    RejectBuilder,
+                    |input| {
+                        if input == b"invalid" {
+                            Err(BuildError::Transport("invalid token".into()))
+                        } else {
+                            Ok(input)
+                        }
+                    },
+                    mem_send,
+                    mem_recv,
+                    std::convert::identity,
+                    io,
+                ),
+            )
+            .unwrap();
+    });
+    let mut builder = CapnpBuilder::connect(client, MAX).unwrap();
+    assert!(matches!(
+        deadline(builder.build(&b"unreachable".to_vec())).await,
+        Err(BuildError::Unreachable)
+    ));
+    for (input, diagnostic) in [
+        (b"backend".to_vec(), "backend refused token"),
+        (b"invalid".to_vec(), "invalid token"),
+    ] {
+        let error = deadline(builder.build(&input)).await.unwrap_err();
+        assert!(matches!(error, BuildError::Transport(_)));
+        assert!(error.to_string().contains(diagnostic));
+    }
+    drop(builder);
+    stopped(vec![server]).await;
+}
+
 #[derive(Debug)]
 struct FailedHalf(
     MemReceiver<Vec<u8>>,
@@ -343,6 +490,178 @@ async fn receive_backend_error_terminates_the_stream_with_diagnostics() {
     stopped(vec![server]).await;
 }
 
+#[derive(Debug)]
+struct Lifetime {
+    _peer: MemChannel,
+    dropped: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+impl Drop for Lifetime {
+    fn drop(&mut self) {
+        self.dropped
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+#[derive(Debug)]
+struct TrackedSender(
+    MemSender<Vec<u8>>,
+    std::sync::Arc<Lifetime>,
+    Option<tokio::sync::oneshot::Sender<()>>,
+);
+#[derive(Debug)]
+struct TrackedReceiver(MemReceiver<Vec<u8>>, std::sync::Arc<Lifetime>);
+type TrackedChannel = Channel<TrackedSender, TrackedReceiver>;
+impl PeerChannel for TrackedSender {
+    type Peer = MemPeer;
+    fn peer(&self) -> &MemPeer {
+        self.0.peer()
+    }
+}
+impl PeerChannel for TrackedReceiver {
+    type Peer = MemPeer;
+    fn peer(&self) -> &MemPeer {
+        self.0.peer()
+    }
+}
+impl SendChannel for TrackedSender {
+    type Privacy = Anonymous;
+    type SendError = MemError;
+    async fn send(&mut self, message: Vec<u8>) -> Result<(), MemError> {
+        let _ = &self.1;
+        let sending = self.0.send(message);
+        tokio::pin!(sending);
+        std::future::poll_fn(|cx| {
+            let state = sending.as_mut().poll(cx);
+            if state.is_pending()
+                && let Some(blocked) = self.2.take()
+            {
+                let _ = blocked.send(());
+            }
+            state
+        })
+        .await
+    }
+}
+impl RecvChannel for TrackedReceiver {
+    type RecvError = MemError;
+    async fn recv(&mut self) -> Result<Vec<u8>, MemError> {
+        let _ = &self.1;
+        self.0.recv().await
+    }
+}
+#[derive(Debug)]
+struct TrackingBuilder {
+    gate: std::sync::Arc<tokio::sync::Semaphore>,
+    started: tokio::sync::mpsc::UnboundedSender<()>,
+    dropped: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    blocked_send: Option<tokio::sync::oneshot::Sender<()>>,
+}
+impl ChannelBuilder for TrackingBuilder {
+    type Input = Vec<u8>;
+    type Channel = TrackedChannel;
+    type BuildError = BuildError;
+    async fn build(&mut self, _: &Vec<u8>) -> Result<TrackedChannel, BuildError> {
+        let (channel, peer) = duplex(MemConfig::default());
+        let (sender, receiver) = channel.into_split();
+        let lifetime = std::sync::Arc::new(Lifetime {
+            _peer: peer,
+            dropped: self.dropped.clone(),
+        });
+        let channel = Channel::new(
+            TrackedSender(sender, lifetime.clone(), self.blocked_send.take()),
+            TrackedReceiver(receiver, lifetime),
+        )
+        .unwrap();
+        self.started.send(()).unwrap();
+        self.gate.acquire().await.unwrap().forget();
+        Ok(channel)
+    }
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn canceled_builds_are_bounded_and_mass_drops_release_backends() {
+    let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let dropped = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+    let backend = TrackingBuilder {
+        gate: gate.clone(),
+        started,
+        dropped: dropped.clone(),
+        blocked_send: None,
+    };
+    let decoded = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let calls = decoded.clone();
+    let (client, io) = tokio::io::duplex(64);
+    let server = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tokio::task::LocalSet::new()
+            .block_on(
+                &rt,
+                serve_builder(
+                    backend,
+                    move |input| {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(input)
+                    },
+                    mem_send,
+                    mem_recv,
+                    std::convert::identity,
+                    io,
+                ),
+            )
+            .unwrap();
+    });
+    let mut builder = CapnpBuilder::connect(client, MAX).unwrap();
+    let input = Vec::new();
+    {
+        let building = builder.build(&input);
+        tokio::pin!(building);
+        deadline(async {
+            tokio::select! {
+                result = &mut building => panic!("build completed before release: {result:?}"),
+                started = starts.recv() => assert!(started.is_some()),
+            }
+        })
+        .await;
+    }
+    for _ in 0..32 {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(2), builder.build(&input))
+                .await
+                .is_err()
+        );
+    }
+    assert_eq!(decoded.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 0);
+    gate.add_permits(1);
+    deadline(async {
+        while dropped.load(std::sync::atomic::Ordering::SeqCst) != 1 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+    gate.add_permits(64);
+    let channels = deadline(async {
+        let mut channels = Vec::new();
+        for _ in 0..64 {
+            channels.push(builder.build(&input).await.unwrap());
+        }
+        channels
+    })
+    .await;
+    assert_eq!(decoded.load(std::sync::atomic::Ordering::SeqCst), 65);
+    drop(channels);
+    deadline(async {
+        while dropped.load(std::sync::atomic::Ordering::SeqCst) != 65 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+    drop(builder);
+    stopped(vec![server]).await;
+}
+
 impl PeerChannel for LimitedSend {
     type Peer = MemPeer;
     fn peer(&self) -> &MemPeer {
@@ -375,4 +694,61 @@ async fn owned_directions_preserve_peer_identity_and_reject_other_capabilities()
         Err(fungi_transport::PeerMismatch)
     ));
     stopped(servers).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dropping_a_channel_releases_a_blocked_backend_without_closing_its_builder() {
+    let dropped = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (started, _starts) = tokio::sync::mpsc::unbounded_channel();
+    let (blocked_send, blocked) = tokio::sync::oneshot::channel();
+    let backend = TrackingBuilder {
+        gate: std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
+        started,
+        dropped: dropped.clone(),
+        blocked_send: Some(blocked_send),
+    };
+    let (client, io) = tokio::io::duplex(64);
+    let server = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tokio::task::LocalSet::new()
+            .block_on(
+                &rt,
+                serve_builder(backend, Ok, mem_send, mem_recv, std::convert::identity, io),
+            )
+            .unwrap();
+    });
+    let mut builder = CapnpBuilder::connect(client, MAX).unwrap();
+    let mut channel = builder.build(&Vec::new()).await.unwrap();
+    channel.send(vec![1]).await.unwrap();
+    {
+        let sending = channel.send(vec![2]);
+        tokio::pin!(sending);
+        deadline(async {
+            tokio::select! {
+                result = &mut sending => panic!("send completed before channel drop: {result:?}"),
+                result = blocked => result.expect("backend dropped before blocking"),
+            }
+        })
+        .await;
+    }
+    drop(channel);
+    let released = tokio::time::timeout(Duration::from_secs(5), async {
+        while dropped.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .is_ok();
+    let mut next = deadline(builder.build(&Vec::new())).await.unwrap();
+    next.send(vec![3]).await.unwrap();
+    drop(next);
+    drop(builder);
+    stopped(vec![server]).await;
+    assert!(
+        released,
+        "backend retained after channel drop while builder/link stayed alive"
+    );
 }
