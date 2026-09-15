@@ -3,3 +3,4 @@
 pub mod batch;
 pub mod intent;
 pub mod queue;
+pub mod wallet;
