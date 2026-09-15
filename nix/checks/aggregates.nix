@@ -1,6 +1,11 @@
 {
   perSystem =
-    { config, pkgs, ... }:
+    {
+      cargoWorkspaces,
+      config,
+      pkgs,
+      ...
+    }:
     let
       registry = config.workspaceChecks;
       entries =
@@ -32,6 +37,26 @@
           pkgs.lib.mapAttrsToList (workspaceName: checks: entries workspaceName (tagged tag checks)) registry
         );
       join = name: paths: pkgs.linkFarm name paths;
+      # One repository-wide report for publishing. The per-workspace coverage
+      # checks enforce the threshold; this merges their native lcov output
+      # with repository-relative paths and converts it to Cobertura for
+      # GitHub code coverage.
+      mergeCoverage =
+        reports:
+        pkgs.runCommand "coverage"
+          {
+            nativeBuildInputs = [
+              pkgs.lcov
+              pkgs.python3Packages.lcov-cobertura
+            ];
+            reports = pkgs.lib.mapAttrsToList (
+              workspaceName: report:
+              "${builtins.dirOf cargoWorkspaces.${workspaceName}.manifestPath}=${report.package}"
+            ) reports;
+          }
+          ''
+            bash ${./coverage/merge.sh} "$out" $reports
+          '';
     in
     {
       checks =
@@ -39,7 +64,7 @@
           {
             tests = join "tests" (selectNamed "tests-nightly-dev" ++ selectNamed "doctests-nightly-dev");
             clippy = join "clippy" (selectNamed "clippy");
-            coverage = join "coverage" (selectNamed "coverage");
+            coverage = mergeCoverage (pkgs.lib.mapAttrs (_: checks: checks.coverage) registry);
             quick = join "quick" (selectTagged "quick");
             lint = join "lint" (
               [
