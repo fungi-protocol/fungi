@@ -1,12 +1,14 @@
+use crate::builder::CapnpBuilder;
 use crate::channel::{CapnpChannel, receive_message, send_message};
 use crate::client::{
-    Bootstrap, channel_actor, new_link, rpc_recv_error, rpc_send_error, start_client,
+    Bootstrap, BuildCommand, channel_actor, new_link, rpc_build_error, rpc_recv_error,
+    rpc_send_error, start_client,
 };
-use crate::error::{RecvError, SendError};
+use crate::error::{BuildError, RecvError, SendError};
 use crate::protocol::{RemoteChannel, channel, recv_failure, send_failure};
-use crate::server::{run_server, serve};
+use crate::server::{run_server, serve, serve_builder};
 use capnp::{capability::Promise, data};
-use fungi_transport::{RecvChannel, SendChannel};
+use fungi_transport::{ChannelBuilder, RecvChannel, SendChannel};
 use fungi_transport_testkit::mem::{MemConfig, duplex};
 use std::io;
 use std::sync::Arc;
@@ -18,6 +20,9 @@ fn mem_send(_: fungi_transport_testkit::mem::MemError) -> SendError {
 }
 fn mem_recv(_: fungi_transport_testkit::mem::MemError) -> RecvError {
     RecvError::Closed
+}
+fn mem_build(_: fungi_transport_testkit::mem::MemError) -> BuildError {
+    BuildError::Unreachable
 }
 
 struct BlockedRpcChannel {
@@ -166,6 +171,26 @@ async fn servers_return_protocol_errors_to_their_callers() {
             drained.unwrap();
             let error = result.unwrap_err();
             assert_eq!(error.kind, capnp::ErrorKind::Failed);
+
+            let (backend, _listener) = fungi_transport_testkit::mem::network(MemConfig::default());
+            let (mut peer, io) = tokio::io::duplex(64);
+            peer.write_all(&[1, 2, 3, 4, 0, 0, 0, 0]).await.unwrap();
+            peer.shutdown().await.unwrap();
+            let (result, drained) = futures_util::future::join(
+                serve_builder(
+                    backend,
+                    |_| Ok(fungi_transport_testkit::mem::MemAddr),
+                    mem_send,
+                    mem_recv,
+                    mem_build,
+                    io,
+                ),
+                async { peer.read_to_end(&mut Vec::new()).await },
+            )
+            .await;
+            drained.unwrap();
+            let error = result.unwrap_err();
+            assert_eq!(error.kind, capnp::ErrorKind::Failed);
         }),
     )
     .await
@@ -173,7 +198,7 @@ async fn servers_return_protocol_errors_to_their_callers() {
 }
 
 #[tokio::test]
-async fn stopped_actors_report_closed_channels() {
+async fn stopped_actors_report_closed_channels_and_unreachable_builders() {
     let (commands, receiver) = mpsc::channel(1);
     drop(receiver);
     assert!(matches!(
@@ -186,6 +211,19 @@ async fn stopped_actors_report_closed_channels() {
         Err(RecvError::Closed)
     ));
     assert!(pending.is_none());
+
+    let (commands, receiver) = mpsc::channel(1);
+    drop(receiver);
+    let (link, _lifetime) = new_link(1024);
+    let mut builder = CapnpBuilder {
+        commands,
+        _link: link,
+        max_recv_message_len: usize::MAX,
+    };
+    assert!(matches!(
+        builder.build(&vec![1]).await,
+        Err(BuildError::Unreachable)
+    ));
 }
 
 #[tokio::test]
@@ -233,6 +271,71 @@ async fn canceled_receive_preserves_a_response_already_delivered_to_the_client()
     .unwrap();
 }
 
+#[tokio::test]
+async fn abandoned_actor_reply_reports_an_unreachable_builder() {
+    let (commands, mut receiver) = mpsc::channel::<BuildCommand>(1);
+    let (link, _lifetime) = new_link(1024);
+    let mut builder = CapnpBuilder {
+        commands,
+        _link: link,
+        max_recv_message_len: usize::MAX,
+    };
+    let actor = async {
+        drop(receiver.recv().await.unwrap());
+    };
+    let (result, ()) = futures_util::future::join(builder.build(&Vec::new()), actor).await;
+    assert!(matches!(result, Err(BuildError::Unreachable)));
+}
+
+#[derive(Debug)]
+struct OnceBuilder(Option<fungi_transport_testkit::mem::MemChannel>);
+impl ChannelBuilder for OnceBuilder {
+    type Privacy = fungi_transport::Pseudonymous;
+    type Input = ();
+    type Channel = fungi_transport_testkit::mem::MemChannel;
+    type BuildError = fungi_transport_testkit::mem::MemError;
+    async fn build(&mut self, _: &()) -> Result<Self::Channel, Self::BuildError> {
+        self.0
+            .take()
+            .ok_or(fungi_transport_testkit::mem::MemError::Closed)
+    }
+}
+
+#[tokio::test]
+async fn builder_channel_errors_are_translated_by_the_backend_callbacks() {
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::task::LocalSet::new().run_until(async {
+            let (backend, peer) = duplex(MemConfig::default());
+            let (peer_sender, peer_receiver) = peer.into_parts();
+            drop(peer_receiver);
+            let (client, io) = tokio::io::duplex(64);
+            let server = tokio::task::spawn_local(serve_builder(
+                OnceBuilder(Some(backend)),
+                |_| Ok(()),
+                mem_send,
+                mem_recv,
+                mem_build,
+                io,
+            ));
+            let mut builder = CapnpBuilder::connect(client, 1024).unwrap();
+            let mut channel = builder.build(&Vec::new()).await.unwrap();
+            assert!(matches!(
+                channel.send(vec![1]).await,
+                Err(SendError::Closed)
+            ));
+            assert!(matches!(
+                builder.build(&Vec::new()).await,
+                Err(BuildError::Unreachable)
+            ));
+            drop((channel, builder, peer_sender));
+            server.await.unwrap().unwrap();
+        }),
+    )
+    .await
+    .unwrap();
+}
+
 #[test]
 fn rpc_disconnects_and_protocol_failures_have_distinct_diagnostics() {
     assert!(matches!(
@@ -243,9 +346,14 @@ fn rpc_disconnects_and_protocol_failures_have_distinct_diagnostics() {
         rpc_recv_error(capnp::Error::disconnected("gone".into())),
         RecvError::Closed
     ));
+    assert!(matches!(
+        rpc_build_error(capnp::Error::disconnected("gone".into())),
+        BuildError::Unreachable
+    ));
     let send = rpc_send_error(capnp::Error::failed("bad response".into()));
     let recv = rpc_recv_error(capnp::Error::failed("bad response".into()));
-    for error in [&send as &dyn std::error::Error, &recv] {
+    let build = rpc_build_error(capnp::Error::failed("bad response".into()));
+    for error in [&send as &dyn std::error::Error, &recv, &build] {
         assert!(error.to_string().contains("bad response"));
         assert!(error.source().is_some());
     }

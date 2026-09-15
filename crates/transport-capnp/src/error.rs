@@ -31,3 +31,14 @@ pub enum RecvError {
     #[error("transport: {0}")]
     Transport(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
+
+/// A remote construction or RPC link failure.
+#[derive(Debug, thiserror::Error)]
+pub enum BuildError {
+    /// The RPC link or backend connection is unavailable.
+    #[error("RPC construction path unavailable")]
+    Unreachable,
+    /// An RPC or backend failure, preserving its cause locally.
+    #[error("transport: {0}")]
+    Transport(#[source] Box<dyn std::error::Error + Send + Sync>),
+}

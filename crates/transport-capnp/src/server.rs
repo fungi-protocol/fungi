@@ -1,9 +1,12 @@
 use crate::client::Reply;
-use crate::error::{RecvError, SendError};
-use crate::protocol::{RemoteChannel, channel, recv_failure, send_failure};
+use crate::error::{BuildError, RecvError, SendError};
+use crate::protocol::{
+    ChannelSchema, RemoteBuilder, RemoteChannel, build_failure, builder, channel, recv_failure,
+    send_failure,
+};
 use capnp::{capability::Promise, data};
 use capnp_rpc::{RpcSystem, rpc_twoparty_capnp::Side, twoparty};
-use fungi_transport::{Duplex, RecvChannel, SendChannel};
+use fungi_transport::{ChannelBuilder, Duplex, RecvChannel, SendChannel};
 use std::rc::Rc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -34,6 +37,42 @@ where
 {
     run_server(io, serve_channel(backend, map_send, map_recv).client).await
 }
+/// Serve a builder on the caller's `LocalSet`, decoding backend input tokens.
+///
+/// Decoding precedes backend access. Error callbacks preserve failure categories
+/// and diagnostic text. Created channels follow [`serve`]'s shutdown semantics.
+/// Returns the RPC result; capnp-rpc treats some disconnects as successful closure.
+///
+/// Error diagnostics returned by the decoder and error callbacks are sent to
+/// the RPC client. They must be appropriate for that recipient.
+pub async fn serve_builder<B, D, S, R, SE, RE, BE, Io>(
+    backend: B,
+    decode: D,
+    map_send: SE,
+    map_recv: RE,
+    map_build: BE,
+    io: Io,
+) -> Result<(), capnp::Error>
+where
+    B: ChannelBuilder<Channel = Duplex<S, R>> + 'static,
+    S: SendChannel + 'static,
+    R: RecvChannel + 'static,
+    SE: Fn(S::SendError) -> SendError + 'static,
+    RE: Fn(R::RecvError) -> RecvError + 'static,
+    BE: Fn(B::BuildError) -> BuildError + 'static,
+    D: Fn(Vec<u8>) -> Result<B::Input, BuildError> + 'static,
+    Io: AsyncRead + AsyncWrite + Unpin + 'static,
+{
+    let bootstrap: RemoteBuilder = capnp_rpc::new_client(BuilderServer {
+        backend: Rc::new(Mutex::new(backend)),
+        decode: Rc::new(decode),
+        map_send: Rc::new(map_send),
+        map_recv: Rc::new(map_recv),
+        map_build: Rc::new(map_build),
+    });
+    run_server(io, bootstrap.client).await
+}
+
 type QueuedSend = (Vec<u8>, Reply<Result<(), SendError>>);
 type Received = mpsc::Receiver<Result<Vec<u8>, RecvError>>;
 struct ChannelServer {
@@ -134,6 +173,63 @@ impl channel::Server<data::Owned, send_failure::Owned, recv_failure::Owned> for 
         })
     }
 }
+struct BuilderServer<B, D, SE, RE, BE> {
+    backend: Rc<Mutex<B>>,
+    decode: Rc<D>,
+    map_send: Rc<SE>,
+    map_recv: Rc<RE>,
+    map_build: Rc<BE>,
+}
+impl<B, D, S, R, SE, RE, BE> builder::Server<data::Owned, ChannelSchema, build_failure::Owned>
+    for BuilderServer<B, D, SE, RE, BE>
+where
+    B: ChannelBuilder<Channel = Duplex<S, R>> + 'static,
+    S: SendChannel + 'static,
+    R: RecvChannel + 'static,
+    SE: Fn(S::SendError) -> SendError + 'static,
+    RE: Fn(R::RecvError) -> RecvError + 'static,
+    BE: Fn(B::BuildError) -> BuildError + 'static,
+    D: Fn(Vec<u8>) -> Result<B::Input, BuildError> + 'static,
+{
+    fn build(
+        &mut self,
+        params: builder::BuildParams<data::Owned, ChannelSchema, build_failure::Owned>,
+        mut results: builder::BuildResults<data::Owned, ChannelSchema, build_failure::Owned>,
+    ) -> Promise<(), capnp::Error> {
+        let input = capnp_rpc::pry!(capnp_rpc::pry!(params.get()).get_input()).to_vec();
+        let input = (self.decode)(input);
+        let backend = self.backend.clone();
+        let map_send = self.map_send.clone();
+        let map_recv = self.map_recv.clone();
+        let map_build = self.map_build.clone();
+        Promise::from_future(async move {
+            let result = match input {
+                Ok(input) => backend
+                    .lock()
+                    .await
+                    .build(&input)
+                    .await
+                    .map_err(|error| map_build(error)),
+                Err(error) => Err(error),
+            };
+            let mut output = results.get().init_result();
+            match result {
+                Ok(channel) => {
+                    let remote = serve_channel(
+                        channel,
+                        move |error| map_send(error),
+                        move |error| map_recv(error),
+                    );
+                    return output.set_ok(remote);
+                }
+                Err(BuildError::Unreachable) => output.init_err().set_unreachable(()),
+                Err(error) => output.init_err().set_failed(error.to_string().as_str()),
+            }
+            Ok(())
+        })
+    }
+}
+
 pub(super) async fn run_server<Io>(
     io: Io,
     bootstrap: capnp::capability::Client,

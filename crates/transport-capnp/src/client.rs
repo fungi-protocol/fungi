@@ -1,11 +1,14 @@
-use crate::error::{RecvError, SendError};
-use crate::protocol::{RemoteChannel, recv_failure, rpc_result, send_failure};
+use crate::channel::{CapnpChannel, CapnpPeer};
+use crate::error::{BuildError, RecvError, SendError};
+use crate::protocol::{
+    RemoteBuilder, RemoteChannel, build_failure, recv_failure, rpc_result, send_failure,
+};
 use capnp_rpc::{RpcSystem, rpc_twoparty_capnp::Side, twoparty};
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 pub(super) type Reply<T> = oneshot::Sender<T>;
@@ -15,6 +18,11 @@ pub(super) enum ChannelCommand {
     Send(Vec<u8>, Reply<Result<(), SendError>>, OwnedSemaphorePermit),
     Recv(Reply<Result<Vec<u8>, RecvError>>, usize),
 }
+pub(super) struct BuildCommand {
+    pub(super) input: Vec<u8>,
+    pub(super) max_recv_message_len: usize,
+    pub(super) reply: Reply<Result<CapnpChannel, BuildError>>,
+}
 #[derive(Debug)]
 pub(super) struct Link {
     pub(super) _lifetime: mpsc::Sender<()>,
@@ -22,6 +30,7 @@ pub(super) struct Link {
 }
 pub(super) enum Bootstrap {
     Channel(mpsc::Receiver<ChannelCommand>),
+    Builder(mpsc::Receiver<BuildCommand>, Weak<Link>),
 }
 
 pub(super) fn new_link(max_message_len: usize) -> (Arc<Link>, mpsc::Receiver<()>) {
@@ -85,6 +94,10 @@ pub(super) async fn run_client<R, W>(
         Bootstrap::Channel(receiver) => {
             let remote = rpc.bootstrap::<RemoteChannel>(Side::Server);
             tokio::task::spawn_local(channel_actor(remote, receiver));
+        }
+        Bootstrap::Builder(receiver, link) => {
+            let remote = rpc.bootstrap::<RemoteBuilder>(Side::Server);
+            tokio::task::spawn_local(builder_actor(remote, receiver, link));
         }
     }
     tokio::select! { _ = rpc => {}, _ = lifetime.recv() => {} }
@@ -198,6 +211,69 @@ async fn dispatch_channel(remote: RemoteChannel, command: ChannelCommand) {
         }
     }
 }
+async fn builder_actor(
+    remote: RemoteBuilder,
+    mut commands: mpsc::Receiver<BuildCommand>,
+    link: Weak<Link>,
+) {
+    while let Some(command) = commands.recv().await {
+        if !command.reply.is_closed() {
+            dispatch_build(remote.clone(), command, link.clone()).await;
+        }
+    }
+}
+async fn dispatch_build(remote: RemoteBuilder, command: BuildCommand, link: Weak<Link>) {
+    let result = async {
+        let mut request = remote.build_request();
+        request
+            .get()
+            .set_input(command.input.as_slice())
+            .map_err(rpc_build_error)?;
+        let response = request.send().promise.await.map_err(rpc_build_error)?;
+        let result = response
+            .get()
+            .and_then(|r| r.get_result())
+            .map_err(rpc_build_error)?;
+        match result
+            .which()
+            .map_err(capnp::Error::from)
+            .map_err(rpc_build_error)?
+        {
+            rpc_result::Ok(remote) => {
+                let remote = remote.map_err(rpc_build_error)?;
+                let link = link.upgrade().ok_or(BuildError::Unreachable)?;
+                let (commands, receiver) = mpsc::channel(2);
+                tokio::task::spawn_local(channel_actor(remote, receiver));
+                Ok(CapnpChannel {
+                    commands,
+                    send_slot: Arc::new(Semaphore::new(1)),
+                    pending: None,
+                    max_recv_message_len: command.max_recv_message_len,
+                    link,
+                    peer: CapnpPeer(Arc::new(())),
+                })
+            }
+            rpc_result::Err(error) => match error
+                .map_err(rpc_build_error)?
+                .which()
+                .map_err(capnp::Error::from)
+                .map_err(rpc_build_error)?
+            {
+                build_failure::Unreachable(()) => Err(BuildError::Unreachable),
+                build_failure::Failed(error) => Err(BuildError::Transport(
+                    error
+                        .and_then(|t| t.to_str().map_err(Into::into))
+                        .map_err(rpc_build_error)?
+                        .to_owned()
+                        .into(),
+                )),
+            },
+        }
+    }
+    .await;
+    // Failed reply delivery drops the channel to release an abandoned build's actor.
+    let _ = command.reply.send(result);
+}
 pub(super) fn rpc_send_error(error: capnp::Error) -> SendError {
     if error.kind == capnp::ErrorKind::Disconnected {
         SendError::Closed
@@ -210,5 +286,12 @@ pub(super) fn rpc_recv_error(error: capnp::Error) -> RecvError {
         RecvError::Closed
     } else {
         RecvError::Transport(error.into())
+    }
+}
+pub(super) fn rpc_build_error(error: capnp::Error) -> BuildError {
+    if error.kind == capnp::ErrorKind::Disconnected {
+        BuildError::Unreachable
+    } else {
+        BuildError::Transport(error.into())
     }
 }
