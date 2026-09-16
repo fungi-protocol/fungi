@@ -57,4 +57,150 @@ mod tests {
     fn an_output_priced_past_the_money_supply_has_no_cost() {
         assert!(p2tr_txout(30_000).effective_cost(FeeRate::MAX).is_none());
     }
+
+    mod prop_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Bytes the compact size prefix takes to encode a script of `len` bytes. Scripts
+        /// past 4 GiB would need 9, but none are generated.
+        fn compact_size_len(len: usize) -> u128 {
+            match len {
+                0..=0xfc => 1,
+                0xfd..=0xffff => 3,
+                _ => 5,
+            }
+        }
+
+        /// 8 bytes of value, the script's length prefix and the script, all non-witness so
+        /// 4 wu a byte.
+        fn expected_weight(script_len: usize) -> u128 {
+            4 * (8 + compact_size_len(script_len) + script_len as u128)
+        }
+
+        /// The cost of an output given the spk length and feerate.
+        fn expected_effective_cost(sats: u64, script_len: usize, sat_per_kwu: u64) -> u128 {
+            // u128 is sufficient that nothing overflows.
+            let fee = (u128::from(sat_per_kwu) * expected_weight(script_len)).div_ceil(1000);
+            u128::from(sats) + fee
+        }
+
+        /// Txout helper to reduce boilerplate.
+        fn txout(sats: u64, script_len: usize) -> TxOut {
+            TxOut {
+                value: Amount::from_sat(sats),
+                script_pubkey: ScriptBuf::from_bytes(vec![0xab; script_len]),
+            }
+        }
+
+        /// Script lengths clustered around where the length prefix grows, plus anything
+        /// up to a size no standard output should reach.
+        fn script_len() -> impl Strategy<Value = usize> {
+            prop_oneof![0..=300usize, 0xfff0..=0x1_0010usize, 0..=200_000usize,]
+        }
+
+        fn money() -> impl Strategy<Value = u64> {
+            0..=Amount::MAX_MONEY.to_sat()
+        }
+
+        /// Up to 1,000,000 sat/vB
+        fn sane_feerate_sat_kwu() -> impl Strategy<Value = u64> {
+            0..=250_000_000u64
+        }
+
+        fn any_feerate() -> impl Strategy<Value = u64> {
+            prop_oneof![sane_feerate_sat_kwu(), any::<u64>()]
+        }
+
+        proptest! {
+            #[test]
+            fn cost_is_value_plus_weight_times_feerate(
+                sats in money(),
+                len in script_len(),
+                sat_per_kwu in sane_feerate_sat_kwu(),
+            ) {
+                let cost = txout(sats, len)
+                    .effective_cost(FeeRate::from_sat_per_kwu(sat_per_kwu))
+                    .expect("realistic inputs never overflow");
+
+                prop_assert_eq!(u128::from(cost.to_sat()), expected_effective_cost(sats, len, sat_per_kwu));
+            }
+
+            #[test]
+            fn cost_is_never_less_than_value(
+                sats in any::<u64>(),
+                len in script_len(),
+                sat_per_kwu in any_feerate(),
+            ) {
+                if let Some(cost) = txout(sats, len).effective_cost(FeeRate::from_sat_per_kwu(sat_per_kwu)) {
+                    prop_assert!(cost >= Amount::from_sat(sats));
+                }
+            }
+
+            #[test]
+            fn a_longer_script_never_costs_less(
+                sats in money(),
+                len in script_len(),
+                extra in 0..=1_000usize,
+                sat_per_kwu in sane_feerate_sat_kwu(),
+            ) {
+                let feerate = FeeRate::from_sat_per_kwu(sat_per_kwu);
+
+                prop_assert!(
+                    txout(sats, len).effective_cost(feerate)
+                        <= txout(sats, len + extra).effective_cost(feerate)
+                );
+            }
+
+            #[test]
+            fn a_higher_feerate_never_costs_less(
+                sats in money(),
+                len in script_len(),
+                sat_per_kwu in sane_feerate_sat_kwu(),
+                bump in 0..=1_000_000u64,
+            ) {
+                let txout = txout(sats, len);
+
+                prop_assert!(
+                    txout.effective_cost(FeeRate::from_sat_per_kwu(sat_per_kwu))
+                        <= txout.effective_cost(FeeRate::from_sat_per_kwu(sat_per_kwu + bump))
+                );
+            }
+
+            /// Every extra sat the output carries is one more sat it costs.
+            #[test]
+            fn cost_moves_one_for_one_with_value(
+                sats in money(),
+                more in 0..=Amount::MAX_MONEY.to_sat(),
+                len in script_len(),
+                sat_per_kwu in sane_feerate_sat_kwu(),
+            ) {
+                let feerate = FeeRate::from_sat_per_kwu(sat_per_kwu);
+                let base = txout(sats, len).effective_cost(feerate).unwrap();
+                let bigger = txout(sats + more, len).effective_cost(feerate).unwrap();
+
+                prop_assert_eq!(bigger - base, Amount::from_sat(more));
+            }
+
+            /// Blockspace is priced by size, so what the contents of the scriptpubkey does not matter.
+            #[test]
+            fn only_the_script_length_matters(
+                sats in money(),
+                script in proptest::collection::vec(any::<u8>(), 0..=600),
+                sat_per_kwu in sane_feerate_sat_kwu(),
+            ) {
+                let feerate = FeeRate::from_sat_per_kwu(sat_per_kwu);
+                let len = script.len();
+                let arbitrary = TxOut {
+                    value: Amount::from_sat(sats),
+                    script_pubkey: ScriptBuf::from_bytes(script),
+                };
+
+                prop_assert_eq!(
+                    arbitrary.effective_cost(feerate),
+                    txout(sats, len).effective_cost(feerate)
+                );
+            }
+        }
+    }
 }
