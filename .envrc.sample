@@ -1,0 +1,4 @@
+use flake .#nightly
+
+# you can also add additional inputs, for example to get jj, uncomment the following:
+# use flake nixpkg#jujutsu
