@@ -387,4 +387,133 @@ mod tests {
             }
         }
     }
+
+    /// Properties of what a coin is worth once its own input is paid for.
+    mod spend_prop_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Weight of the input spending each kind of coin we can price, outpoint and
+        /// nsequence included.
+        const P2TR_INPUT_WU: u64 = 230;
+        const P2WPKH_INPUT_WU: u64 = 272;
+        const NESTED_P2WPKH_INPUT_WU: u64 = 364;
+        const P2PKH_INPUT_WU: u64 = 592;
+        const P2PK_INPUT_WU: u64 = 456;
+
+        /// Up to 1,000,000 sat/vB, as in the output properties above.
+        fn sane_feerate_sat_kwu() -> impl Strategy<Value = u64> {
+            0..=250_000_000u64
+        }
+
+        fn money() -> impl Strategy<Value = u64> {
+            0..=Amount::MAX_MONEY.to_sat()
+        }
+
+        /// A coin we can price the spend of, paired with the weight its input takes.
+        fn spendable_coin() -> impl Strategy<Value = (Utxo, u64)> {
+            let spk = prop_oneof![
+                Just((p2tr_spk(), P2TR_INPUT_WU)),
+                Just((p2pk_spk(), P2PK_INPUT_WU)),
+                any::<[u8; 20]>().prop_map(|hash| (
+                    ScriptBuf::new_p2wpkh(&WPubkeyHash::from_byte_array(hash)),
+                    P2WPKH_INPUT_WU
+                )),
+                any::<[u8; 20]>().prop_map(|hash| (
+                    ScriptBuf::new_p2sh(&ScriptHash::from_byte_array(hash)),
+                    NESTED_P2WPKH_INPUT_WU
+                )),
+                any::<[u8; 20]>().prop_map(|hash| (
+                    ScriptBuf::new_p2pkh(&PubkeyHash::from_byte_array(hash)),
+                    P2PKH_INPUT_WU
+                )),
+            ];
+
+            (money(), spk).prop_map(|(sats, (spk, input_wu))| (utxo_with(spk, sats), input_wu))
+        }
+
+        /// What the spend costs: the input's weight priced per kwu and rounded up.
+        fn expected_spend_cost(input_wu: u64, sat_per_kwu: u64) -> i128 {
+            (u128::from(sat_per_kwu) * u128::from(input_wu)).div_ceil(1000) as i128
+        }
+
+        proptest! {
+            #[test]
+            fn a_coin_is_worth_its_value_less_its_spend(
+                (coin, input_wu) in spendable_coin(),
+                sat_per_kwu in sane_feerate_sat_kwu(),
+            ) {
+                let feerate = FeeRate::from_sat_per_kwu(sat_per_kwu);
+
+                prop_assert_eq!(coin.input_weight(), Weight::from_wu(input_wu));
+                prop_assert_eq!(
+                    i128::from(coin.effective_value(feerate).unwrap().to_sat()),
+                    i128::from(coin.prev_out.value.to_sat())
+                        - expected_spend_cost(input_wu, sat_per_kwu)
+                );
+            }
+
+            /// The input's weight comes from how the coin is spent, never from what it
+            /// carries.
+            #[test]
+            fn what_a_coin_carries_does_not_change_its_input_weight(
+                (coin, _) in spendable_coin(),
+                other_sats in money(),
+            ) {
+                let other = utxo_with(coin.prev_out.script_pubkey.clone(), other_sats);
+
+                prop_assert_eq!(coin.input_weight(), other.input_weight());
+            }
+
+            /// Blockspace only ever costs, so a coin is never worth more than its value,
+            /// and costs more to spend as the feerate climbs.
+            #[test]
+            fn spending_only_ever_costs(
+                (coin, _) in spendable_coin(),
+                sat_per_kwu in sane_feerate_sat_kwu(),
+                bump in 0..=1_000_000u64,
+            ) {
+                let value = coin.prev_out.value.to_signed().unwrap();
+                let worth = coin.effective_value(FeeRate::from_sat_per_kwu(sat_per_kwu)).unwrap();
+                let dearer = coin
+                    .effective_value(FeeRate::from_sat_per_kwu(sat_per_kwu + bump))
+                    .unwrap();
+
+                prop_assert!(worth <= value);
+                prop_assert!(dearer <= worth);
+            }
+
+            /// Nothing is charged at a feerate of zero, so the coin is worth exactly what
+            /// it carries.
+            #[test]
+            fn a_free_block_charges_nothing_for_the_spend((coin, _) in spendable_coin()) {
+                prop_assert_eq!(
+                    coin.effective_value(FeeRate::from_sat_per_kwu(0)).unwrap(),
+                    coin.prev_out.value.to_signed().unwrap()
+                );
+            }
+
+            /// Paying a coin straight through to an identical output leaves exactly the
+            /// two pieces of blockspace unfunded, which is what coin selection has to
+            /// cover.
+            #[test]
+            fn effective_value_and_cost_are_mirrors(
+                (coin, input_wu) in spendable_coin(),
+                sat_per_kwu in sane_feerate_sat_kwu(),
+            ) {
+                let feerate = FeeRate::from_sat_per_kwu(sat_per_kwu);
+                let payment = coin.prev_out.clone();
+
+                let have = coin.effective_value(feerate).unwrap();
+                let need = payment.effective_cost(feerate).unwrap().to_signed().unwrap();
+
+                let output_wu = payment.weight().to_wu();
+                prop_assert_eq!(
+                    i128::from((need - have).to_sat()),
+                    expected_spend_cost(input_wu, sat_per_kwu)
+                        + expected_spend_cost(output_wu, sat_per_kwu)
+                );
+            }
+        }
+    }
 }
