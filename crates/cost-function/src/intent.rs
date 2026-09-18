@@ -1,5 +1,6 @@
 //! Defines what the user wants, and how much they care.
 
+use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use bitcoin::{Amount, ScriptBuf};
@@ -47,62 +48,80 @@ impl PayoffCurve {
         }
     }
 
-    /// What the intent is worth at `at`.
-    pub fn payoff(&self, at: Instant) -> Amount {
-        let mut point = Point {
-            at: self.start,
-            worth: Amount::ZERO,
-        };
+    /// The straight runs between the curve's breakpoints, in order.
+    ///
+    /// Before the first the curve is worth nothing, and after the last it holds that
+    /// run's end forever. Neither is a finite span, so neither is yielded here.
+    pub fn segments(&self) -> impl Iterator<Item = Segment> + '_ {
+        let mut at = self.start;
+        let mut worth = Amount::ZERO;
 
-        for &(gap, worth) in &self.breakpoints {
-            let next = Point {
-                at: point.at + gap,
-                worth,
+        self.breakpoints.iter().map(move |&(gap, next_worth)| {
+            let next = at + gap;
+            let segment = Segment {
+                span: at..next,
+                start: worth,
+                end: next_worth,
             };
 
-            if at <= next.at {
-                return Line::new(point, next).interpolate(at);
+            at = next;
+            worth = next_worth;
+
+            segment
+        })
+    }
+
+    /// What the intent is worth at `at`.
+    pub fn payoff(&self, at: Instant) -> Amount {
+        let mut worth = Amount::ZERO;
+
+        for segment in self.segments() {
+            if at <= segment.span.end {
+                return segment.interpolate(at);
             }
 
-            point = next;
+            worth = segment.end;
         }
 
-        point.worth
+        worth
     }
 }
 
-/// What a curve is worth at one instant.
-#[derive(Clone, Copy)]
-struct Point {
-    at: Instant,
-    worth: Amount,
+/// A straight run of a curve, from one breakpoint to the next.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Segment {
+    /// When the run begins and ends.
+    pub span: Range<Instant>,
+
+    /// What the curve is worth at `span.start`.
+    pub start: Amount,
+
+    /// What the curve is worth at `span.end`.
+    pub end: Amount,
 }
 
-/// A straight run of a curve, from one point to the next.
-struct Line(Point, Point);
-
-impl Line {
-    /// The straight run between two points, in whichever order they arrive.
-    fn new(a: Point, b: Point) -> Self {
-        if a.at <= b.at { Line(a, b) } else { Line(b, a) }
-    }
-
-    /// Where the line sits at `at`, which holds at whichever end `at` lies beyond.
+impl Segment {
+    /// Where the run sits at `at`, which holds at whichever end `at` lies beyond.
     fn interpolate(&self, at: Instant) -> Amount {
-        let Line(start, end) = *self;
+        // Clamp `at` to the span of the run.
+        let at = at.clamp(self.span.start, self.span.end);
 
-        // Clamp `at` to the span of the line.
-        let at = at.clamp(start.at, end.at);
+        let span = self
+            .span
+            .end
+            .saturating_duration_since(self.span.start)
+            .as_nanos() as i128;
 
-        let span = end.at.saturating_duration_since(start.at).as_nanos() as i128;
+        // A breakpoint no duration after the one before it is a step rather than a run,
+        // and the value it steps to is what holds from that instant on.
         if span == 0 {
-            return end.worth;
+            return self.end;
         }
 
-        let elapsed = at.saturating_duration_since(start.at).as_nanos() as i128;
-        let climb = i128::from(end.worth.to_sat()) - i128::from(start.worth.to_sat());
+        let elapsed = at.saturating_duration_since(self.span.start).as_nanos() as i128;
+        let climb = i128::from(self.end.to_sat()) - i128::from(self.start.to_sat());
 
-        Amount::from_sat((i128::from(start.worth.to_sat()) + climb * elapsed / span) as u64)
+        Amount::from_sat((i128::from(self.start.to_sat()) + climb * elapsed / span) as u64)
     }
 }
 
@@ -225,52 +244,59 @@ mod tests {
         );
     }
 
-    /// Which end of a line is named first says nothing about the curve it came from.
+    /// The runs a curve is made of, which is what a caller comparing two curves needs.
     #[test]
-    fn a_line_runs_from_its_earlier_point_to_its_later_one() {
+    fn a_curve_is_made_of_the_runs_between_its_breakpoints() {
         let start = Instant::now();
-        let early = Point {
-            at: start,
-            worth: Amount::ZERO,
-        };
-        let late = Point {
-            at: start + Duration::from_secs(60),
-            worth: Amount::from_sat(100),
-        };
-        let halfway = start + Duration::from_secs(30);
+        let peak = start + Duration::from_secs(1800);
+        let over = peak + Duration::from_secs(1800);
+
+        let segments: Vec<Segment> = single_peaked(start).segments().collect();
 
         assert_eq!(
-            Line::new(early, late).interpolate(halfway),
-            Amount::from_sat(50)
+            segments,
+            [
+                Segment {
+                    span: start..peak,
+                    start: Amount::ZERO,
+                    end: Amount::from_sat(100_000),
+                },
+                Segment {
+                    span: peak..over,
+                    start: Amount::from_sat(100_000),
+                    end: Amount::ZERO,
+                },
+            ]
         );
+        assert_eq!(segments[0].clone(), segments[0]);
+    }
+
+    /// The flat ends run forever, so they are not runs the curve can hand out.
+    #[test]
+    fn a_curve_without_breakpoints_has_no_runs() {
         assert_eq!(
-            Line::new(late, early).interpolate(halfway),
-            Amount::from_sat(50)
+            PayoffCurve::new(Instant::now(), vec![]).segments().count(),
+            0
         );
     }
 
     /// Asking past either end is answered by that end, rather than by running the line
     /// on to wherever it would have gone.
     #[test]
-    fn a_line_holds_at_the_end_nearest_what_it_is_asked_about() {
+    fn a_run_holds_at_the_end_nearest_what_it_is_asked_about() {
         let start = Instant::now();
-        let line = Line::new(
-            Point {
-                at: start,
-                worth: Amount::from_sat(100),
-            },
-            Point {
-                at: start + Duration::from_secs(60),
-                worth: Amount::from_sat(200),
-            },
-        );
+        let segment = Segment {
+            span: start..start + Duration::from_secs(60),
+            start: Amount::from_sat(100),
+            end: Amount::from_sat(200),
+        };
 
         assert_eq!(
-            line.interpolate(start - Duration::from_secs(60)),
+            segment.interpolate(start - Duration::from_secs(60)),
             Amount::from_sat(100)
         );
         assert_eq!(
-            line.interpolate(start + Duration::from_secs(600)),
+            segment.interpolate(start + Duration::from_secs(600)),
             Amount::from_sat(200)
         );
     }
