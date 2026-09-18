@@ -49,9 +49,6 @@ impl PayoffCurve {
     }
 
     /// The straight runs between the curve's breakpoints, in order.
-    ///
-    /// Before the first the curve is worth nothing, and after the last it holds that
-    /// run's end forever. Neither is a finite span, so neither is yielded here.
     pub fn segments(&self) -> impl Iterator<Item = Segment> + '_ {
         let mut at = self.start;
         let mut worth = Amount::ZERO;
@@ -92,18 +89,18 @@ impl PayoffCurve {
 pub struct Segment {
     /// When the run begins and ends.
     pub span: Range<Instant>,
-
     /// What the curve is worth at `span.start`.
     pub start: Amount,
-
     /// What the curve is worth at `span.end`.
     pub end: Amount,
 }
 
 impl Segment {
-    /// Where the run sits at `at`, which holds at whichever end `at` lies beyond.
-    fn interpolate(&self, at: Instant) -> Amount {
-        // Clamp `at` to the span of the run.
+    /// What the curve is worth at `at`, exactly.
+    ///
+    /// `at` is clamped to the span, so either end holds beyond itself. Nanoseconds and
+    /// satoshis both sit far inside `i128`, so the arithmetic cannot overflow.
+    pub(crate) fn worth_at(&self, at: Instant) -> FractionalAmount {
         let at = at.clamp(self.span.start, self.span.end);
 
         let span = self
@@ -115,14 +112,80 @@ impl Segment {
         // A breakpoint no duration after the one before it is a step rather than a run,
         // and the value it steps to is what holds from that instant on.
         if span == 0 {
-            return self.end;
+            return self.end.into();
         }
 
         let elapsed = at.saturating_duration_since(self.span.start).as_nanos() as i128;
-        let climb = i128::from(self.end.to_sat()) - i128::from(self.start.to_sat());
+        let start = i128::from(self.start.to_sat());
+        let climb = i128::from(self.end.to_sat()) - start;
 
-        Amount::from_sat((i128::from(self.start.to_sat()) + climb * elapsed / span) as u64)
+        FractionalAmount::new(start * span + climb * elapsed, span)
     }
+
+    /// Where the run sits at `at`, to the nearest satoshi.
+    fn interpolate(&self, at: Instant) -> Amount {
+        self.worth_at(at).round()
+    }
+}
+
+/// Satoshis that need not be whole.
+///
+/// A straight run between two breakpoints rarely passes through whole satoshis, and
+/// rounding on the way is what blurs out where two curves cross. So the worth stays a
+/// fraction until a caller asks for an [`Amount`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FractionalAmount {
+    numerator: i128,
+    denominator: i128,
+}
+
+impl FractionalAmount {
+    /// `numerator / denominator` satoshis, reduced.
+    ///
+    /// Panics if `denominator` is zero.
+    pub(crate) fn new(numerator: i128, denominator: i128) -> Self {
+        assert!(denominator != 0, "a fraction needs a denominator");
+
+        // Keep the sign on the numerator, so the denominator is always positive.
+        let sign = denominator.signum();
+        let divisor = gcd(numerator, denominator);
+
+        FractionalAmount {
+            numerator: sign * numerator / divisor,
+            denominator: sign * denominator / divisor,
+        }
+    }
+
+    /// The nearest whole satoshi, halves rounded up.
+    ///
+    /// NOTE: Nothing is worth a negative number of satoshis, so anything below zero rounds to
+    /// [`Amount::ZERO`].
+    pub(crate) fn round(self) -> Amount {
+        let doubled = 2 * self.numerator + self.denominator;
+        let sats = doubled.div_euclid(2 * self.denominator);
+
+        Amount::from_sat(u64::try_from(sats).unwrap_or(0))
+    }
+}
+
+impl From<Amount> for FractionalAmount {
+    fn from(amount: Amount) -> Self {
+        FractionalAmount {
+            numerator: i128::from(amount.to_sat()),
+            denominator: 1,
+        }
+    }
+}
+
+/// Greatest common divisor
+fn gcd(a: i128, b: i128) -> i128 {
+    let (mut a, mut b) = (a.abs(), b.abs());
+
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+
+    a.max(1)
 }
 
 /// An [`Action`] together with a [`PayoffCurve`] determined by the user.
@@ -299,6 +362,67 @@ mod tests {
             segment.interpolate(start + Duration::from_secs(600)),
             Amount::from_sat(200)
         );
+    }
+
+    /// The fraction is the point of this: half of an odd number of sats is not a whole
+    /// number, and saying so is what lets a caller find where two curves cross.
+    #[test]
+    fn a_run_is_worth_an_exact_fraction_between_its_ends() {
+        let start = Instant::now();
+        let segment = Segment {
+            span: start..start + Duration::from_secs(2),
+            start: Amount::ZERO,
+            end: Amount::from_sat(1),
+        };
+
+        assert_eq!(
+            segment.worth_at(start + Duration::from_secs(1)),
+            FractionalAmount::new(1, 2)
+        );
+    }
+
+    /// A step has no span to divide by, so its worth is whole from the outset.
+    #[test]
+    fn a_step_is_worth_what_it_steps_to() {
+        let start = Instant::now();
+        let step = Segment {
+            span: start..start,
+            start: Amount::ZERO,
+            end: Amount::from_sat(100),
+        };
+
+        assert_eq!(step.worth_at(start), Amount::from_sat(100).into());
+    }
+
+    /// Equal worths compare equal however they were arrived at.
+    #[test]
+    fn a_fraction_is_held_in_lowest_terms() {
+        assert_eq!(FractionalAmount::new(2, 4), FractionalAmount::new(1, 2));
+        assert_eq!(FractionalAmount::new(-1, -2), FractionalAmount::new(1, 2));
+        assert_eq!(FractionalAmount::new(1, -2), FractionalAmount::new(-1, 2));
+        assert_eq!(FractionalAmount::new(0, 5), FractionalAmount::new(0, 1));
+        assert_eq!(
+            FractionalAmount::from(Amount::from_sat(3)),
+            FractionalAmount::new(3, 1)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "a fraction needs a denominator")]
+    fn a_fraction_cannot_be_over_nothing() {
+        FractionalAmount::new(1, 0);
+    }
+
+    /// Rounding is where the precision is finally given up, and only there.
+    #[test]
+    fn a_fraction_rounds_to_the_nearest_satoshi() {
+        assert_eq!(FractionalAmount::new(1, 3).round(), Amount::ZERO);
+        assert_eq!(FractionalAmount::new(2, 3).round(), Amount::from_sat(1));
+        assert_eq!(FractionalAmount::new(7, 2).round(), Amount::from_sat(4));
+        assert_eq!(FractionalAmount::new(-1, 2).round(), Amount::ZERO);
+
+        // Nothing is worth a negative number of satoshis.
+        assert_eq!(FractionalAmount::new(-5, 2).round(), Amount::ZERO);
     }
 
     #[test]
