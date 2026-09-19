@@ -1,5 +1,8 @@
 use std::convert::Infallible;
 use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll, Waker};
 
 use tokio::sync::mpsc;
 
@@ -152,4 +155,126 @@ async fn channel_does_not_require_shared_access() {
         channel.recv().await.unwrap_err().kind(),
         io::ErrorKind::WouldBlock
     );
+}
+
+#[derive(Debug)]
+struct SharedBackend {
+    peer: u8,
+    sender: mpsc::Sender<u32>,
+    receiver: tokio::sync::Mutex<mpsc::Receiver<u32>>,
+    drops: Arc<AtomicUsize>,
+}
+
+impl SharedBackend {
+    fn new() -> Self {
+        let (sender, receiver) = mpsc::channel(1);
+        Self {
+            peer: 1,
+            sender,
+            receiver: tokio::sync::Mutex::new(receiver),
+            drops: Arc::default(),
+        }
+    }
+}
+
+impl Drop for SharedBackend {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl PeerChannel for SharedBackend {
+    type Peer = u8;
+
+    fn peer(&self) -> &Self::Peer {
+        &self.peer
+    }
+}
+
+impl SendChannel<String> for SharedBackend {
+    type Privacy = Pseudonymous;
+    type SendError = mpsc::error::SendError<u32>;
+
+    async fn send(&mut self, message: String) -> Result<(), Self::SendError> {
+        self.sender.send(message.len() as u32).await
+    }
+}
+
+impl RecvChannel<u32> for SharedBackend {
+    type RecvError = io::Error;
+
+    async fn recv(&mut self) -> Result<u32, Self::RecvError> {
+        self.receiver
+            .get_mut()
+            .recv()
+            .await
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "receiver closed"))
+    }
+}
+
+impl Channel<u32, String> for SharedBackend {}
+
+impl SharedChannel<u32, String> for SharedBackend {
+    async fn send_shared(&self, message: String) -> Result<(), Self::SendError> {
+        self.sender.send(message.len() as u32).await
+    }
+
+    async fn recv_shared(&self) -> Result<u32, Self::RecvError> {
+        self.receiver
+            .lock()
+            .await
+            .recv()
+            .await
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "receiver closed"))
+    }
+}
+
+#[tokio::test]
+async fn shared_split_allows_independent_progress() {
+    let mut native = SharedBackend::new();
+    native.send("native".to_owned()).await.unwrap();
+    assert_eq!(native.recv().await.unwrap(), 6);
+    native.receiver.get_mut().close();
+    assert_eq!(
+        native.recv().await.unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe
+    );
+    assert_eq!(
+        native.recv_shared().await.unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe
+    );
+
+    let backend = SharedBackend::new();
+    let drops = Arc::clone(&backend.drops);
+    let (mut sender, mut receiver) = split(backend);
+
+    fn assert_pseudonymous<C: SendChannel<String, Privacy = Pseudonymous>>(_: &C) {}
+    assert_pseudonymous(&sender);
+    assert_eq!(sender.peer(), receiver.peer());
+
+    {
+        let receive = receiver.recv();
+        let mut receive = std::pin::pin!(receive);
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(receive.as_mut().poll(&mut context), Poll::Pending));
+
+        sender.send("shared".to_owned()).await.unwrap();
+        assert_eq!(receive.await.unwrap(), 6);
+    }
+
+    sender.send("one".to_owned()).await.unwrap();
+    {
+        let send = sender.send("next".to_owned());
+        let mut send = std::pin::pin!(send);
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(send.as_mut().poll(&mut context), Poll::Pending));
+        assert_eq!(receiver.recv().await.unwrap(), 3);
+        send.await.unwrap();
+    }
+    assert_eq!(receiver.recv().await.unwrap(), 4);
+
+    drop(sender);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    drop(receiver);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
