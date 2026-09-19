@@ -55,6 +55,18 @@ fn unidirectional(capacity: usize) -> (Sender, Receiver) {
 fn assert_channel<C: Channel<u32, u32>>(_: &C) {}
 fn assert_asymmetric_channel<C: Channel<u32, String>>(_: &C) {}
 fn assert_connection_unlinkability<C: SendChannel<u32, Privacy = ConnectionUnlinkability>>(_: &C) {}
+fn assert_connection_unlinkability_strings<
+    C: SendChannel<String, Privacy = ConnectionUnlinkability>,
+>(
+    _: &C,
+) {
+}
+fn assert_connection_unlinkability_bytes<
+    C: SendChannel<Vec<u8>, Privacy = ConnectionUnlinkability>,
+>(
+    _: &C,
+) {
+}
 
 #[tokio::test]
 async fn bidirectional_combines_sending_and_receiving() {
@@ -253,4 +265,117 @@ async fn shared_split_allows_independent_progress() {
     assert_eq!(drops.load(Ordering::SeqCst), 0);
     drop(receiver);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn transformations_adapt_each_channel_direction() {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let (sender, receiver) = unidirectional(1);
+        let mut sender = MapBeforeSend::new(sender, |message: String| message.len() as u32);
+        let mut receiver = MapAfterRecv::new(receiver, |message: u32| message.to_string());
+
+        assert_connection_unlinkability_strings(&sender);
+
+        sender.send("hello".to_owned()).await.unwrap();
+        assert_eq!(receiver.recv().await.unwrap(), "5");
+    })
+    .await
+    .expect("message transformation must complete");
+}
+
+#[tokio::test]
+async fn map_after_recv_accepts_a_stateful_transformation() {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let (mut sender, receiver) = unidirectional(2);
+        let mut count = 0;
+        let mut receiver = MapAfterRecv::new(receiver, move |message| {
+            count += 1;
+            (count, message)
+        });
+
+        sender.send(7).await.unwrap();
+        sender.send(8).await.unwrap();
+        assert_eq!(receiver.recv().await.unwrap(), (1, 7));
+        assert_eq!(receiver.recv().await.unwrap(), (2, 8));
+    })
+    .await
+    .expect("message transformation must complete");
+}
+
+#[tokio::test]
+async fn transformations_compose_with_shared_halves() {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let (sender, receiver) = split(SharedBackend::new());
+        let mut sender = MapBeforeSend::new(sender, |message: Vec<u8>| {
+            String::from_utf8(message).unwrap()
+        });
+        let mut receiver = MapAfterRecv::new(receiver, |message: u32| message.to_string());
+
+        assert_connection_unlinkability_bytes(&sender);
+        sender.send(b"shared".to_vec()).await.unwrap();
+        assert_eq!(receiver.recv().await.unwrap(), "6");
+    })
+    .await
+    .expect("message transformation must complete");
+}
+
+#[tokio::test]
+async fn transformations_preserve_transport_errors() {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let (sender, receiver) = unidirectional(1);
+        drop(receiver);
+        let mut sender = MapBeforeSend::new(sender, |message: String| message.len() as u32);
+        assert!(sender.send("closed".to_owned()).await.is_err());
+
+        let (sender, receiver) = unidirectional(1);
+        drop(sender);
+        let mut receiver = MapAfterRecv::new(receiver, |message: u32| message.to_string());
+        assert_eq!(
+            receiver.recv().await.unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+    })
+    .await
+    .expect("message transformation must complete");
+}
+
+#[tokio::test]
+async fn map_before_send_accepts_non_send_intermediate_messages() {
+    struct Sink(Arc<AtomicUsize>);
+
+    impl SendChannel<std::rc::Rc<usize>> for Sink {
+        type Privacy = Unspecified;
+        type SendError = Infallible;
+
+        fn send(
+            &mut self,
+            message: std::rc::Rc<usize>,
+        ) -> impl Future<Output = Result<(), Self::SendError>> + Send {
+            self.0.store(*message, Ordering::SeqCst);
+            std::future::ready(Ok(()))
+        }
+    }
+
+    fn require_send<F: Future + Send>(future: F) -> F {
+        future
+    }
+
+    let received = Arc::new(AtomicUsize::new(0));
+    let mut sender = MapBeforeSend::new(Sink(Arc::clone(&received)), std::rc::Rc::new);
+    require_send(sender.send(42)).await.unwrap();
+    assert_eq!(received.load(Ordering::SeqCst), 42);
+}
+
+#[tokio::test]
+async fn map_before_send_accepts_non_send_messages() {
+    fn require_send<F: Future + Send>(future: F) -> F {
+        future
+    }
+
+    let (sender, mut receiver) = unidirectional(1);
+    let mut sender = MapBeforeSend::new(sender, |message: std::rc::Rc<u32>| *message);
+    require_send(sender.send(std::rc::Rc::new(42)))
+        .await
+        .unwrap();
+    assert_eq!(receiver.recv().await.unwrap(), 42);
 }
