@@ -1,8 +1,12 @@
 use std::convert::Infallible;
 use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll, Waker};
 
 use tokio::sync::mpsc;
 
+use crate::shared;
 use crate::*;
 
 #[derive(Debug)]
@@ -49,17 +53,25 @@ fn unidirectional(capacity: usize) -> (Sender, Receiver) {
     (Sender { sender }, Receiver { receiver })
 }
 
-fn assert_bidirectional<C: Bidirectional<u32, u32>>(_: &C) {}
-fn assert_asymmetric_bidirectional<C: Bidirectional<u32, String>>(_: &C) {}
-fn assert_connection_unlinkability<C: SendChannel<u32, Privacy = ConnectionUnlinkability>>(_: &C) {}
+#[test]
+fn types_carry_their_capabilities() {
+    fn bidirectional<C: Bidirectional<I, O>, I, O>() {}
+    fn privacy<C: SendChannel<M, Privacy = P>, M, P>() {}
+
+    bidirectional::<Duplex<Sender, Receiver>, u32, u32>();
+    bidirectional::<Duplex<Sender, Receiver>, u32, String>();
+    bidirectional::<Duplex<Sequential, Sequential>, u32, u32>();
+    bidirectional::<Sequential, u32, u32>();
+
+    privacy::<Duplex<Sender, Receiver>, u32, ConnectionUnlinkability>();
+    privacy::<Sequential, u32, ConnectionUnlinkability>();
+    privacy::<shared::SendHalf<SharedBackend, u32, String>, String, ConnectionUnlinkability>();
+}
 
 #[tokio::test]
 async fn duplex_combines_sending_and_receiving() {
     let (sender, receiver) = unidirectional(1);
     let mut channel = Duplex::new(sender, receiver);
-
-    assert_bidirectional(&channel);
-    assert_connection_unlinkability(&channel);
 
     channel.send(42).await.unwrap();
     assert_eq!(channel.recv().await.unwrap(), 42);
@@ -80,7 +92,6 @@ async fn supports_different_message_types_by_direction() {
     let (sender, receiver) = unidirectional(1);
     let mut channel = Duplex::new(sender, receiver);
 
-    assert_asymmetric_bidirectional(&channel);
     SendChannel::<String>::send(&mut channel, "hello".to_owned())
         .await
         .unwrap();
@@ -90,7 +101,6 @@ async fn supports_different_message_types_by_direction() {
 #[tokio::test]
 async fn preserves_independent_direction_state() {
     let mut channel = Duplex::new(Sequential::default(), Sequential(Some(8)));
-    assert_bidirectional(&channel);
     channel.send(7).await.unwrap();
     assert_eq!(channel.recv().await.unwrap(), 8);
     let (mut sender, _) = channel.into_parts();
@@ -122,16 +132,89 @@ impl RecvChannel<u32> for Sequential {
 
 impl Bidirectional<u32, u32> for Sequential {}
 
-#[tokio::test]
-async fn bidirectional_does_not_require_shared_access() {
-    let mut channel = Sequential::default();
+#[derive(Debug)]
+struct SharedBackend {
+    sender: mpsc::Sender<u32>,
+    receiver: tokio::sync::Mutex<mpsc::Receiver<u32>>,
+    drops: Arc<AtomicUsize>,
+}
 
-    assert_bidirectional(&channel);
-    assert_connection_unlinkability(&channel);
-    channel.send(7).await.unwrap();
-    assert_eq!(channel.recv().await.unwrap(), 7);
-    assert_eq!(
-        channel.recv().await.unwrap_err().kind(),
-        io::ErrorKind::WouldBlock
-    );
+impl SharedBackend {
+    fn new() -> Self {
+        let (sender, receiver) = mpsc::channel(1);
+        Self {
+            sender,
+            receiver: tokio::sync::Mutex::new(receiver),
+            drops: Arc::default(),
+        }
+    }
+}
+
+impl Drop for SharedBackend {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl SendChannel<String> for SharedBackend {
+    type Privacy = ConnectionUnlinkability;
+    type SendError = mpsc::error::SendError<u32>;
+
+    async fn send(&mut self, message: String) -> Result<(), Self::SendError> {
+        self.sender.send(message.len() as u32).await
+    }
+}
+
+impl RecvChannel<u32> for SharedBackend {
+    type RecvError = io::Error;
+
+    async fn recv(&mut self) -> Result<u32, Self::RecvError> {
+        self.receiver
+            .get_mut()
+            .recv()
+            .await
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "receiver closed"))
+    }
+}
+
+impl Bidirectional<u32, String> for SharedBackend {}
+
+impl SharedChannel<u32, String> for SharedBackend {
+    async fn send_shared(&self, message: String) -> Result<(), Self::SendError> {
+        self.sender.send(message.len() as u32).await
+    }
+
+    async fn recv_shared(&self) -> Result<u32, Self::RecvError> {
+        self.receiver
+            .lock()
+            .await
+            .recv()
+            .await
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "receiver closed"))
+    }
+}
+
+#[tokio::test]
+async fn split_halves_do_not_block_each_other() {
+    let (mut sender, mut receiver) = shared::split(SharedBackend::new());
+
+    let receive = receiver.recv();
+    let mut receive = std::pin::pin!(receive);
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(matches!(receive.as_mut().poll(&mut context), Poll::Pending));
+
+    sender.send("shared".to_owned()).await.unwrap();
+    assert_eq!(receive.await.unwrap(), 6);
+}
+
+#[test]
+fn split_keeps_the_backend_until_both_halves_drop() {
+    let backend = SharedBackend::new();
+    let drops = Arc::clone(&backend.drops);
+    let (sender, receiver) = shared::split(backend);
+
+    drop(sender);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    drop(receiver);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
