@@ -122,6 +122,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "fungi-transport"
+version = "0.0.0"
+
+[[package]]
 name = "hex-conservative"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
