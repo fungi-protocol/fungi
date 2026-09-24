@@ -48,6 +48,18 @@ impl WalletStateSnapshot {
             intents: intents.into_iter().collect(),
         }
     }
+
+    /// The coins available to spend.
+    pub(crate) fn utxos(&self) -> &[Utxo] {
+        &self.utxos
+    }
+
+    /// The intents the wallet has yet to satisfy.
+    ///
+    /// A position in this slice names an intent only within this snapshot.
+    pub(crate) fn intents(&self) -> &[Intent] {
+        &self.intents
+    }
 }
 
 #[cfg(test)]

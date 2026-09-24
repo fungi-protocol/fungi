@@ -2,7 +2,10 @@
 
 pub mod batch;
 pub mod blockspace;
-#[expect(dead_code, reason = "no caller in the crate selects change yet")]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "no caller in the crate selects change yet")
+)]
 pub mod change;
 #[cfg_attr(
     not(test),
@@ -17,4 +20,9 @@ pub mod queue;
     reason = "no caller in the crate poses a funding request yet"
 )]
 pub mod selection;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "nothing scores a simulated state yet")
+)]
+pub(crate) mod simulate;
 pub mod wallet;
