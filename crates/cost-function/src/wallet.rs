@@ -29,6 +29,16 @@ impl<Q: Queue> WalletState<Q> {
             queue,
         }
     }
+
+    /// The coins available to spend.
+    pub fn utxos(&self) -> &[Utxo] {
+        &self.utxos
+    }
+
+    /// The intents the wallet has yet to satisfy.
+    pub fn queue(&self) -> &Q {
+        &self.queue
+    }
 }
 
 #[cfg(test)]

@@ -16,6 +16,12 @@ pub trait Queue {
 
     /// Every intent with its id, in no particular order.
     fn iter(&self) -> impl Iterator<Item = (Self::Id, &Intent)>;
+
+    /// The intent `id` names, if the queue still holds it.
+    fn get(&self, id: Self::Id) -> Option<&Intent>;
+
+    /// Drop an intent, because something realized it.
+    fn remove(&mut self, id: Self::Id);
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,6 +57,14 @@ impl Queue for InMemoryQueue {
 
     fn iter(&self) -> impl Iterator<Item = (u64, &Intent)> {
         self.intents.iter().map(|(&id, intent)| (id, intent))
+    }
+
+    fn get(&self, id: u64) -> Option<&Intent> {
+        self.intents.get(&id)
+    }
+
+    fn remove(&mut self, id: u64) {
+        self.intents.remove(&id);
     }
 }
 

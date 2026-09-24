@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use bitcoin::{Amount, ScriptBuf};
+use bitcoin::{Amount, ScriptBuf, TxOut};
 
 /// The required information for an output creation intent.
 ///
@@ -139,6 +139,23 @@ impl Intent {
         Intent {
             inner,
             payoff_curve,
+        }
+    }
+
+    pub fn action(&self) -> &Action {
+        &self.inner
+    }
+}
+
+impl Action {
+    /// The outputs a transaction carrying this out has to pay.
+    /// The shape of this function will change when we support different actions
+    pub(crate) fn outputs(&self) -> Vec<TxOut> {
+        match self {
+            Action::OutputCreation(instructions) => vec![TxOut {
+                value: instructions.amount,
+                script_pubkey: instructions.script_pubkey.clone(),
+            }],
         }
     }
 }
