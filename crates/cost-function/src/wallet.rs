@@ -55,6 +55,21 @@ impl<Id: Eq + Hash> WalletStateSnapshot<Id> {
             intents: intents.into_iter().collect(),
         }
     }
+
+    /// The coins available to spend.
+    pub(crate) fn utxos(&self) -> &[Utxo] {
+        &self.utxos
+    }
+
+    /// The intents the wallet has yet to satisfy, each with its queue id.
+    pub(crate) fn intents(&self) -> impl Iterator<Item = (&Id, &Intent)> {
+        self.intents.iter()
+    }
+
+    /// The intent with queue id `id`, if the wallet still owes it.
+    pub(crate) fn get_intent(&self, id: &Id) -> Option<&Intent> {
+        self.intents.get(id)
+    }
 }
 
 #[cfg(test)]

@@ -8,7 +8,7 @@ use crate::selection::InputSelection;
 
 /// The values of the change outputs a `ChangeSelector` decided to create.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ChangeSelection(Vec<Amount>);
+pub(crate) struct ChangeSelection(pub(crate) Vec<Amount>);
 
 /// Change selection strategy.
 pub(crate) trait ChangeSelector {
