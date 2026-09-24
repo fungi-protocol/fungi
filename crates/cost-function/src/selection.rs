@@ -28,9 +28,9 @@ pub(crate) struct FundingRequest<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct InputSelection {
     /// Coins the selector added. Excludes [`FundingRequest::required`].
-    selected_inputs: Vec<Utxo>,
+    pub(crate) selected_inputs: Vec<Utxo>,
     /// amount left over.
-    surplus: Amount,
+    pub(crate) surplus: Amount,
 }
 
 /// A strategy for closing a [`FundingRequest`]'s funding gap.
@@ -43,7 +43,7 @@ pub(crate) trait CoinSelector {
 /// What a `ChangeSelector` returns.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ChangeSelection {
-    selected_change: Vec<TxOut>,
+    pub(crate) selected_change: Vec<TxOut>,
 }
 
 /// Change selection strategy.
