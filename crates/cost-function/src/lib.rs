@@ -9,4 +9,9 @@ pub(crate) mod decision_tree;
 pub mod intent;
 pub mod plan;
 pub mod queue;
+#[expect(
+    dead_code,
+    reason = "no caller in the crate poses a funding request yet"
+)]
+pub mod selection;
 pub mod wallet;
