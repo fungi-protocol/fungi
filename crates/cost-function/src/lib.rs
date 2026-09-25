@@ -9,3 +9,4 @@ pub(crate) mod decision_tree;
 pub mod intent;
 pub mod plan;
 pub mod queue;
+pub mod wallet;
