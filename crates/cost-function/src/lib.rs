@@ -1,6 +1,7 @@
 //! Scoring the ways a wallet could realize what the user has asked it to do.
 
 pub mod batch;
+pub mod blockspace;
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "nothing walks or builds the tree yet")
