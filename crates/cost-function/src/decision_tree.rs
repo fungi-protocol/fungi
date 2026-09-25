@@ -8,7 +8,7 @@ pub(crate) enum DecisionTree<Id> {
 
 /// One way to place one intent.
 pub(crate) struct Node<Id> {
-    pub(crate) subtree: Box<DecisionTree<Id>>,
+    pub(crate) subtree: DecisionTree<Id>,
 }
 
 #[cfg(test)]
@@ -39,7 +39,7 @@ mod tests {
         };
 
         let tree = DecisionTree::Branch(vec![Node {
-            subtree: Box::new(DecisionTree::Leaf(finished.clone())),
+            subtree: DecisionTree::Leaf(finished.clone()),
         }]);
 
         let nodes = nodes_of(&tree);
