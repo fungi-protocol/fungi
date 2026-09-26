@@ -37,6 +37,7 @@
             "**/Cargo.toml"
           ];
         };
+        settings.formatter.shellcheck.excludes = [ ".envrc.sample" ];
       };
     };
 }
