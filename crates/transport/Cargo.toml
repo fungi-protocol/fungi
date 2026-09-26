@@ -3,3 +3,6 @@ name = "fungi-transport"
 description = "P2P datagram channel abstraction for the Fungi protocol"
 version.workspace = true
 edition.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
