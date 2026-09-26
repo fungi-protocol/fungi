@@ -54,7 +54,7 @@ impl<Event> PersistActions<Event> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::convert::Infallible;
 
     #[derive(Default)]
@@ -80,6 +80,38 @@ mod tests {
         fn close(&self) -> Result<(), Infallible> {
             *self.closed.borrow_mut() = true;
             Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FailingPersister {
+        inner: InMemoryPersister,
+        fail_save: Cell<bool>,
+        fail_load: Cell<bool>,
+        close_calls: Cell<usize>,
+    }
+
+    impl Persister for FailingPersister {
+        type InternalStorageError = TestError;
+        type SessionEvent = u8;
+
+        fn save_event(&self, event: u8) -> Result<(), TestError> {
+            if self.fail_save.get() {
+                return Err(TestError::Save);
+            }
+            self.inner.save_event(event).map_err(|never| match never {})
+        }
+
+        fn load(&self) -> Result<Box<dyn Iterator<Item = u8>>, TestError> {
+            if self.fail_load.get() {
+                return Err(TestError::Load);
+            }
+            self.inner.load().map_err(|never| match never {})
+        }
+
+        fn close(&self) -> Result<(), TestError> {
+            self.close_calls.set(self.close_calls.get() + 1);
+            self.inner.close().map_err(|never| match never {})
         }
     }
 
@@ -138,6 +170,70 @@ mod tests {
     }
 
     #[test]
+    fn a_save_failure_before_append_preserves_previous_events() {
+        for action in [PersistActions::Save(2), PersistActions::SaveAndClose(2)] {
+            let persister = FailingPersister {
+                inner: execute(PersistActions::Save(1)),
+                ..Default::default()
+            };
+            persister.fail_save.set(true);
+
+            let result = action.execute(&persister);
+
+            assert_eq!(result, Err(TestError::Save));
+            let replayed: Vec<_> = persister
+                .load()
+                .expect("no load failure configured")
+                .collect();
+            assert_eq!(replayed, [1]);
+            assert!(!*persister.inner.closed.borrow());
+            assert_eq!(persister.close_calls.get(), 0);
+
+            persister.fail_save.set(false);
+            persister.save_event(3).expect("save failure cleared");
+            assert_eq!(*persister.inner.events.borrow(), [1, 3]);
+        }
+    }
+
+    #[test]
+    fn loading_never_closes_the_session() {
+        for closed in [false, true] {
+            for fail_load in [false, true] {
+                let persister = FailingPersister {
+                    inner: execute(PersistActions::Save(1)),
+                    ..Default::default()
+                };
+                if closed {
+                    persister.close().expect("close cannot fail");
+                }
+                let close_calls = persister.close_calls.get();
+                persister.fail_load.set(fail_load);
+
+                let result = persister.load().map(|events| events.collect::<Vec<_>>());
+
+                let expected = if fail_load {
+                    Err(TestError::Load)
+                } else {
+                    Ok(vec![1])
+                };
+                assert_eq!(result, expected);
+                assert_eq!(*persister.inner.closed.borrow(), closed);
+                assert_eq!(persister.close_calls.get(), close_calls);
+                assert_eq!(*persister.inner.events.borrow(), [1]);
+
+                persister.fail_load.set(false);
+                if !closed {
+                    persister.save_event(2).expect("no save failure configured");
+                }
+                let replayed: Vec<_> = persister.load().expect("load failure cleared").collect();
+                assert_eq!(replayed, if closed { vec![1] } else { vec![1, 2] });
+                assert_eq!(*persister.inner.closed.borrow(), closed);
+                assert_eq!(persister.close_calls.get(), close_calls);
+            }
+        }
+    }
+
+    #[test]
     fn a_closing_save_records_the_event_first() {
         let persister = execute(PersistActions::SaveAndClose(1));
 
@@ -157,6 +253,8 @@ mod tests {
         Save,
         #[error("close failed")]
         Close,
+        #[error("load failed")]
+        Load,
     }
 
     struct MockPersister {
