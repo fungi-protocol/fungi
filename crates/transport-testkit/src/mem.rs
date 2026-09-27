@@ -1,7 +1,11 @@
-//! Typed in-memory links.
+//! Typed in-memory links and connection setup.
 
-use fungi_transport::{Bidirectional, ConnectionUnlinkability, RecvChannel, SendChannel};
+use fungi_transport::{
+    Bidirectional, ChannelBuilder, ConnectionUnlinkability, RecvChannel, SendChannel,
+};
 use tokio::sync::mpsc;
+
+const CONNECTION_QUEUE_CAPACITY: usize = 8;
 
 /// Capacity of each direction of an in-memory link.
 #[derive(Debug, Clone, Default)]
@@ -11,11 +15,11 @@ pub struct MemConfig {
     pub capacity: Option<usize>,
 }
 
-/// An in-memory queue is closed.
+/// An in-memory message or connection queue is closed.
 #[derive(Debug, thiserror::Error)]
 pub enum MemError {
-    /// The other end of the queue has been dropped: sending finds no receiver,
-    /// or receiving finds no sender and no buffered message.
+    /// The other end of the queue has been dropped: sending or connecting finds
+    /// no receiver, or receiving or accepting finds no sender and nothing queued.
     #[error("in-memory path closed")]
     Closed,
 }
@@ -86,6 +90,71 @@ pub fn bidirectional<M: Send>(config: MemConfig) -> (MemChannel<M>, MemChannel<M
             },
         ),
     )
+}
+
+/// Address of the single listener associated with a connector.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct MemAddr;
+
+/// Creates links and submits their remote endpoints to a listener.
+///
+/// Pending endpoints are buffered so construction can finish before acceptance.
+/// A full connection queue waits for the listener.
+#[derive(Debug)]
+pub struct MemChannelBuilder<M = Vec<u8>> {
+    config: MemConfig,
+    incoming: mpsc::Sender<MemChannel<M>>,
+}
+
+impl<M> Clone for MemChannelBuilder<M> {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            incoming: self.incoming.clone(),
+        }
+    }
+}
+
+/// Accepts the remote endpoints created by its connector.
+#[derive(Debug)]
+pub struct MemListener<M = Vec<u8>> {
+    incoming: mpsc::Receiver<MemChannel<M>>,
+}
+
+/// Create a connector and its listener.
+pub fn network<M>(config: MemConfig) -> (MemChannelBuilder<M>, MemListener<M>) {
+    let (incoming, receiver) = mpsc::channel(CONNECTION_QUEUE_CAPACITY);
+    (
+        MemChannelBuilder { config, incoming },
+        MemListener { incoming: receiver },
+    )
+}
+
+impl<M: Send> ChannelBuilder<M> for MemChannelBuilder<M> {
+    type Privacy = ConnectionUnlinkability;
+    type Input = MemAddr;
+    type Channel = MemChannel<M>;
+    type BuildError = MemError;
+
+    async fn build(&mut self, _address: &MemAddr) -> Result<Self::Channel, MemError> {
+        let (local, remote) = bidirectional(self.config.clone());
+        self.incoming
+            .send(remote)
+            .await
+            .map_err(|_| MemError::Closed)?;
+        Ok(local)
+    }
+}
+
+impl<M: Send> ChannelBuilder<M> for MemListener<M> {
+    type Privacy = ConnectionUnlinkability;
+    type Input = ();
+    type Channel = MemChannel<M>;
+    type BuildError = MemError;
+
+    async fn build(&mut self, _input: &()) -> Result<Self::Channel, MemError> {
+        self.incoming.recv().await.ok_or(MemError::Closed)
+    }
 }
 
 #[cfg(test)]
@@ -193,6 +262,150 @@ mod tests {
             });
             left.send(Message("bounded".into())).await.unwrap();
             assert_eq!(right.recv().await.unwrap(), Message("bounded".into()));
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connected_links_can_reconnect_after_peer_loss() {
+        deadline(async {
+            let (connector, listener) = network(MemConfig::default());
+            testkit::build_use_drop_rebuild(connector, listener, &MemAddr, |error| {
+                matches!(error, MemError::Closed)
+            })
+            .await;
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn listener_delivers_typed_connected_peers() {
+        deadline(async {
+            let (mut connector, mut listener) = network(MemConfig::default());
+            let mut left = connector.build(&MemAddr).await.unwrap();
+            left.send(Message("before accept".into())).await.unwrap();
+            let mut right = listener.build(&()).await.unwrap();
+            assert_eq!(right.recv().await.unwrap(), Message("before accept".into()));
+            drop(right);
+            assert!(matches!(
+                left.send(Message("closed".into())).await,
+                Err(MemError::Closed)
+            ));
+            assert!(matches!(left.recv().await, Err(MemError::Closed)));
+            drop(listener);
+            assert!(matches!(
+                connector.build(&MemAddr).await,
+                Err(MemError::Closed)
+            ));
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn accepting_a_connection_unblocks_a_saturated_connector() {
+        deadline(async {
+            let (mut connector, mut listener) = network::<usize>(MemConfig::default());
+            let mut clients = Vec::new();
+            for index in 0..CONNECTION_QUEUE_CAPACITY {
+                let mut client = connector.build(&MemAddr).await.unwrap();
+                client.send(index).await.unwrap();
+                clients.push(client);
+            }
+            let pending = connector.build(&MemAddr);
+            tokio::pin!(pending);
+            assert!(futures_util::poll!(&mut pending).is_pending());
+            let mut accepted = listener.build(&()).await.unwrap();
+            assert_eq!(accepted.recv().await.unwrap(), 0);
+            let mut extra_client = pending.await.unwrap();
+            extra_client.send(CONNECTION_QUEUE_CAPACITY).await.unwrap();
+            for index in 1..=CONNECTION_QUEUE_CAPACITY {
+                let mut accepted = listener.build(&()).await.unwrap();
+                assert_eq!(accepted.recv().await.unwrap(), index);
+            }
+            drop(clients);
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cloned_connectors_keep_concurrent_peer_links_distinct() {
+        deadline(async {
+            let (connector, mut listener) = network::<usize>(MemConfig::default());
+            let connecting = async {
+                futures_util::future::join_all((0..16).map(|index| {
+                    let mut connector = connector.clone();
+                    async move {
+                        let mut client = connector.build(&MemAddr).await.unwrap();
+                        client.send(index).await.unwrap();
+                        assert_eq!(client.recv().await.unwrap(), index + 100);
+                    }
+                }))
+                .await;
+            };
+            let accepting = async {
+                let mut seen = std::collections::BTreeSet::new();
+                for _ in 0..16 {
+                    let mut server = listener.build(&()).await.unwrap();
+                    let index = server.recv().await.unwrap();
+                    assert!(seen.insert(index), "duplicate peer connection");
+                    server.send(index + 100).await.unwrap();
+                }
+                assert_eq!(seen, (0..16).collect());
+            };
+            futures_util::future::join(connecting, accepting).await;
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_listener_wakes_a_connector_waiting_for_capacity() {
+        deadline(async {
+            let (mut connector, listener) = network::<usize>(MemConfig::default());
+            let mut clients = Vec::new();
+            for _ in 0..CONNECTION_QUEUE_CAPACITY {
+                clients.push(connector.build(&MemAddr).await.unwrap());
+            }
+            let pending = connector.build(&MemAddr);
+            tokio::pin!(pending);
+            assert!(futures_util::poll!(&mut pending).is_pending());
+            drop(listener);
+            assert!(matches!(pending.await, Err(MemError::Closed)));
+            for mut client in clients {
+                assert!(matches!(client.recv().await, Err(MemError::Closed)));
+                assert!(matches!(client.send(0).await, Err(MemError::Closed)));
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn listener_drains_connections_after_all_connector_clones_are_dropped() {
+        deadline(async {
+            let (mut connector, mut listener) = network::<usize>(MemConfig::default());
+            let mut clone = connector.clone();
+            let mut first = connector.build(&MemAddr).await.unwrap();
+            let mut second = clone.build(&MemAddr).await.unwrap();
+            first.send(1).await.unwrap();
+            second.send(2).await.unwrap();
+            drop(connector);
+            let mut accepted = listener.build(&()).await.unwrap();
+            assert_eq!(accepted.recv().await.unwrap(), 1);
+            drop(clone);
+            let mut accepted = listener.build(&()).await.unwrap();
+            assert_eq!(accepted.recv().await.unwrap(), 2);
+            assert!(matches!(listener.build(&()).await, Err(MemError::Closed)));
+            accepted.send(3).await.unwrap();
+            assert_eq!(second.recv().await.unwrap(), 3);
+
+            let (connector, mut listener) = network::<usize>(MemConfig::default());
+            let clone = connector.clone();
+            let pending = listener.build(&());
+            tokio::pin!(pending);
+            assert!(futures_util::poll!(&mut pending).is_pending());
+            drop(connector);
+            assert!(futures_util::poll!(&mut pending).is_pending());
+            drop(clone);
+            assert!(matches!(pending.await, Err(MemError::Closed)));
         })
         .await;
     }
