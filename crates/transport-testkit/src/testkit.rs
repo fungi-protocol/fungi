@@ -1,7 +1,8 @@
 //! Reusable conformance checks for byte channel implementations.
 //!
 //! Supply fresh channels and select checks for the backend's guarantees.
-//! Closure detection is an additional property, not a requirement of the traits.
+//! Closure detection and recovery after size rejection are additional properties,
+//! not requirements of the traits.
 
 use fungi_transport::{RecvChannel, SendChannel};
 
@@ -37,4 +38,62 @@ pub async fn closed_after_peer_drop<C: RecvChannel<Vec<u8>>>(
 ) {
     drop(peer);
     assert!(is_closed(&channel.recv().await.unwrap_err()));
+}
+
+/// Verify rejection of a payload above the declared limit.
+///
+/// The payload must be rejected before the peer receives anything.
+/// `max + 1` must be representable and small enough to allocate for this test.
+pub async fn too_large<S: SendChannel<Vec<u8>>, R: RecvChannel<Vec<u8>>>(
+    mut sender: S,
+    mut receiver: R,
+    max: usize,
+    is_too_large: impl FnOnce(&S::SendError) -> bool,
+) {
+    let reception = std::pin::pin!(receiver.recv());
+    assert!(is_too_large(
+        &submit_oversized(&mut sender, reception, max).await
+    ));
+}
+
+/// Verify that a size rejection leaves the channel usable.
+///
+/// The payload must be rejected before the peer receives anything.
+/// `max + 1` must be representable and small enough to allocate for this test.
+pub async fn too_large_is_recoverable<S: SendChannel<Vec<u8>>, R: RecvChannel<Vec<u8>>>(
+    mut sender: S,
+    mut receiver: R,
+    max: usize,
+    is_too_large: impl FnOnce(&S::SendError) -> bool,
+) {
+    let mut reception = std::pin::pin!(receiver.recv());
+    assert!(is_too_large(
+        &submit_oversized(&mut sender, reception.as_mut(), max).await
+    ));
+
+    let recovery_message = vec![0x42; max.min(5)];
+    let (sent, received) =
+        futures_util::future::join(sender.send(recovery_message.clone()), reception).await;
+    sent.unwrap();
+    assert_eq!(received.unwrap(), recovery_message);
+}
+
+/// Submit a payload above the limit and return its rejection.
+///
+/// Fails if `reception` completes first.
+async fn submit_oversized<S: SendChannel<Vec<u8>>, T: std::fmt::Debug>(
+    sender: &mut S,
+    reception: std::pin::Pin<&mut impl std::future::Future<Output = T>>,
+    max: usize,
+) -> S::SendError {
+    let size = max
+        .checked_add(1)
+        .expect("test limit must allow a larger payload");
+    let submission = std::pin::pin!(sender.send(vec![0; size]));
+    match futures_util::future::select(submission, reception).await {
+        futures_util::future::Either::Left((result, _)) => result.unwrap_err(),
+        futures_util::future::Either::Right((received, _)) => {
+            panic!("receiver completed before the oversized payload was rejected: {received:?}")
+        }
+    }
 }
