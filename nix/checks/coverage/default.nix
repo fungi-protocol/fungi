@@ -24,10 +24,12 @@
                 // {
                   cargoArtifacts = cargoWorkspace.cargoArtifactsDev;
                   pnameSuffix = "-coverage-collect";
-                  nativeBuildInputs = with pkgs; [
-                    cargo-llvm-cov
-                    cargo-nextest
-                  ];
+                  nativeBuildInputs =
+                    cargoWorkspace.commonArgs.nativeBuildInputs
+                    ++ (with pkgs; [
+                      cargo-llvm-cov
+                      cargo-nextest
+                    ]);
                   buildPhaseCargoCommand = "bash ${./collect.sh} $out ${pkgs.lib.escapeShellArg cargoWorkspace.cargoManifestPath}";
                   installPhase = "true";
                 }
