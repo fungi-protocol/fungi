@@ -16,6 +16,7 @@ mkdir -p "$out"
 cargo llvm-cov report \
   --manifest-path "$manifest_path" \
   --lcov \
+  --ignore-filename-regex '(^|/)target/.*/out/channel_capnp\.rs$' \
   --output-path "$out/coverage.lcov"
 
 test -s "$out/coverage.lcov"
