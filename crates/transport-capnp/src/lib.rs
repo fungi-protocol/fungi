@@ -11,7 +11,7 @@ mod error;
 mod protocol;
 mod server;
 
-pub use channel::CapnpChannel;
+pub use channel::{CapnpBidirectional, CapnpChannel, CapnpRecvHalf, CapnpSendHalf};
 pub use error::{RecvError, SendError};
 pub use server::serve;
 
