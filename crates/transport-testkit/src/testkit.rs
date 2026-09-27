@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use std::future::Future;
 use std::time::Duration;
 
-use fungi_transport::{Duplex, RecvChannel, SendChannel};
+use fungi_transport::{ChannelBuilder, Duplex, RecvChannel, SendChannel};
 use futures_util::future::{Either, FusedFuture, FutureExt};
 
 /// Verify intact delivery in both directions.
@@ -156,6 +156,31 @@ async fn submit_oversized<S: SendChannel<Vec<u8>>, E>(
             "receiver completed before the oversized payload was rejected: {} bytes",
             received.len()
         ),
+    }
+}
+
+/// Verify connection establishment and reconnection once both ends are gone.
+///
+/// Use only for connection-backed channels.
+pub async fn build_use_drop_rebuild<C, L>(mut connector: C, mut listener: L, address: &C::Input)
+where
+    C: ChannelBuilder,
+    C::Channel: SendChannel<Vec<u8>> + RecvChannel<Vec<u8>>,
+    L: ChannelBuilder<Input = (), Channel = C::Channel>,
+{
+    // The second connection catches state the dropped first one left behind.
+    for connection in ["first connection", "second connection"] {
+        // Fail as soon as either side fails; the other may wait indefinitely.
+        let (mut client, mut server) = futures_util::future::join(
+            async { connector.build(address).await.expect(connection) },
+            async { listener.build(&()).await.expect(connection) },
+        )
+        .await;
+        assert_eq!(
+            exchange(&mut client, &mut server, b"message").await,
+            b"message"
+        );
+        assert_eq!(exchange(&mut server, &mut client, b"reply").await, b"reply");
     }
 }
 

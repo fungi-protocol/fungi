@@ -3,7 +3,9 @@
 
 //! Exercise conformance helpers independently of a public backend.
 
-use fungi_transport::{ConnectionUnlinkability, Duplex, RecvChannel, SendChannel};
+use std::io;
+
+use fungi_transport::{ChannelBuilder, ConnectionUnlinkability, Duplex, RecvChannel, SendChannel};
 use fungi_transport_testkit::testkit;
 use tokio::sync::mpsc;
 
@@ -62,8 +64,41 @@ impl RecvChannel for Receiver {
     }
 }
 
+struct Connector(mpsc::Sender<BidirectionalChannel>);
+struct Listener(mpsc::Receiver<BidirectionalChannel>);
+
+impl ChannelBuilder for Connector {
+    type Privacy = ConnectionUnlinkability;
+    type Input = ();
+    type Channel = BidirectionalChannel;
+    type BuildError = io::Error;
+
+    async fn build(&mut self, _: &()) -> Result<BidirectionalChannel, io::Error> {
+        let (client, server) = pair(1024);
+        self.0
+            .send(server)
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "listener closed"))?;
+        Ok(client)
+    }
+}
+
+impl ChannelBuilder for Listener {
+    type Privacy = ConnectionUnlinkability;
+    type Input = ();
+    type Channel = BidirectionalChannel;
+    type BuildError = io::Error;
+
+    async fn build(&mut self, _: &()) -> Result<BidirectionalChannel, io::Error> {
+        self.0
+            .recv()
+            .await
+            .ok_or(io::Error::new(io::ErrorKind::BrokenPipe, "listener closed"))
+    }
+}
+
 #[tokio::test(start_paused = true)]
-async fn helpers_check_delivery_limits_cancellation_and_bursts() {
+async fn helpers_check_delivery_limits_cancellation_and_reconnection() {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         let (left, right) = pair(1024);
         testkit::roundtrip_both_directions(left, right).await;
@@ -85,6 +120,9 @@ async fn helpers_check_delivery_limits_cancellation_and_bursts() {
 
         let (left, right) = pair(1024);
         testkit::mutual_bursts_converge(left, right, 16).await;
+
+        let (sender, receiver) = mpsc::channel(1);
+        testkit::build_use_drop_rebuild(Connector(sender), Listener(receiver), &()).await;
     })
     .await
     .expect("conformance helpers must complete");
@@ -350,6 +388,26 @@ async fn recovery_rejects_a_channel_closed_by_the_rejection() {
     .await;
 }
 
+struct FailingConnector;
+impl ChannelBuilder for FailingConnector {
+    type Privacy = ConnectionUnlinkability;
+    type Input = ();
+    type Channel = BidirectionalChannel;
+    type BuildError = io::Error;
+    async fn build(&mut self, _: &()) -> Result<BidirectionalChannel, io::Error> {
+        Err(io::Error::other("injected construction failure"))
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn construction_checks_reject_a_failed_connection() {
+    let (_queue, receiver) = mpsc::channel(1);
+    rejected(async move {
+        testkit::build_use_drop_rebuild(FailingConnector, Listener(receiver), &()).await
+    })
+    .await;
+}
+
 #[derive(Debug)]
 struct RetainingReceiver {
     inner: Receiver,
@@ -390,6 +448,44 @@ async fn bursts_accept_empty_and_single_message_exchanges() {
     }
 }
 
+struct FailingReconnect {
+    connector: Connector,
+    connected: bool,
+}
+
+impl ChannelBuilder for FailingReconnect {
+    type Privacy = ConnectionUnlinkability;
+    type Input = ();
+    type Channel = BidirectionalChannel;
+    type BuildError = io::Error;
+    async fn build(&mut self, input: &()) -> Result<BidirectionalChannel, io::Error> {
+        let channel = self.connector.build(input).await?;
+        if self.connected {
+            Err(io::Error::other("injected reconnection failure"))
+        } else {
+            self.connected = true;
+            Ok(channel)
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn construction_checks_reject_a_failed_reconnection() {
+    let (sender, receiver) = mpsc::channel(1);
+    rejected(async move {
+        testkit::build_use_drop_rebuild(
+            FailingReconnect {
+                connector: Connector(sender),
+                connected: false,
+            },
+            Listener(receiver),
+            &(),
+        )
+        .await;
+    })
+    .await;
+}
+
 #[tokio::test]
 #[should_panic(expected = "test limit must allow a larger payload")]
 async fn size_check_rejects_an_unrepresentable_test_payload() {
@@ -414,4 +510,84 @@ async fn rejection_requires_the_helper_to_stop_within_its_deadline() {
 #[should_panic(expected = "helper accepted a defective backend")]
 async fn rejection_requires_the_helper_to_panic() {
     rejected(async {}).await;
+}
+
+/// Gives the client a closed receiver but keeps the real one open, so the
+/// server's sends succeed and only the client's reception fails.
+struct BrokenReceiveConnector {
+    connector: Connector,
+    retained: Vec<Receiver>,
+}
+
+impl ChannelBuilder for BrokenReceiveConnector {
+    type Privacy = ConnectionUnlinkability;
+    type Input = ();
+    type Channel = BidirectionalChannel;
+    type BuildError = io::Error;
+    async fn build(&mut self, input: &()) -> Result<BidirectionalChannel, io::Error> {
+        let (sender, receiver) = self.connector.build(input).await?.into_parts();
+        self.retained.push(receiver);
+        let (_, closed) = mpsc::channel(1);
+        Ok(Duplex::new(sender, Receiver(closed)))
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn construction_checks_reject_a_client_that_cannot_receive() {
+    let (sender, receiver) = mpsc::channel(1);
+    rejected(async move {
+        testkit::build_use_drop_rebuild(
+            BrokenReceiveConnector {
+                connector: Connector(sender),
+                retained: Vec::new(),
+            },
+            Listener(receiver),
+            &(),
+        )
+        .await;
+    })
+    .await;
+}
+
+/// Like [`BrokenReceiveConnector`], from the second connection on.
+struct BrokenReceiveOnReconnect {
+    connector: Connector,
+    connected: bool,
+    retained: Vec<Receiver>,
+}
+
+impl ChannelBuilder for BrokenReceiveOnReconnect {
+    type Privacy = ConnectionUnlinkability;
+    type Input = ();
+    type Channel = BidirectionalChannel;
+    type BuildError = io::Error;
+    async fn build(&mut self, input: &()) -> Result<BidirectionalChannel, io::Error> {
+        let channel = self.connector.build(input).await?;
+        if !self.connected {
+            self.connected = true;
+            return Ok(channel);
+        }
+        let (sender, receiver) = channel.into_parts();
+        self.retained.push(receiver);
+        let (_, closed) = mpsc::channel(1);
+        Ok(Duplex::new(sender, Receiver(closed)))
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn construction_checks_reject_a_reconnected_client_that_cannot_receive() {
+    let (sender, receiver) = mpsc::channel(1);
+    rejected(async move {
+        testkit::build_use_drop_rebuild(
+            BrokenReceiveOnReconnect {
+                connector: Connector(sender),
+                connected: false,
+                retained: Vec::new(),
+            },
+            Listener(receiver),
+            &(),
+        )
+        .await;
+    })
+    .await;
 }
