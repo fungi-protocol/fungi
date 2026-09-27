@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use std::future::Future;
 use std::time::Duration;
 
-use fungi_transport::{Bidirectional, RecvChannel, SendChannel};
+use fungi_transport::{Bidirectional, ChannelBuilder, RecvChannel, SendChannel};
 
 /// Verify intact delivery in both directions.
 pub async fn roundtrip_both_directions<C: SendChannel<Vec<u8>> + RecvChannel<Vec<u8>>>(
@@ -153,6 +153,63 @@ async fn submit_oversized<S: SendChannel<Vec<u8>>, T: std::fmt::Debug>(
             panic!("receiver completed before the oversized payload was rejected: {received:?}")
         }
     }
+}
+
+/// Verify connection establishment, peer loss, and reconnection.
+///
+/// Use only for connection-backed channels that detect peer loss on both the
+/// connecting and the accepting side.
+pub async fn build_use_drop_rebuild<C, L>(
+    mut connector: C,
+    mut listener: L,
+    address: &C::Input,
+    is_closed: impl Fn(&<C::Channel as RecvChannel<Vec<u8>>>::RecvError) -> bool,
+) where
+    C: ChannelBuilder,
+    C::Channel: SendChannel<Vec<u8>> + RecvChannel<Vec<u8>>,
+    L: ChannelBuilder<Input = (), Channel = C::Channel>,
+{
+    // Fail as soon as either side fails; the other may wait indefinitely.
+    let (mut client, mut server) = futures_util::future::join(
+        async { connector.build(address).await.expect("connect") },
+        async { listener.build(&()).await.expect("accept") },
+    )
+    .await;
+
+    let (sent, received) =
+        futures_util::future::join(client.send(b"message".to_vec()), server.recv()).await;
+    sent.unwrap();
+    assert_eq!(received.unwrap(), b"message");
+    let (sent, reply) =
+        futures_util::future::join(server.send(b"reply".to_vec()), client.recv()).await;
+    sent.unwrap();
+    assert_eq!(reply.unwrap(), b"reply");
+
+    drop(server);
+    let detected = tokio::time::timeout(Duration::from_secs(5), client.recv())
+        .await
+        .expect("a dropped peer must not leave recv pending forever");
+    assert!(is_closed(&detected.unwrap_err()));
+
+    let (mut client, mut server) = futures_util::future::join(
+        async { connector.build(address).await.expect("reconnect") },
+        async { listener.build(&()).await.expect("reaccept") },
+    )
+    .await;
+    let (sent, received) =
+        futures_util::future::join(client.send(b"again".to_vec()), server.recv()).await;
+    sent.unwrap();
+    assert_eq!(received.unwrap(), b"again");
+    let (sent, reply) =
+        futures_util::future::join(server.send(b"answer".to_vec()), client.recv()).await;
+    sent.unwrap();
+    assert_eq!(reply.unwrap(), b"answer");
+
+    drop(client);
+    let detected = tokio::time::timeout(Duration::from_secs(5), server.recv())
+        .await
+        .expect("a dropped peer must not leave recv pending forever");
+    assert!(is_closed(&detected.unwrap_err()));
 }
 
 /// Verify that each side receives the peer's burst under backpressure, in any order.
