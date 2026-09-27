@@ -18,6 +18,12 @@ pub enum SendError {
 /// A bridge or remote receive failure.
 #[derive(Debug, thiserror::Error)]
 pub enum RecvError {
+    /// The local receive limit rejected a complete payload; the channel remains usable.
+    #[error("received message exceeds {max} bytes")]
+    TooLarge {
+        /// Maximum accepted incoming payload length in bytes.
+        max: usize,
+    },
     /// The RPC channel is closed.
     #[error("RPC channel closed")]
     Closed,
