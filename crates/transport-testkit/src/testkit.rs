@@ -1,7 +1,8 @@
 //! Reusable conformance checks for byte channel implementations.
 //!
 //! Supply fresh channels and select checks for the backend's guarantees.
-//! Closure detection is an additional property, not a requirement of the traits.
+//! Closure detection and recovery after size rejection are additional properties,
+//! not requirements of the traits.
 
 use fungi_transport::{RecvChannel, SendChannel};
 
@@ -37,4 +38,41 @@ pub async fn closed_after_peer_drop<C: RecvChannel<Vec<u8>>>(
 ) {
     drop(peer);
     assert!(is_closed(&channel.recv().await.unwrap_err()));
+}
+
+/// Verify rejection of a payload above the declared limit.
+///
+/// `max + 1` must be representable and small enough to allocate for this test.
+pub async fn too_large<C: SendChannel<Vec<u8>>>(
+    mut channel: C,
+    max: usize,
+    is_too_large: impl FnOnce(&C::SendError) -> bool,
+) {
+    let size = max
+        .checked_add(1)
+        .expect("test limit must allow a larger payload");
+    let message = vec![0; size];
+    assert!(is_too_large(&channel.send(message).await.unwrap_err()));
+}
+
+/// Verify that a size rejection leaves the channel usable.
+///
+/// `max + 1` must be representable and small enough to allocate for this test.
+pub async fn too_large_is_recoverable<S: SendChannel<Vec<u8>>, R: RecvChannel<Vec<u8>>>(
+    mut sender: S,
+    mut receiver: R,
+    max: usize,
+    is_too_large: impl FnOnce(&S::SendError) -> bool,
+) {
+    let size = max
+        .checked_add(1)
+        .expect("test limit must allow a larger payload");
+    let message = vec![0; size];
+    assert!(is_too_large(&sender.send(message).await.unwrap_err()));
+
+    let recovery_message = vec![0x42; max.min(5)];
+    let (sent, received) =
+        futures_util::future::join(sender.send(recovery_message.clone()), receiver.recv()).await;
+    sent.unwrap();
+    assert_eq!(received.unwrap(), recovery_message);
 }
