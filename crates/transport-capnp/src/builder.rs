@@ -45,6 +45,11 @@ impl CapnpBuilder {
     pub fn set_max_recv_message_len(&mut self, max: usize) {
         self.max_recv_message_len = max;
     }
+
+    /// Treat this remote builder as an inbound builder with unit input.
+    pub fn into_acceptor(self) -> CapnpAcceptor {
+        CapnpAcceptor(self)
+    }
 }
 impl ChannelBuilder for CapnpBuilder {
     type Privacy = Unspecified;
@@ -65,5 +70,17 @@ impl ChannelBuilder for CapnpBuilder {
             .await
             .map_err(|_| BuildError::Unreachable)?
             .map(CapnpChannel::into_channel)
+    }
+}
+/// Inbound remote builder. Sends an empty token for each acceptance request.
+#[derive(Debug)]
+pub struct CapnpAcceptor(CapnpBuilder);
+impl ChannelBuilder for CapnpAcceptor {
+    type Privacy = Unspecified;
+    type Input = ();
+    type Channel = CapnpBidirectional;
+    type BuildError = BuildError;
+    async fn build(&mut self, _: &()) -> Result<CapnpBidirectional, BuildError> {
+        self.0.build(&Vec::new()).await
     }
 }
