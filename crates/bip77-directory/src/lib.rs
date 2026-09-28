@@ -15,6 +15,9 @@ use fungi_ohttp::mailbox_api::{self, Client, ShortId};
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod testing;
+mod transport;
+
+pub use transport::{Builder, Receiver, Sender};
 
 /// Sends an encapsulated request to its OHTTP relay.
 ///
@@ -30,6 +33,14 @@ pub trait Relay: Send + Sync {
         &self,
         request: OhttpRequest,
     ) -> impl Future<Output = Result<Vec<u8>, Self::Error>> + Send;
+}
+
+impl<R: Relay> Relay for std::sync::Arc<R> {
+    type Error = R::Error;
+
+    async fn post(&self, request: OhttpRequest) -> Result<Vec<u8>, Self::Error> {
+        (**self).post(request).await
+    }
 }
 
 /// Failure to use a BIP77 directory as a [`Directory`].
