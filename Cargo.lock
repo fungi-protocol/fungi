@@ -1116,6 +1116,7 @@ dependencies = [
  "bhttp 0.6.1",
  "bitcoin-ohttp",
  "fungi-mailboxes",
+ "fungi-transport",
  "rand 0.8.8",
  "thiserror 2.0.20",
  "tokio",
