@@ -526,3 +526,57 @@ async fn encrypted_response_must_contain_valid_bhttp_response_control() {
 fn invalid_key_configuration_is_rejected() {
     assert!(OhttpExchange::new(Vec::new()).is_err());
 }
+
+#[tokio::test(start_paused = true)]
+async fn empty_ohttp_polls_can_be_cancelled_without_skipping_messages() {
+    use fungi_transport::{ChannelBuilder, RecvChannel, SendChannel};
+    use std::future::Future;
+    use std::pin::pin;
+    use std::task::{Context, Waker};
+
+    let (exchange, _) = ohttp_loopback();
+    let mut builder = Builder::new(exchange, "https://directory.test").unwrap();
+    let mut sender = builder.build(&[18; 32]).await.unwrap();
+    let mut receiver = builder.receiver([18; 32]);
+    for message in [b"first".to_vec(), b"second".to_vec()] {
+        // Poll through an encrypted 202, then cancel the pending receive.
+        {
+            let mut receive = pin!(receiver.recv());
+            for _ in 0..2 {
+                assert!(
+                    receive
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+            }
+        }
+        let (sent, received) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(sender.send(message.clone()), receiver.recv())
+        })
+        .await
+        .unwrap();
+        sent.unwrap();
+        assert_eq!(received.unwrap(), message);
+    }
+}
+
+#[tokio::test]
+async fn channel_ends_resume_after_a_restart() {
+    use fungi_transport::{ChannelBuilder, RecvChannel, SendChannel, Unspecified};
+
+    fn unspecified<C: SendChannel<Privacy = Unspecified>>(_: &C) {}
+    let (exchange, _) = ohttp_loopback();
+    let mut builder = Builder::new(exchange, "https://directory.test").unwrap();
+    let mut sender = builder.build(&[25; 32]).await.unwrap();
+    unspecified(&sender);
+    let mut receiver = builder.receiver([25; 32]);
+    sender.send(b"before".to_vec()).await.unwrap();
+    assert_eq!(receiver.recv().await.unwrap(), b"before");
+    let (send_slot_id, receive_slot_id) = (sender.next_slot_id(), receiver.next_slot_id());
+
+    let mut sender = builder.resume_sender([25; 32], send_slot_id);
+    let mut receiver = builder.resume_receiver([25; 32], receive_slot_id);
+    sender.send(b"after".to_vec()).await.unwrap();
+    assert_eq!(receiver.recv().await.unwrap(), b"after");
+}
