@@ -10,6 +10,7 @@
       fungi-transport = { };
       fungi-transport-tor-socks = { };
       fungi-mailboxes = { };
+      fungi-bip77-directory = { };
     };
   };
 }
