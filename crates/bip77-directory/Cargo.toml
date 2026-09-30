@@ -1,0 +1,18 @@
+[package]
+name = "fungi-bip77-directory"
+description = "BIP77 directory for fungi-mailboxes"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+fungi-mailboxes = { path = "../mailboxes" }
+fungi-ohttp = { path = "../ohttp" }
+thiserror = "2"
+
+[dev-dependencies]
+bhttp = "0.7.2"
+bitcoin-ohttp = "0.6.0"
+tokio = { version = "1", features = ["macros", "rt"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
