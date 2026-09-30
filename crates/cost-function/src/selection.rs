@@ -40,6 +40,23 @@ pub(crate) trait CoinSelector {
     fn select(&self, request: FundingRequest<'_>) -> Result<InputSelection, Self::Error>;
 }
 
+/// What a `ChangeSelector` returns.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ChangeSelection {
+    selected_change: Vec<TxOut>,
+}
+
+/// Change selection strategy.
+pub(crate) trait ChangeSelector {
+    type Error;
+
+    fn select(
+        &self,
+        request: InputSelection,
+        dust_limit: Amount,
+    ) -> Result<ChangeSelection, Self::Error>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
