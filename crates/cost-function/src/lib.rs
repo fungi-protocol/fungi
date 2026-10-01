@@ -15,4 +15,9 @@ pub mod queue;
     reason = "no caller in the crate poses a funding request yet"
 )]
 pub mod selection;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "nothing scores a simulated state yet")
+)]
+pub(crate) mod simulate;
 pub mod wallet;

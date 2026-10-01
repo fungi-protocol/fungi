@@ -5,6 +5,7 @@ version.workspace = true
 
 [dependencies]
 bitcoin = "=0.32.8"
+rand = "0.8"
 
 [dev-dependencies]
 proptest = "=1.11.0"
