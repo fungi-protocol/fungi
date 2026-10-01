@@ -94,12 +94,12 @@ mod tests {
             .save_event(2)
             .expect("in memory storage cannot fail");
 
-        let replayed: Vec<u8> = persister
+        let loaded_events: Vec<u8> = persister
             .load()
             .expect("in memory storage cannot fail")
             .collect();
 
-        assert_eq!(replayed, [1, 2]);
+        assert_eq!(loaded_events, [1, 2]);
     }
 
     #[test]
@@ -119,14 +119,6 @@ mod tests {
             .expect("in memory storage cannot fail");
 
         persister
-    }
-
-    #[test]
-    fn a_no_op_records_nothing() {
-        let persister = execute(PersistActions::NoOp);
-
-        assert!(persister.events.borrow().is_empty());
-        assert!(!*persister.closed.borrow());
     }
 
     #[test]
@@ -182,6 +174,34 @@ mod tests {
             self.calls.borrow_mut().push(Call::Close);
             self.close_result
         }
+    }
+
+    #[test]
+    fn a_no_op_makes_no_storage_calls() {
+        let persister = MockPersister {
+            calls: RefCell::new(vec![]),
+            save_result: Ok(()),
+            close_result: Ok(()),
+        };
+
+        let result = PersistActions::NoOp.execute(&persister);
+
+        assert_eq!(result, Ok(()));
+        assert!(persister.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_save_calls_save_once_without_closing() {
+        let persister = MockPersister {
+            calls: RefCell::new(vec![]),
+            save_result: Ok(()),
+            close_result: Ok(()),
+        };
+
+        let result = PersistActions::Save(1).execute(&persister);
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(*persister.calls.borrow(), [Call::Save(1)]);
     }
 
     #[test]
