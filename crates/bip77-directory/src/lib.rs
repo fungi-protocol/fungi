@@ -12,6 +12,12 @@ use bech32::{Hrp, NoChecksum};
 use fungi_mailbox::{MailboxStore, PutOutcome, SlotId};
 use url::Url;
 
+mod ohttp;
+
+pub use ohttp::{
+    ENCAPSULATED_MESSAGE_BYTES, OhttpExchange, OhttpExchangeError, Relay, SingleRelay,
+};
+
 /// A BIP77 mailbox identifier encoded as 13 uppercase bech32 characters.
 ///
 /// Uses the first 64 bits of a Fungi slot ID, rather than a Payjoin public-key
