@@ -1,13 +1,14 @@
 //! Reusable conformance checks for byte channel implementations.
 //!
 //! Supply fresh channels and select checks for the backend's guarantees.
-//! Cancellation safety, closure detection, and recovery after size rejection are
-//! additional properties, not requirements of the traits.
+//! Cancellation safety, closure detection, duplicate-free delivery, and recovery
+//! after size rejection are additional properties, not requirements of the traits.
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::time::Duration;
 
-use fungi_transport::{RecvChannel, SendChannel};
+use fungi_transport::{Bidirectional, RecvChannel, SendChannel};
 
 /// Verify intact delivery in both directions.
 pub async fn roundtrip_both_directions<C: SendChannel<Vec<u8>> + RecvChannel<Vec<u8>>>(
@@ -131,4 +132,54 @@ pub async fn too_large_is_recoverable<S: SendChannel<Vec<u8>>, R: RecvChannel<Ve
         futures_util::future::join(sender.send(recovery_message.clone()), receiver.recv()).await;
     sent.unwrap();
     assert_eq!(received.unwrap(), recovery_message);
+}
+
+/// Verify lossless, duplicate-free exchange under backpressure in any order.
+///
+/// Requires independent directions and completion within five seconds.
+pub async fn mutual_bursts_converge<S, R>(
+    left: Bidirectional<S, R>,
+    right: Bidirectional<S, R>,
+    burst: usize,
+) where
+    S: SendChannel<Vec<u8>>,
+    R: RecvChannel<Vec<u8>>,
+{
+    async fn drive<S, R>(channel: Bidirectional<S, R>, tag: u8, peer_tag: u8, burst: usize)
+    where
+        S: SendChannel<Vec<u8>>,
+        R: RecvChannel<Vec<u8>>,
+    {
+        let (mut sender, mut receiver) = channel.into_parts();
+        let sending = async move {
+            for index in 0..burst {
+                let message = std::iter::once(tag).chain(index.to_le_bytes()).collect();
+                sender.send(message).await.unwrap();
+            }
+        };
+        let receiving = async move {
+            let mut expected: BTreeSet<Vec<u8>> = (0..burst)
+                .map(|index| {
+                    std::iter::once(peer_tag)
+                        .chain(index.to_le_bytes())
+                        .collect()
+                })
+                .collect();
+            for _ in 0..burst {
+                let message = receiver.recv().await.unwrap();
+                assert!(
+                    expected.remove(&message),
+                    "unexpected or duplicate burst message: {message:?}"
+                );
+            }
+        };
+        futures_util::future::join(sending, receiving).await;
+    }
+    let exchange = futures_util::future::join(
+        drive(left, b'l', b'r', burst),
+        drive(right, b'r', b'l', burst),
+    );
+    tokio::time::timeout(Duration::from_secs(5), exchange)
+        .await
+        .expect("mutual bursts must make progress");
 }
