@@ -3,8 +3,8 @@ use crate::client::{
     Bootstrap, channel_actor, new_link, rpc_recv_error, rpc_send_error, start_client,
 };
 use crate::error::{RecvError, SendError};
-use crate::protocol::{channel, recv_failure, send_failure};
-use crate::server::serve;
+use crate::protocol::{RemoteChannel, channel, recv_failure, send_failure};
+use crate::server::{run_server, serve};
 use capnp::{capability::Promise, data};
 use fungi_transport::{RecvChannel, SendChannel};
 use fungi_transport_testkit::mem::{MemConfig, bidirectional};
@@ -54,6 +54,67 @@ impl channel::Server<data::Owned, send_failure::Owned, recv_failure::Owned> for 
             .unwrap();
         Promise::ok(())
     }
+}
+
+#[tokio::test]
+async fn canceled_sends_stay_bounded_across_splitting_without_blocking_receive() {
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::task::LocalSet::new().run_until(async {
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let (started, mut starts) = mpsc::unbounded_channel();
+            let remote: RemoteChannel = capnp_rpc::new_client(BlockedRpcChannel {
+                started,
+                gate: Arc::clone(&gate),
+            });
+            let (client, io) = tokio::io::duplex(64);
+            let server = tokio::task::spawn_local(run_server(io, remote.client));
+            let mut channel = CapnpChannel::connect(client, 1024).unwrap();
+            {
+                let sending = channel.send(b"first".to_vec());
+                tokio::pin!(sending);
+                tokio::select! {
+                    result = &mut sending => panic!("send completed before release: {result:?}"),
+                    message = starts.recv() => assert_eq!(message.unwrap(), b"first"),
+                }
+            }
+            let (mut sender, mut receiver) = channel.into_channel().into_parts();
+            for _ in 0..32 {
+                assert!(
+                    tokio::time::timeout(
+                        Duration::from_millis(2),
+                        sender.send(b"canceled".to_vec())
+                    )
+                    .await
+                    .is_err()
+                );
+            }
+            assert!(matches!(
+                starts.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+            assert_eq!(receiver.recv().await.unwrap(), b"independent");
+            gate.add_permits(1);
+            {
+                let sending = sender.send(b"after".to_vec());
+                tokio::pin!(sending);
+                tokio::select! {
+                    result = &mut sending => panic!("send completed before release: {result:?}"),
+                    message = starts.recv() => assert_eq!(message.unwrap(), b"after"),
+                }
+                gate.add_permits(1);
+                sending.await.unwrap();
+            }
+            assert!(matches!(
+                starts.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+            drop((sender, receiver));
+            server.await.unwrap().unwrap();
+        }),
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -125,6 +186,51 @@ async fn stopped_actors_report_closed_channels() {
         Err(RecvError::Closed)
     ));
     assert!(pending.is_none());
+}
+
+#[tokio::test]
+async fn canceled_receive_preserves_a_response_already_delivered_to_the_client() {
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::task::LocalSet::new().run_until(async {
+            let (backend, mut peer) = bidirectional(MemConfig::default());
+            let (client, io) = tokio::io::duplex(64);
+            let server = tokio::task::spawn_local(serve(backend, mem_send, mem_recv, io));
+            let mut channel = CapnpChannel::connect(client, 1024).unwrap();
+            channel.send(b"native".to_vec()).await.unwrap();
+            assert_eq!(peer.recv().await.unwrap(), b"native");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(5), channel.recv())
+                    .await
+                    .is_err()
+            );
+            peer.send(b"retained".to_vec()).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while channel.pending.as_ref().unwrap().is_empty() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let (sender, mut receiver) = channel.into_channel().into_parts();
+            assert_eq!(receiver.recv().await.unwrap(), b"retained");
+            drop(peer);
+            assert!(
+                tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
+            drop((sender, receiver));
+            tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }),
+    )
+    .await
+    .unwrap();
 }
 
 #[test]
