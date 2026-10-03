@@ -1,4 +1,4 @@
-//! Typed in-memory links and connection setup.
+//! Typed in-memory links, connection setup, and mailboxes for offline peers.
 
 use fungi_transport::{
     Bidirectional, ChannelBuilder, ConnectionUnlinkability, RecvChannel, SendChannel,
@@ -28,6 +28,14 @@ pub enum MemError {
 #[derive(Debug)]
 pub struct MemSender<M> {
     sender: mpsc::Sender<M>,
+}
+
+impl<M> Clone for MemSender<M> {
+    fn clone(&self) -> Self {
+        Self {
+            sender: self.sender.clone(),
+        }
+    }
 }
 
 /// Owned receiving direction from one in-memory peer.
@@ -155,6 +163,46 @@ impl<M: Send> ChannelBuilder<M> for MemListener<M> {
     async fn build(&mut self, _input: &()) -> Result<Self::Channel, MemError> {
         self.incoming.recv().await.ok_or(MemError::Closed)
     }
+}
+
+/// A store that retains a peer's incoming queue between active sessions.
+///
+/// Bounded, process-local storage lets peers receive messages in later sessions.
+/// Dropping the destination mailbox closes the path and discards unread messages.
+#[derive(Debug)]
+pub struct Mailbox<M> {
+    sender: MemSender<M>,
+    receiver: MemReceiver<M>,
+}
+
+/// Exclusive mailbox reception preserving storage ownership for later sessions.
+#[derive(Debug)]
+pub struct MailboxReceiver<'a, M>(&'a mut MemReceiver<M>);
+
+impl<M: Send> RecvChannel<M> for MailboxReceiver<'_, M> {
+    type RecvError = MemError;
+    fn recv(&mut self) -> impl std::future::Future<Output = Result<M, MemError>> + Send {
+        self.0.recv()
+    }
+}
+
+impl<M: Send> Mailbox<M> {
+    /// Open one exclusive session; dropping it preserves queued messages.
+    pub fn connect(&mut self) -> Bidirectional<MemSender<M>, MailboxReceiver<'_, M>> {
+        Bidirectional::new(self.sender.clone(), MailboxReceiver(&mut self.receiver))
+    }
+}
+
+/// Create stores that retain messages between independent peer sessions.
+///
+/// Both stores must remain alive. Sending waits when the destination queue is full.
+pub fn store_and_forward<M: Send>(config: MemConfig) -> (Mailbox<M>, Mailbox<M>) {
+    let (left, right) = bidirectional(config);
+    let mailbox = |channel: MemChannel<M>| {
+        let (sender, receiver) = channel.into_parts();
+        Mailbox { sender, receiver }
+    };
+    (mailbox(left), mailbox(right))
 }
 
 #[cfg(test)]
@@ -297,6 +345,107 @@ mod tests {
                 connector.build(&MemAddr).await,
                 Err(MemError::Closed)
             ));
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stores_forward_between_non_overlapping_peer_sessions() {
+        deadline(async {
+            let (mut a_store, mut b_store) = store_and_forward(MemConfig::default());
+            {
+                let mut a = a_store.connect();
+                a.send(Message("request".into())).await.unwrap();
+            }
+            {
+                let mut b = b_store.connect();
+                assert_eq!(b.recv().await.unwrap(), Message("request".into()));
+                b.send(Message("reply".into())).await.unwrap();
+            }
+            let mut a = a_store.connect();
+            assert_eq!(a.recv().await.unwrap(), Message("reply".into()));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(1), a.recv())
+                    .await
+                    .is_err()
+            );
+            drop(a);
+            {
+                let mut b = b_store.connect();
+                b.send(Message("later".into())).await.unwrap();
+            }
+            assert_eq!(
+                a_store.connect().recv().await.unwrap(),
+                Message("later".into())
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn offline_storage_is_bounded_and_closes_when_dropped() {
+        deadline(async {
+            let (mut a_store, b_store) = store_and_forward(MemConfig::default());
+            {
+                let mut a = a_store.connect();
+                a.send(Message("buffered".into())).await.unwrap();
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(1), a.send(Message("full".into())))
+                        .await
+                        .is_err()
+                );
+            }
+            drop(b_store);
+            let mut a = a_store.connect();
+            assert!(matches!(
+                a.send(Message("closed".into())).await,
+                Err(MemError::Closed)
+            ));
+            assert!(matches!(a.recv().await, Err(MemError::Closed)));
+        })
+        .await;
+    }
+    #[tokio::test(start_paused = true)]
+    async fn store_forwards_through_separate_accepted_connections() {
+        deadline(async {
+            let (mut connector, mut listener) = network(MemConfig::default());
+            let (mut incoming_store, mut outgoing_store) = store_and_forward(MemConfig::default());
+            {
+                let mut alice = connector.build(&MemAddr).await.unwrap();
+                let mut relay = listener.build(&()).await.unwrap();
+                alice.send(Message("stored request".into())).await.unwrap();
+                incoming_store
+                    .connect()
+                    .send(relay.recv().await.unwrap())
+                    .await
+                    .unwrap();
+                drop(alice);
+                assert!(matches!(relay.recv().await, Err(MemError::Closed)));
+            }
+            {
+                let mut bob = connector.build(&MemAddr).await.unwrap();
+                let mut relay = listener.build(&()).await.unwrap();
+                relay
+                    .send(outgoing_store.connect().recv().await.unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(bob.recv().await.unwrap(), Message("stored request".into()));
+                bob.send(Message("stored reply".into())).await.unwrap();
+                outgoing_store
+                    .connect()
+                    .send(relay.recv().await.unwrap())
+                    .await
+                    .unwrap();
+                drop(bob);
+                assert!(matches!(relay.recv().await, Err(MemError::Closed)));
+            }
+            let mut alice = connector.build(&MemAddr).await.unwrap();
+            let mut relay = listener.build(&()).await.unwrap();
+            relay
+                .send(incoming_store.connect().recv().await.unwrap())
+                .await
+                .unwrap();
+            assert_eq!(alice.recv().await.unwrap(), Message("stored reply".into()));
         })
         .await;
     }
