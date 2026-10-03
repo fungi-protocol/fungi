@@ -3,7 +3,7 @@
 
 use std::{io, time::Duration};
 
-use fungi_transport::{Bidirectional, RecvChannel, SendChannel, Unspecified};
+use fungi_transport::{Bidirectional, ChannelBuilder, RecvChannel, SendChannel, Unspecified};
 use fungi_transport_testkit::testkit;
 use tokio::sync::{mpsc, oneshot};
 
@@ -82,6 +82,31 @@ fn pair(mode: Mode) -> (Fixture, Fixture) {
         Bidirectional::new(Sender(right), receiver(incoming_right)),
     )
 }
+struct Connector(mpsc::Sender<Fixture>);
+struct Listener(mpsc::Receiver<Fixture>);
+impl ChannelBuilder for Connector {
+    type Privacy = Unspecified;
+    type Input = ();
+    type Channel = Fixture;
+    type BuildError = io::Error;
+    async fn build(&mut self, _: &()) -> Result<Fixture, io::Error> {
+        let (client, server) = pair(Mode::Deliver);
+        self.0.send(server).await.map_err(io::Error::other)?;
+        Ok(client)
+    }
+}
+impl ChannelBuilder for Listener {
+    type Privacy = Unspecified;
+    type Input = ();
+    type Channel = Fixture;
+    type BuildError = io::Error;
+    async fn build(&mut self, _: &()) -> Result<Fixture, io::Error> {
+        self.0
+            .recv()
+            .await
+            .ok_or_else(|| io::Error::other("listener closed"))
+    }
+}
 #[tokio::test(start_paused = true)]
 async fn helpers_accept_submission_that_waits_for_peer_reception() {
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -94,6 +119,11 @@ async fn helpers_accept_submission_that_waits_for_peer_reception() {
         let (left, right) = pair(Mode::Deliver);
         testkit::too_large_is_recoverable(left, right, MAX, |error| {
             error.kind() == io::ErrorKind::InvalidInput
+        })
+        .await;
+        let (queue, receiver) = mpsc::channel(1);
+        testkit::build_use_drop_rebuild(Connector(queue), Listener(receiver), &(), |error| {
+            error.to_string() == "closed"
         })
         .await;
     })
@@ -127,4 +157,12 @@ async fn cancellation_rejects_loss_after_reception_is_acknowledged() {
         .await
         .expect("message loss must be detected within the deadline");
     assert!(result.expect_err("helper accepted message loss").is_panic());
+}
+
+#[tokio::test(start_paused = true)]
+async fn acceptance_reports_a_closed_connector() {
+    let (queue, receiver) = mpsc::channel(1);
+    drop(queue);
+    let mut listener = Listener(receiver);
+    assert!(listener.build(&()).await.is_err());
 }
