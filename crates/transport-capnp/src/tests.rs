@@ -182,7 +182,7 @@ async fn stopped_actors_report_closed_channels() {
     ));
     let mut pending = None;
     assert!(matches!(
-        receive_message(&commands, &mut pending).await,
+        receive_message(&commands, &mut pending, usize::MAX).await,
         Err(RecvError::Closed)
     ));
     assert!(pending.is_none());
