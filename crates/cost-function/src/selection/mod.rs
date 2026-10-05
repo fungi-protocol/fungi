@@ -4,6 +4,8 @@ use bitcoin::{Amount, FeeRate, TxOut};
 
 use crate::wallet::Utxo;
 
+pub(crate) mod random;
+
 /// Everything a `CoinSelector` needs that isn't wallet state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SelectionParams {
