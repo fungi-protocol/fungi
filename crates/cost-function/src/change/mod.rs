@@ -1,6 +1,6 @@
 //! Change strategy.
 
-use bitcoin::Amount;
+use bitcoin::{Amount, TxOut, Weight};
 
 use crate::selection::InputSelection;
 
@@ -30,6 +30,20 @@ pub(crate) trait ChangeSelector {
         request: InputSelection,
         dust_limit: Amount,
     ) -> Result<ChangeSelection, Self::Error>;
+}
+
+/// A change output, with the satisfaction weight of its scriptpubkey.
+pub(crate) type OutputWithSatisfactionWeight = (TxOut, Weight);
+
+/// Assigns scriptpubkeys to change outputs.
+pub(crate) trait ScriptpubkeyAssigner {
+    type Error;
+
+    /// Each change output, with the satisfaction weight of its scriptpubkey.
+    fn assign(
+        &self,
+        change: ChangeSelection,
+    ) -> Result<Vec<OutputWithSatisfactionWeight>, Self::Error>;
 }
 
 #[cfg(test)]
