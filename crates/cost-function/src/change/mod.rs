@@ -1,6 +1,7 @@
 //! Change strategy.
 
 use bitcoin::{Amount, TxOut, Weight};
+pub mod single_output;
 
 use crate::selection::InputSelection;
 
