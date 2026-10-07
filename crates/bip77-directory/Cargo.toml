@@ -1,0 +1,23 @@
+[package]
+name = "fungi-bip77-directory"
+description = "BIP77 directory backend for Fungi linked mailboxes"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bech32 = { version = "0.11", default-features = false, features = ["alloc"] }
+fungi-mailbox = { path = "../mailbox" }
+thiserror = "2"
+url = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = [
+  "macros",
+  "rt",
+  "sync",
+  "test-util",
+  "time",
+] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
