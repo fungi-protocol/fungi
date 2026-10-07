@@ -1,6 +1,6 @@
 //! The weight a coin or output adds to a transaction, and the fee for it.
 
-use bitcoin::{Amount, FeeRate, Weight};
+use bitcoin::{Amount, FeeRate, TxOut, Weight};
 
 use crate::wallet::Utxo;
 
@@ -28,6 +28,12 @@ impl KnowsWeight for Utxo {
         self.satisfaction_weight
             .checked_add(OUTPOINT_AND_SEQUENCE)
             .expect("satisfaction weight fits in a block")
+    }
+}
+
+impl KnowsWeight for TxOut {
+    fn weight(&self) -> Weight {
+        TxOut::weight(self)
     }
 }
 
@@ -100,6 +106,13 @@ mod tests {
         tx.weight() - before
     }
 
+    fn txout(script_len: usize) -> TxOut {
+        TxOut {
+            value: Amount::from_sat(30_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0xab; script_len]),
+        }
+    }
+
     /// Up to 1,000,000 sat/vB.
     fn sane_feerate_sat_kwu() -> impl Strategy<Value = u64> {
         0..=250_000_000u64
@@ -121,6 +134,16 @@ mod tests {
         coin(0, u64::MAX).weight();
     }
 
+    #[test]
+    fn a_taproot_output_costs_its_bytes() {
+        // 8 value + 1 length + 34 script = 43 vB.
+        let txout = txout(34);
+        assert_eq!(KnowsWeight::weight(&txout), Weight::from_vb(43).unwrap());
+
+        let feerate = FeeRate::from_sat_per_vb(10).unwrap();
+        assert_eq!(txout.fee(feerate), Some(Amount::from_sat(430)));
+    }
+
     proptest! {
         /// scriptSig and witness element lengths are > 252 bytes, where their length
         /// prefix grows from 1 to 3 bytes.
@@ -138,6 +161,32 @@ mod tests {
             prop_assert_eq!(
                 coin.fee(FeeRate::from_sat_per_kwu(sat_per_kwu)),
                 Some(Amount::from_sat((sat_per_kwu * weight.to_wu()).div_ceil(1000)))
+            );
+        }
+
+        /// Script lengths are drawn from either side of 252 and 65,535 bytes, where the
+        /// length prefix grows from 1 to 3 and from 3 to 5 bytes.
+        #[test]
+        fn an_output_weighs_its_value_length_prefix_and_script(
+            len in prop_oneof![0..=300usize, 0xfff0..=0x1_0010usize],
+            sat_per_kwu in sane_feerate_sat_kwu(),
+        ) {
+            // Compact size: 1 byte up to 0xfc, otherwise a marker byte and a 2 or 4 byte
+            // length.
+            let prefix = match len {
+                0..=0xfc => 1,
+                0xfd..=0xffff => 3,
+                _ => 5,
+            };
+            // An 8 byte value, then the length prefix and the script. Outputs are non-witness
+            // data, so each byte weighs 4 WU.
+            let weight_wu = 4 * (8 + prefix + len as u64);
+            let txout = txout(len);
+
+            prop_assert_eq!(KnowsWeight::weight(&txout), Weight::from_wu(weight_wu));
+            prop_assert_eq!(
+                txout.fee(FeeRate::from_sat_per_kwu(sat_per_kwu)),
+                Some(Amount::from_sat((sat_per_kwu * weight_wu).div_ceil(1000)))
             );
         }
     }
