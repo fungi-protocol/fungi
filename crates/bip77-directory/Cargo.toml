@@ -6,11 +6,18 @@ edition.workspace = true
 
 [dependencies]
 bech32 = { version = "0.11", default-features = false, features = ["alloc"] }
+bhttp = "0.6.1"
 fungi-mailbox = { path = "../mailbox" }
+ohttp = { package = "bitcoin-ohttp", version = "0.6.0", default-features = false, features = [
+  "client",
+  "rust-hpke",
+] }
+rand = "0.8"
 thiserror = "2"
 url = "2"
 
 [dev-dependencies]
+ohttp = { package = "bitcoin-ohttp", version = "0.6.0", features = ["server"] }
 tokio = { version = "1", features = [
   "macros",
   "rt",
