@@ -8,6 +8,7 @@ edition.workspace = true
 bech32 = { version = "0.11", default-features = false, features = ["alloc"] }
 bhttp = "0.6.1"
 fungi-mailbox = { path = "../mailbox" }
+fungi-transport = { path = "../transport" }
 ohttp = { package = "bitcoin-ohttp", version = "0.6.0", default-features = false, features = [
   "client",
   "rust-hpke",
