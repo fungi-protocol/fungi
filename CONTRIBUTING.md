@@ -72,10 +72,7 @@
   over time. Pull requests are therefore a meta-discourse, about whether or not
   the commits convey their own purpose clearly and correctly, getting from
   draft commits to publishable ones.
-- Address review by amending (`jj edit`) and force-pushing (or just `jj git
-  push`). Range-diffs are posted in the comments, so pushing fixup commits to
-  be squashed before merging is not necessary in order for reviewers to keep
-  track of what has changed.
+- See [REVIEWING.md](REVIEWING.md) for how review works.
 
 ## AI-assisted contributions
 
