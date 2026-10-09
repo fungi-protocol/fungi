@@ -49,16 +49,16 @@ fn unidirectional(capacity: usize) -> (Sender, Receiver) {
     (Sender { sender }, Receiver { receiver })
 }
 
-fn assert_channel<C: Channel<u32, u32>>(_: &C) {}
-fn assert_asymmetric_channel<C: Channel<u32, String>>(_: &C) {}
+fn assert_bidirectional<C: Bidirectional<u32, u32>>(_: &C) {}
+fn assert_asymmetric_bidirectional<C: Bidirectional<u32, String>>(_: &C) {}
 fn assert_connection_unlinkability<C: SendChannel<u32, Privacy = ConnectionUnlinkability>>(_: &C) {}
 
 #[tokio::test]
-async fn bidirectional_combines_sending_and_receiving() {
+async fn duplex_combines_sending_and_receiving() {
     let (sender, receiver) = unidirectional(1);
-    let mut channel = Bidirectional::new(sender, receiver);
+    let mut channel = Duplex::new(sender, receiver);
 
-    assert_channel(&channel);
+    assert_bidirectional(&channel);
     assert_connection_unlinkability(&channel);
 
     channel.send(42).await.unwrap();
@@ -78,9 +78,9 @@ async fn bidirectional_combines_sending_and_receiving() {
 #[tokio::test]
 async fn supports_different_message_types_by_direction() {
     let (sender, receiver) = unidirectional(1);
-    let mut channel = Bidirectional::new(sender, receiver);
+    let mut channel = Duplex::new(sender, receiver);
 
-    assert_asymmetric_channel(&channel);
+    assert_asymmetric_bidirectional(&channel);
     SendChannel::<String>::send(&mut channel, "hello".to_owned())
         .await
         .unwrap();
@@ -89,8 +89,8 @@ async fn supports_different_message_types_by_direction() {
 
 #[tokio::test]
 async fn preserves_independent_direction_state() {
-    let mut channel = Bidirectional::new(Sequential::default(), Sequential(Some(8)));
-    assert_channel(&channel);
+    let mut channel = Duplex::new(Sequential::default(), Sequential(Some(8)));
+    assert_bidirectional(&channel);
     channel.send(7).await.unwrap();
     assert_eq!(channel.recv().await.unwrap(), 8);
     let (mut sender, _) = channel.into_parts();
@@ -120,13 +120,13 @@ impl RecvChannel<u32> for Sequential {
     }
 }
 
-impl Channel<u32, u32> for Sequential {}
+impl Bidirectional<u32, u32> for Sequential {}
 
 #[tokio::test]
-async fn channel_does_not_require_shared_access() {
+async fn bidirectional_does_not_require_shared_access() {
     let mut channel = Sequential::default();
 
-    assert_channel(&channel);
+    assert_bidirectional(&channel);
     assert_connection_unlinkability(&channel);
     channel.send(7).await.unwrap();
     assert_eq!(channel.recv().await.unwrap(), 7);

@@ -26,7 +26,7 @@ pub trait RecvChannel<M = Vec<u8>>: Send {
 }
 
 /// A channel that can receive and send messages.
-pub trait Channel<I = Vec<u8>, O = Vec<u8>>: RecvChannel<I> + SendChannel<O> {}
+pub trait Bidirectional<I = Vec<u8>, O = Vec<u8>>: RecvChannel<I> + SendChannel<O> {}
 
 /// Build a channel with a sending capability and matching privacy tag.
 pub trait ChannelBuilder<M = Vec<u8>>: Send {
