@@ -9,12 +9,12 @@ use crate::selection::InputSelection;
 /// Change selector may produce outputs but not selected scriptpubkey to along
 /// with them.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct OutputWithoutScriptpubkey(Amount);
+pub(crate) struct OutputWithoutScriptpubkey(pub(crate) Amount);
 
 /// What a `ChangeSelector` returns.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ChangeSelection {
-    selected_change: Vec<OutputWithoutScriptpubkey>,
+    pub(crate) selected_change: Vec<OutputWithoutScriptpubkey>,
 }
 
 impl ChangeSelection {
