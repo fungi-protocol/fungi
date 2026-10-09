@@ -1,17 +1,17 @@
 //! Adapter for combining independent channel directions.
 
-use crate::{Channel, RecvChannel, SendChannel};
+use crate::{Bidirectional, RecvChannel, SendChannel};
 
 /// A channel composed from independent sending and receiving capabilities.
 ///
 /// The sending destination and receiving source may differ.
 #[derive(Debug)]
-pub struct Bidirectional<S, R> {
+pub struct Duplex<S, R> {
     sender: S,
     receiver: R,
 }
 
-impl<S, R> Bidirectional<S, R> {
+impl<S, R> Duplex<S, R> {
     /// Combine sending and receiving capabilities.
     pub fn new(sender: S, receiver: R) -> Self {
         Self { sender, receiver }
@@ -23,7 +23,7 @@ impl<S, R> Bidirectional<S, R> {
     }
 }
 
-impl<M, S: SendChannel<M>, R: Send> SendChannel<M> for Bidirectional<S, R> {
+impl<M, S: SendChannel<M>, R: Send> SendChannel<M> for Duplex<S, R> {
     type Privacy = S::Privacy;
     type SendError = S::SendError;
 
@@ -32,7 +32,7 @@ impl<M, S: SendChannel<M>, R: Send> SendChannel<M> for Bidirectional<S, R> {
     }
 }
 
-impl<M, S: Send, R: RecvChannel<M>> RecvChannel<M> for Bidirectional<S, R> {
+impl<M, S: Send, R: RecvChannel<M>> RecvChannel<M> for Duplex<S, R> {
     type RecvError = R::RecvError;
 
     fn recv(&mut self) -> impl Future<Output = Result<M, Self::RecvError>> + Send {
@@ -40,7 +40,7 @@ impl<M, S: Send, R: RecvChannel<M>> RecvChannel<M> for Bidirectional<S, R> {
     }
 }
 
-impl<I, O, S, R> Channel<I, O> for Bidirectional<S, R>
+impl<I, O, S, R> Bidirectional<I, O> for Duplex<S, R>
 where
     S: SendChannel<O>,
     R: RecvChannel<I>,

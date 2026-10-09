@@ -1,12 +1,12 @@
 //! Message-oriented transport capabilities for the Fungi protocol.
 
-mod bidirectional;
+mod duplex;
 mod privacy;
 mod traits;
 
-pub use bidirectional::Bidirectional;
+pub use duplex::Duplex;
 pub use privacy::{ConnectionUnlinkability, MessageUnlinkability, Privacy, Unspecified};
-pub use traits::{Channel, ChannelBuilder, RecvChannel, SendChannel};
+pub use traits::{Bidirectional, ChannelBuilder, RecvChannel, SendChannel};
 
 #[cfg(test)]
 mod tests;
