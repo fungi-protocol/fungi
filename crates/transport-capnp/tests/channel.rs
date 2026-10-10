@@ -118,6 +118,73 @@ async fn stopped(servers: Vec<std::thread::JoinHandle<()>>) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn receive_limit_preserves_both_directions_and_canceled_results() {
+    async fn exercise<C>(mut channel: C, mut peer: fungi_transport_testkit::mem::MemChannel)
+    where
+        C: SendChannel<SendError = SendError> + RecvChannel<RecvError = RecvError>,
+    {
+        peer.send(vec![1; 4]).await.unwrap();
+        assert_eq!(channel.recv().await.unwrap(), vec![1; 4]);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), channel.recv())
+                .await
+                .is_err()
+        );
+        peer.send(vec![2; 5]).await.unwrap();
+        assert!(matches!(
+            channel.recv().await,
+            Err(RecvError::TooLarge { max: 4 })
+        ));
+        peer.send(vec![3]).await.unwrap();
+        assert_eq!(channel.recv().await.unwrap(), vec![3]);
+        channel.send(vec![4; 5]).await.unwrap();
+        assert_eq!(peer.recv().await.unwrap(), vec![4; 5]);
+    }
+    for split in [false, true] {
+        let (backend, peer) = bidirectional(MemConfig::default());
+        let (client, io) = tokio::io::duplex(64);
+        let server = server(backend, io);
+        let mut channel = CapnpChannel::connect(client, MAX).unwrap();
+        channel.set_max_recv_message_len(4);
+        if split {
+            deadline(exercise(channel.into_channel(), peer)).await;
+        } else {
+            deadline(exercise(channel, peer)).await;
+        }
+        stopped(vec![server]).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn receive_limit_changes_apply_to_new_requests_and_allow_empty_payloads() {
+    let (backend, mut peer) = bidirectional(MemConfig::default());
+    let (client, io) = tokio::io::duplex(64);
+    let server = server(backend, io);
+    let mut channel = CapnpChannel::connect(client, MAX).unwrap();
+    channel.set_max_recv_message_len(4);
+    deadline(async {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), channel.recv())
+                .await
+                .is_err()
+        );
+        channel.set_max_recv_message_len(0);
+        peer.send(vec![1; 4]).await.unwrap();
+        assert_eq!(channel.recv().await.unwrap(), vec![1; 4]);
+        peer.send(vec![2]).await.unwrap();
+        assert!(matches!(
+            channel.recv().await,
+            Err(RecvError::TooLarge { max: 0 })
+        ));
+        peer.send(Vec::new()).await.unwrap();
+        assert!(channel.recv().await.unwrap().is_empty());
+    })
+    .await;
+    drop((channel, peer));
+    stopped(vec![server]).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn conforms_in_both_directions_and_preserves_empty_messages() {
     let (mut left, mut right, servers) = pair(MemConfig::default());
     deadline(async {

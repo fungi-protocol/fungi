@@ -18,7 +18,9 @@ use crate::protocol::{RemoteChannel, channel, recv_failure, send_failure};
 /// Returns the RPC result; capnp-rpc treats some disconnects as successful closure.
 ///
 /// Error diagnostics returned by the callbacks are sent to the RPC client.
-/// Callbacks must return diagnostics appropriate for that recipient.
+/// Callbacks must return diagnostics appropriate for that recipient. A callback
+/// returning [`RecvError::TooLarge`] is still a terminal backend error, transmitted
+/// as diagnostic text; only client-side size rejection preserves the channel.
 pub async fn serve<S, R, SE, RE, Io>(
     backend: Bidirectional<S, R>,
     map_send: SE,
