@@ -1,5 +1,8 @@
 //! Onion service addresses.
 
+use std::fmt;
+use std::str::FromStr;
+
 use tor_hscrypto::pk::{HsId, HsIdParseError};
 
 /// A v3 onion service hostname and a virtual port.
@@ -9,7 +12,8 @@ pub struct Addr {
     port: u16,
 }
 
-/// The reason a hostname is not a v3 onion address.
+/// The reason a hostname is not a v3 onion address, or its text form cannot
+/// be read.
 #[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum InvalidAddr {
@@ -25,6 +29,10 @@ pub enum InvalidAddr {
     /// The port is 0, which no onion service can listen on.
     #[error("onion port 0 is unusable")]
     ZeroPort,
+    /// The text form lacks a `:<port>`, or the port is not a number below
+    /// 65536.
+    #[error("expected <host>.onion:<port>")]
+    InvalidPort,
 }
 
 impl Addr {
@@ -53,6 +61,22 @@ impl Addr {
     /// The virtual port on the onion service.
     pub fn port(&self) -> u16 {
         self.port
+    }
+}
+
+impl fmt::Display for Addr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.host, self.port)
+    }
+}
+
+impl FromStr for Addr {
+    type Err = InvalidAddr;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let (host, port) = text.rsplit_once(':').ok_or(InvalidAddr::InvalidPort)?;
+        let port = port.parse().map_err(|_| InvalidAddr::InvalidPort)?;
+        Self::new(host.to_owned(), port)
     }
 }
 
@@ -189,5 +213,30 @@ mod tests {
 
             prop_assert!(matches!(result, Err(InvalidAddr::NotOnion)), "{result:?}");
         }
+    }
+
+    proptest! {
+        #[test]
+        fn text_form_round_trips(host in onion_host(), port in 1u16..) {
+            let addr = Addr::new(host.clone(), port).unwrap();
+
+            prop_assert_eq!(addr.to_string(), format!("{host}:{port}"));
+            prop_assert_eq!(addr.to_string().parse::<Addr>().unwrap(), addr);
+        }
+
+        #[test]
+        fn text_form_needs_a_port(host in onion_host(), port in "|:|:port|:65536") {
+            let result = format!("{host}{port}").parse::<Addr>();
+
+            prop_assert!(matches!(result, Err(InvalidAddr::InvalidPort)), "{result:?}");
+        }
+    }
+
+    #[test]
+    fn text_form_needs_a_host() {
+        assert!(matches!(
+            ":9735".parse::<Addr>(),
+            Err(InvalidAddr::NotOnion)
+        ));
     }
 }
