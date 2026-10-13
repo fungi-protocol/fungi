@@ -24,6 +24,14 @@ const READ_LEN: usize = 1 << 16;
 /// On the wire, messages consist of a type and a payload.
 pub type Message = TypedSlice<Vec<u8>>;
 
+/// Copies a record into a [`Message`].
+pub(crate) fn to_message(record: TypedSlice<&[u8]>) -> Result<Message, Infallible> {
+    Ok(TypedSlice {
+        ty: record.ty,
+        value: record.value.to_vec(),
+    })
+}
+
 /// Receives messages from a byte stream.
 ///
 /// A message payload is at most `N` bytes long, and `N` must be at least 18,
@@ -304,6 +312,17 @@ where
     /// The privacy is [`Unspecified`], because it depends on where the stream
     /// comes from.
     pub fn new(stream: S, decode: fn(TypedSlice<&[u8]>) -> Result<T, E>) -> Self {
+        Self::tagged(stream, decode)
+    }
+}
+
+impl<S, const N: usize, P, T, E> Channel<S, N, P, T, E>
+where
+    S: AsyncRead + AsyncWrite,
+{
+    /// Wraps `stream` like [`Channel::new`], with a privacy `P` the caller
+    /// vouches for.
+    pub(crate) fn tagged(stream: S, decode: fn(TypedSlice<&[u8]>) -> Result<T, E>) -> Self {
         let (read, write) = tokio::io::split(stream);
 
         Self {
@@ -373,7 +392,6 @@ where
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use std::convert::Infallible;
     use std::io;
     use std::pin::Pin;
     use std::task::{Context, Poll};
@@ -384,7 +402,7 @@ mod tests {
     use proptest::prelude::*;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 
-    use super::{Channel, Message, READ_LEN, Reader, RecvError, SendError, Writer};
+    use super::{Channel, Message, READ_LEN, Reader, RecvError, SendError, Writer, to_message};
 
     const MAX: usize = 32;
 
@@ -399,10 +417,6 @@ mod tests {
             ty,
             value: payload.to_vec(),
         }
-    }
-
-    fn to_message(record: TypedSlice<&[u8]>) -> Result<Message, Infallible> {
-        Ok(make_message(record.ty, record.value))
     }
 
     /// Returns a channel and the other end of its stream, which the test
