@@ -4,19 +4,40 @@
 //! bytes.
 
 use std::fmt;
-use std::io;
+use std::io::{self, Cursor};
+use std::marker::PhantomData;
 use std::mem;
 use std::num::NonZeroUsize;
 
-use fungi_transport::RecvChannel;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use fungi_transport::{Bidirectional, Privacy, RecvChannel, SendChannel, Unspecified};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// A message channel over a byte stream.
-pub struct Channel<S> {
+pub struct Channel<S, P = Unspecified> {
     stream: S,
     max_message_len: u32,
     incoming: Incoming,
+    outgoing: Cursor<Vec<u8>>,
     failed: bool,
+    privacy: PhantomData<fn() -> P>,
+}
+
+/// Failure to send a message.
+#[derive(Debug, thiserror::Error)]
+pub enum SendError {
+    /// The message is above the limit. Nothing was written, and the channel
+    /// remains usable.
+    #[error("message exceeds {max} bytes")]
+    TooLarge {
+        /// Largest accepted length in bytes.
+        max: u32,
+    },
+    /// The channel already ended, in either direction.
+    #[error("channel closed")]
+    Closed,
+    /// The stream failed. The channel carries no further messages.
+    #[error(transparent)]
+    Io(#[from] io::Error),
 }
 
 /// Failure to receive a message. The channel yields no further messages.
@@ -48,13 +69,15 @@ impl<S> Channel<S> {
             stream,
             max_message_len,
             incoming: Incoming::default(),
+            outgoing: Cursor::default(),
             failed: false,
+            privacy: PhantomData,
         }
     }
 }
 
 /// Leaves out message bytes, so a channel can be logged.
-impl<S: fmt::Debug> fmt::Debug for Channel<S> {
+impl<S: fmt::Debug, P> fmt::Debug for Channel<S, P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Channel")
             .field("stream", &self.stream)
@@ -64,7 +87,46 @@ impl<S: fmt::Debug> fmt::Debug for Channel<S> {
     }
 }
 
-impl<S: AsyncRead + Send + Unpin> RecvChannel for Channel<S> {
+impl<S: AsyncWrite + Send + Unpin, P: Privacy> SendChannel for Channel<S, P> {
+    type Privacy = P;
+    type SendError = SendError;
+
+    /// A dropped send may still deliver its message, ahead of the next one.
+    async fn send(&mut self, message: Vec<u8>) -> Result<(), SendError> {
+        if self.failed {
+            return Err(SendError::Closed);
+        }
+
+        let max = self.max_message_len;
+        let len = u32::try_from(message.len())
+            .ok()
+            .filter(|len| *len <= max)
+            .ok_or(SendError::TooLarge { max })?;
+
+        let written = self.write(len, &message).await;
+        self.failed = written.is_err();
+
+        Ok(written?)
+    }
+}
+
+impl<S: AsyncWrite + Unpin, P> Channel<S, P> {
+    /// Write one message, after whatever a dropped send left unwritten.
+    ///
+    /// The cursor advances with every accepted byte and outlives the send
+    /// future, so the stream never carries part of a message followed by the
+    /// start of another.
+    async fn write(&mut self, len: u32, payload: &[u8]) -> io::Result<()> {
+        self.stream.write_all_buf(&mut self.outgoing).await?;
+
+        self.outgoing = Cursor::new([&len.to_be_bytes(), payload].concat());
+        self.stream.write_all_buf(&mut self.outgoing).await?;
+
+        self.stream.flush().await
+    }
+}
+
+impl<S: AsyncRead + Send + Unpin, P> RecvChannel for Channel<S, P> {
     type RecvError = RecvError;
 
     async fn recv(&mut self) -> Result<Vec<u8>, RecvError> {
@@ -80,6 +142,13 @@ impl<S: AsyncRead + Send + Unpin> RecvChannel for Channel<S> {
 
         message
     }
+}
+
+impl<S, P> Bidirectional for Channel<S, P>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin,
+    P: Privacy,
+{
 }
 
 /// The part of the next message already taken from the stream.
