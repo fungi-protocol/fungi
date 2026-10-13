@@ -8,7 +8,7 @@ edition.workspace = true
 fungi-transport = { path = "../transport" }
 sha3 = { version = "0.12", default-features = false }
 thiserror = "2"
-tokio = { version = "1", features = ["io-util"] }
+tokio = { version = "1", features = ["io-util", "net"] }
 
 [dev-dependencies]
 proptest = "=1.11.0"
