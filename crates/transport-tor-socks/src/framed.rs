@@ -7,12 +7,13 @@
 
 use std::collections::VecDeque;
 use std::fmt;
-use std::io;
+use std::io::{self, Cursor};
+use std::marker::PhantomData;
 use std::mem;
 use std::num::NonZeroUsize;
 
-use fungi_transport::RecvChannel;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use fungi_transport::{Bidirectional, Privacy, RecvChannel, SendChannel, Unspecified};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::record::{self, Item};
 
@@ -23,20 +24,41 @@ const READ_LEN: usize = 4096;
 pub type Message = (u64, Vec<u8>);
 
 /// A message channel over a byte stream.
-pub struct Channel<S> {
+pub struct Channel<S, P = Unspecified> {
     stream: S,
     max_message_len: u32,
     records: record::Buffer,
     read: Box<[u8]>,
     /// What earlier reads brought and was not yet received: at most one read.
     received: VecDeque<Result<Message, record::Error>>,
+    outgoing: Cursor<Vec<u8>>,
     failed: bool,
+    privacy: PhantomData<fn() -> P>,
+}
+
+/// Failure to send a message.
+#[derive(Debug, thiserror::Error)]
+pub enum SendError {
+    /// The message is above the limit. Nothing was written, and the channel
+    /// remains usable.
+    #[error("message exceeds {max} bytes")]
+    TooLarge {
+        /// Largest accepted length in bytes.
+        max: u32,
+    },
+    /// The channel already ended, in either direction.
+    #[error("channel closed")]
+    Closed,
+    /// The stream failed. The channel carries no further messages.
+    #[error(transparent)]
+    Io(#[from] io::Error),
 }
 
 /// Failure to receive a message. The channel yields no further messages.
 #[derive(Debug, thiserror::Error)]
 pub enum RecvError {
-    /// The stream ended between messages, or an earlier receive failed.
+    /// The stream ended between messages, or an earlier receive or write
+    /// failed.
     #[error("channel closed")]
     Closed,
     /// The peer sent a malformed record, or the stream ended inside one.
@@ -57,14 +79,16 @@ impl<S> Channel<S> {
             records: record::Buffer::new(max_message_len),
             read: vec![0; READ_LEN].into_boxed_slice(),
             received: VecDeque::new(),
+            outgoing: Cursor::default(),
             failed: false,
+            privacy: PhantomData,
         }
     }
 }
 
 /// Leaves out message bytes, so a channel can be logged. The stream is left
 /// out too, as its own `Debug` may show the bytes it buffers.
-impl<S> fmt::Debug for Channel<S> {
+impl<S, P> fmt::Debug for Channel<S, P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Channel")
             .field("max_message_len", &self.max_message_len)
@@ -73,7 +97,50 @@ impl<S> fmt::Debug for Channel<S> {
     }
 }
 
-impl<S: AsyncRead + Send + Unpin> RecvChannel<Message> for Channel<S> {
+impl<S: AsyncWrite + Send + Unpin, P: Privacy> SendChannel<Message> for Channel<S, P> {
+    type Privacy = P;
+    type SendError = SendError;
+
+    /// A dropped send may still deliver its message, ahead of the next one.
+    async fn send(&mut self, (ty, payload): Message) -> Result<(), SendError> {
+        if self.failed {
+            return Err(SendError::Closed);
+        }
+
+        let max = self.max_message_len;
+        if !u32::try_from(payload.len()).is_ok_and(|len| len <= max) {
+            return Err(SendError::TooLarge { max });
+        }
+
+        let written = self.write(record::encode([(ty, &payload[..])])).await;
+        self.failed = written.is_err();
+
+        Ok(written?)
+    }
+}
+
+impl<S: AsyncWrite + Unpin, P> Channel<S, P> {
+    /// Write one record, after whatever a dropped send left unwritten.
+    ///
+    /// The cursor advances with every accepted byte and outlives the send
+    /// future, so the stream never carries part of a record followed by the
+    /// start of another.
+    async fn write(&mut self, record: Vec<u8>) -> io::Result<()> {
+        self.stream.write_all_buf(&mut self.outgoing).await?;
+
+        self.outgoing = Cursor::new(record);
+        self.stream.write_all_buf(&mut self.outgoing).await?;
+
+        loop {
+            match self.stream.flush().await {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                flushed => return flushed,
+            }
+        }
+    }
+}
+
+impl<S: AsyncRead + Send + Unpin, P> RecvChannel<Message> for Channel<S, P> {
     type RecvError = RecvError;
 
     async fn recv(&mut self) -> Result<Message, RecvError> {
@@ -88,7 +155,14 @@ impl<S: AsyncRead + Send + Unpin> RecvChannel<Message> for Channel<S> {
     }
 }
 
-impl<S: AsyncRead + Unpin> Channel<S> {
+impl<S, P> Bidirectional<Message, Message> for Channel<S, P>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin,
+    P: Privacy,
+{
+}
+
+impl<S: AsyncRead + Unpin, P> Channel<S, P> {
     /// Reading from the stream is the only await, and what a read brings is
     /// parsed before the next, so a receive dropped by `select!` loses
     /// nothing.
@@ -137,11 +211,11 @@ mod tests {
     use std::task::{Context, Poll};
     use std::time::Duration;
 
-    use fungi_transport::RecvChannel;
+    use fungi_transport::{Bidirectional, RecvChannel, SendChannel};
     use proptest::prelude::*;
-    use tokio::io::{AsyncRead, AsyncWriteExt, DuplexStream, ReadBuf};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 
-    use super::{Channel, Message, READ_LEN, RecvError};
+    use super::{Channel, Message, READ_LEN, RecvError, SendError};
     use crate::record;
 
     const MAX: u32 = 16;
@@ -268,6 +342,80 @@ mod tests {
         assert!(matches!(channel.recv().await, Err(RecvError::Closed)));
     }
 
+    /// A channel writing what the test reads from the returned stream.
+    fn writing(pipe_len: usize) -> (DuplexStream, Channel<DuplexStream>) {
+        let (peer, stream) = tokio::io::duplex(pipe_len);
+        (peer, Channel::new(stream, MAX))
+    }
+
+    /// Everything written to the stream until it ends.
+    async fn written(mut peer: DuplexStream) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        peer.read_to_end(&mut bytes).await.unwrap();
+        bytes
+    }
+
+    #[tokio::test]
+    async fn writes_each_message_as_a_record() {
+        let (peer, mut channel) = writing(64);
+
+        channel.send(message(2, b"first")).await.unwrap();
+        channel.send(message(253, b"")).await.unwrap();
+        drop(channel);
+
+        assert_eq!(written(peer).await, b"\x02\x05first\xfd\x00\xfd\x00");
+    }
+
+    #[tokio::test]
+    async fn sends_a_message_at_the_limit() {
+        let (peer, mut channel) = writing(64);
+        let payload = vec![7; MAX as usize];
+
+        channel.send((2, payload.clone())).await.unwrap();
+        drop(channel);
+
+        assert_eq!(written(peer).await, frame(2, &payload));
+    }
+
+    #[tokio::test]
+    async fn refuses_a_message_above_the_limit_and_stays_usable() {
+        let (peer, mut channel) = writing(64);
+
+        let refused = channel.send((2, vec![7; MAX as usize + 1])).await;
+        channel.send(message(2, b"next")).await.unwrap();
+        drop(channel);
+
+        assert!(matches!(refused, Err(SendError::TooLarge { max: MAX })));
+        assert_eq!(written(peer).await, frame(2, b"next"));
+    }
+
+    /// The peer counts the bytes the length announced, so a send dropped part
+    /// way through must not be followed by the start of another message.
+    #[tokio::test(start_paused = true)]
+    async fn canceled_send_leaves_whole_messages_on_the_stream() {
+        let (peer, mut channel) = writing(6);
+
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(1),
+            channel.send(message(2, b"abandoned")),
+        );
+        assert!(blocked.await.is_err());
+
+        let (bytes, sent) = tokio::join!(written(peer), async move {
+            channel.send(message(2, b"next")).await
+        });
+
+        sent.unwrap();
+        assert_eq!(bytes, [frame(2, b"abandoned"), frame(2, b"next")].concat());
+    }
+
+    #[test]
+    fn sends_and_receives_through_one_channel() {
+        fn assert_bidirectional<C: Bidirectional<Message, Message>>() {}
+
+        assert_bidirectional::<Channel<DuplexStream>>();
+    }
+
     /// Neither the bytes the channel holds nor those still in the stream show.
     #[tokio::test(start_paused = true)]
     async fn debug_output_omits_message_bytes() {
@@ -285,8 +433,37 @@ mod tests {
         );
     }
 
-    /// Fails the first read, then yields its bytes and ends. Ending keeps a
-    /// channel that wrongly retries the failure from waiting forever.
+    /// A failed write may have left part of a message on the stream, so neither
+    /// direction can be trusted afterwards.
+    #[tokio::test]
+    async fn a_failed_send_ends_both_directions() {
+        let mut channel = failing_once(io::ErrorKind::BrokenPipe, &[]);
+
+        let Err(SendError::Io(error)) = channel.send(message(2, b"lost")).await else {
+            panic!("expected the stream failure");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert!(matches!(
+            channel.send(message(2, b"next")).await,
+            Err(SendError::Closed)
+        ));
+        assert!(matches!(channel.recv().await, Err(RecvError::Closed)));
+    }
+
+    #[tokio::test]
+    async fn a_failed_receive_ends_both_directions() {
+        let mut channel = reading_all(&[0x02, 17]).await;
+
+        assert!(channel.recv().await.is_err());
+        assert!(matches!(
+            channel.send(message(2, b"next")).await,
+            Err(SendError::Closed)
+        ));
+    }
+
+    /// Fails the first read or write. Reads then yield its bytes and end;
+    /// writes then take everything. Either keeps a channel that wrongly
+    /// retries the failure from waiting forever.
     struct FailsOnce {
         error: Option<io::ErrorKind>,
         bytes: &'static [u8],
@@ -302,6 +479,27 @@ mod tests {
                 return Poll::Ready(Err(kind.into()));
             }
             buf.put_slice(std::mem::take(&mut self.bytes));
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for FailsOnce {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if let Some(kind) = self.error.take() {
+                return Poll::Ready(Err(kind.into()));
+            }
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Ready(Ok(()))
         }
     }
@@ -333,6 +531,57 @@ mod tests {
         assert_eq!(channel.recv().await.unwrap(), message(2, b"x"));
     }
 
+    /// An interrupted write asks to be retried, so it must not end the channel.
+    #[tokio::test]
+    async fn retries_an_interrupted_write() {
+        let mut channel = failing_once(io::ErrorKind::Interrupted, &[]);
+
+        channel.send(message(2, b"x")).await.unwrap();
+    }
+
+    /// Takes every write and fails the first flush, then flushes. Flushing
+    /// keeps a send that wrongly retries the failure from waiting forever.
+    struct FlushFailsOnce(Option<io::ErrorKind>);
+
+    impl AsyncWrite for FlushFailsOnce {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            match self.0.take() {
+                Some(kind) => Poll::Ready(Err(kind.into())),
+                None => Poll::Ready(Ok(())),
+            }
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_flush_fails_the_send() {
+        let mut channel = Channel::new(FlushFailsOnce(Some(io::ErrorKind::BrokenPipe)), MAX);
+
+        let Err(SendError::Io(error)) = channel.send(message(2, b"x")).await else {
+            panic!("expected the stream failure");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    /// An interrupted flush asks to be retried, so it must not end the channel.
+    #[tokio::test]
+    async fn retries_an_interrupted_flush() {
+        let mut channel = Channel::new(FlushFailsOnce(Some(io::ErrorKind::Interrupted)), MAX);
+
+        channel.send(message(2, b"x")).await.unwrap();
+    }
+
     fn block_on<F: Future>(future: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
             .build()
@@ -360,6 +609,29 @@ mod tests {
                 };
 
                 tokio::join!(writing, receiving);
+            });
+        }
+
+        #[test]
+        fn what_one_end_sends_the_other_receives(messages in within_limit()) {
+            block_on(async {
+                let (near, far) = tokio::io::duplex(8);
+                let mut sender: Channel<DuplexStream> = Channel::new(near, MAX);
+                let mut receiver: Channel<DuplexStream> = Channel::new(far, MAX);
+                let sent = messages.clone();
+                let sending = async move {
+                    for message in sent {
+                        sender.send(message).await.unwrap();
+                    }
+                };
+                let receiving = async {
+                    for message in &messages {
+                        assert_eq!(&receiver.recv().await.unwrap(), message);
+                    }
+                    assert!(matches!(receiver.recv().await, Err(RecvError::Closed)));
+                };
+
+                tokio::join!(sending, receiving);
             });
         }
 
