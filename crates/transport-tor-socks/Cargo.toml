@@ -6,9 +6,13 @@ edition.workspace = true
 
 [dependencies]
 fungi-transport = { path = "../transport" }
+getrandom = { version = "0.3", features = ["std"] }
 thiserror = "2"
-tokio = { version = "1.54", features = ["io-util"] }
+tokio = { version = "1.54", features = ["io-util", "net"] }
 tor-hscrypto = { version = "0.47", default-features = false }
+tor-socksproto = { version = "0.47", default-features = false, features = [
+  "client-handshake",
+] }
 
 [dev-dependencies]
 data-encoding = "2"
