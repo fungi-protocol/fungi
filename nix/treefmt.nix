@@ -10,7 +10,7 @@
         runtimeInputs = [ pkgs.cargo-sort ];
         text = ''
           for manifest in "$@"; do
-            cargo-sort "$(dirname "$manifest")"
+            cargo-sort --no-format "$(dirname "$manifest")"
           done
         '';
       };
