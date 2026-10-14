@@ -11,6 +11,14 @@ use crate::simulate::WalletStateDiff;
 pub(crate) struct Scorer;
 
 impl Scorer {
+    /// The combined cost of objective and subjective terms.
+    pub(crate) fn cost(&self, diff: &WalletStateDiff, instant: Instant) -> Option<SignedAmount> {
+        let objective_cost = self.objective_cost(diff)?;
+        let payment_utility = self.payment_utility(diff, instant)?;
+
+        objective_cost.checked_sub(payment_utility)
+    }
+
     /// The value of the coins `diff` spends, minus the value of the change it pays back:
     /// what the payments and the fee take out of the wallet.
     ///
@@ -89,6 +97,17 @@ mod tests {
         }
     }
 
+    /// An intent worth `sats` from `now` on.
+    fn intent(now: Instant, sats: u64) -> Intent {
+        Intent::new(
+            Action::OutputCreation(FixedPaymentInstructions {
+                script_pubkey: ScriptBuf::new(),
+                amount: Amount::from_sat(sats),
+            }),
+            PayoffCurve::new(now, [(Duration::ZERO, Amount::from_sat(sats))]),
+        )
+    }
+
     #[test]
     fn nothing_spent_and_nothing_returned_costs_nothing() {
         assert_eq!(
@@ -117,23 +136,29 @@ mod tests {
     #[test]
     fn utility_sums_realized_payoffs() {
         let now = Instant::now();
-        let worth = |sats| {
-            Intent::new(
-                Action::OutputCreation(FixedPaymentInstructions {
-                    script_pubkey: ScriptBuf::new(),
-                    amount: Amount::from_sat(sats),
-                }),
-                PayoffCurve::new(now, [(Duration::ZERO, Amount::from_sat(sats))]),
-            )
-        };
         let diff = WalletStateDiff {
-            realized: vec![worth(100), worth(200)],
+            realized: vec![intent(now, 100), intent(now, 200)],
             ..diff(&[], &[])
         };
 
         assert_eq!(
             Scorer.payment_utility(&diff, now),
             Some(SignedAmount::from_sat(300))
+        );
+    }
+
+    /// 31,000 sats leave the wallet to realize an intent worth 40,000.
+    #[test]
+    fn utility_offsets_spend() {
+        let now = Instant::now();
+        let diff = WalletStateDiff {
+            realized: vec![intent(now, 40_000)],
+            ..diff(&[100_000], &[69_000])
+        };
+
+        assert_eq!(
+            Scorer.cost(&diff, now),
+            Some(SignedAmount::from_sat(-9_000))
         );
     }
 }
