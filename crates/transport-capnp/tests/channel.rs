@@ -3,11 +3,12 @@
 
 //! Consumer workflows over real RPC connections.
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::time::Duration;
 
 use fungi_transport::{Bidirectional, ConnectionUnlinkability, RecvChannel, SendChannel};
-use fungi_transport_capnp::{CapnpChannel, RecvError, SendError, serve};
+use fungi_transport_capnp::{CapnpBidirectional, CapnpChannel, RecvError, SendError, serve};
 use fungi_transport_testkit::{
     mem::{MemConfig, MemError, MemReceiver, MemSender, bidirectional},
     testkit,
@@ -73,7 +74,7 @@ where
 fn wrap<S, R>(
     backend: Bidirectional<S, R>,
     max: usize,
-) -> (CapnpChannel, std::thread::JoinHandle<()>)
+) -> (CapnpBidirectional, std::thread::JoinHandle<()>)
 where
     S: SendChannel + 'static,
     R: RecvChannel + 'static,
@@ -82,9 +83,18 @@ where
 {
     let (client, io) = tokio::io::duplex(64);
     let server = server(backend, io);
-    (CapnpChannel::connect(client, max).unwrap(), server)
+    (
+        CapnpChannel::connect(client, max).unwrap().into_channel(),
+        server,
+    )
 }
-fn pair(config: MemConfig) -> (CapnpChannel, CapnpChannel, Vec<std::thread::JoinHandle<()>>) {
+fn pair(
+    config: MemConfig,
+) -> (
+    CapnpBidirectional,
+    CapnpBidirectional,
+    Vec<std::thread::JoinHandle<()>>,
+) {
     let (left, right) = bidirectional(config);
     let (left, first) = wrap(left, MAX);
     let (right, second) = wrap(right, MAX);
@@ -116,6 +126,35 @@ async fn conforms_in_both_directions_and_preserves_empty_messages() {
         testkit::roundtrip_both_directions(left, right).await;
     })
     .await;
+    stopped(servers).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bidirectional_bursts_preserve_every_message_under_backpressure() {
+    let (left, right, servers) = pair(MemConfig::default());
+    async fn exchange(channel: CapnpBidirectional, tag: u8) -> BTreeSet<Vec<u8>> {
+        let (mut sender, mut receiver) = channel.into_parts();
+        let sending = async move {
+            for index in 0..32 {
+                sender.send(vec![tag, index]).await.unwrap();
+            }
+        };
+        let receiving = async move {
+            let mut messages = BTreeSet::new();
+            for _ in 0..32 {
+                assert!(messages.insert(receiver.recv().await.unwrap()));
+            }
+            messages
+        };
+        futures_util::future::join(sending, receiving).await.1
+    }
+    let (from_right, from_left) = deadline(futures_util::future::join(
+        exchange(left, 0),
+        exchange(right, 1),
+    ))
+    .await;
+    assert_eq!(from_right, (0..32).map(|i| vec![1, i]).collect());
+    assert_eq!(from_left, (0..32).map(|i| vec![0, i]).collect());
     stopped(servers).await;
 }
 
@@ -314,4 +353,17 @@ async fn receive_backend_error_closes_both_directions_with_diagnostics() {
     ));
     drop(channel);
     stopped(vec![server]).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn owned_directions_preserve_unspecified_privacy() {
+    let (left, right, servers) = pair(MemConfig::default());
+    let (sender, receiver) = left.into_parts();
+
+    fn unspecified<C: SendChannel<Privacy = fungi_transport::Unspecified>>(_: &C) {}
+    unspecified(&sender);
+    let (other_sender, other_receiver) = right.into_parts();
+
+    drop((sender, receiver, other_sender, other_receiver));
+    stopped(servers).await;
 }
