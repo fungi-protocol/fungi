@@ -7,7 +7,7 @@ use fungi_transport::{ChannelBuilder, RecvChannel, SendChannel};
 use fungi_transport_testkit::mem::{MemConfig, bidirectional};
 use tokio::sync::{Semaphore, mpsc};
 
-use crate::builder::CapnpBuilder;
+use crate::builder::{CapnpBuilder, reap_child};
 use crate::channel::{CapnpChannel, receive_message, send_message};
 use crate::client::{
     Bootstrap, BuildCommand, channel_actor, new_link, rpc_build_error, rpc_recv_error,
@@ -16,6 +16,43 @@ use crate::client::{
 use crate::error::{BuildError, RecvError, SendError};
 use crate::protocol::{RemoteChannel, channel, recv_failure, send_failure};
 use crate::server::{run_server, serve, serve_builder};
+
+#[tokio::test]
+async fn cleanup_reaps_a_process_that_exited_successfully() {
+    let mut child = tokio::process::Command::new("true")
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let status = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(status.success());
+    reap_child(&mut child).await;
+    assert!(child.id().is_none());
+    assert!(child.wait().await.unwrap().success());
+}
+
+const SIGKILL: i32 = 9;
+
+#[tokio::test]
+async fn cleanup_kills_and_reaps_a_process_that_exceeds_the_grace_period() {
+    let mut child = tokio::process::Command::new("sleep")
+        .arg("60")
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    assert!(child.try_wait().unwrap().is_none());
+    tokio::time::timeout(std::time::Duration::from_secs(5), reap_child(&mut child))
+        .await
+        .unwrap();
+    assert!(child.id().is_none());
+    let status = child.wait().await.unwrap();
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(SIGKILL)
+    );
+}
 
 fn mem_send(_: fungi_transport_testkit::mem::MemError) -> SendError {
     SendError::Closed
