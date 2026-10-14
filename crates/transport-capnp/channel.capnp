@@ -29,3 +29,13 @@ interface Channel(M, SendE, RecvE) {
   recv @1 () -> (result :Result(M, RecvE));
 }
 
+struct BuildFailure {
+  union {
+    unreachable @0 :Void;
+    failed @1 :Text;
+  }
+}
+
+interface Builder(I, C, E) {
+  build @0 (input :I) -> (result :Result(C, E));
+}
