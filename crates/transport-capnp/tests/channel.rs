@@ -434,12 +434,12 @@ async fn builders_reconnect_and_keep_channels_alive_after_builder_drop() {
             .unwrap();
     });
     let mut connector = CapnpBuilder::connect(client, MAX).unwrap();
-    let mut listener = CapnpBuilder::connect(inbound, MAX).unwrap();
+    let mut listener = CapnpBuilder::connect(inbound, MAX).unwrap().into_acceptor();
     for _ in 0..2 {
         connector.set_max_recv_message_len(1);
         let (left, right) = deadline(futures_util::future::join(
             connector.build(&Vec::new()),
-            listener.build(&Vec::new()),
+            listener.build(&()),
         ))
         .await;
         let (mut left, mut right) = (left.unwrap(), right.unwrap());
@@ -461,7 +461,7 @@ async fn builders_reconnect_and_keep_channels_alive_after_builder_drop() {
     }
     let (left, right) = deadline(futures_util::future::join(
         connector.build(&Vec::new()),
-        listener.build(&Vec::new()),
+        listener.build(&()),
     ))
     .await;
     let (mut left, mut right) = (left.unwrap(), right.unwrap());
