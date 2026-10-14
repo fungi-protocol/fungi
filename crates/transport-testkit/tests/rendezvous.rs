@@ -12,7 +12,18 @@ use tokio::sync::{mpsc, oneshot};
 const MAX: usize = 8;
 type Message = (Vec<u8>, oneshot::Sender<()>);
 struct Sender(mpsc::Sender<Message>);
-struct Receiver(mpsc::Receiver<Message>);
+struct Receiver {
+    queue: mpsc::Receiver<Message>,
+    mode: Mode,
+    saved: Option<Vec<u8>>,
+}
+#[derive(Clone, Copy)]
+enum Mode {
+    Deliver,
+    Retain,
+    Lose,
+    Yield,
+}
 type BidirectionalChannel = Bidirectional<Sender, Receiver>;
 
 impl SendChannel for Sender {
@@ -36,31 +47,52 @@ impl SendChannel for Sender {
 impl RecvChannel for Receiver {
     type RecvError = io::Error;
     async fn recv(&mut self) -> Result<Vec<u8>, io::Error> {
+        if let Some(message) = self.saved.take() {
+            return Ok(message);
+        }
         let (message, acknowledge) = self
-            .0
+            .queue
             .recv()
             .await
             .ok_or_else(|| io::Error::other("closed"))?;
         let _ = acknowledge.send(());
-        Ok(message)
+        match self.mode {
+            Mode::Deliver => Ok(message),
+            Mode::Retain => {
+                self.saved = Some(message);
+                std::future::pending().await
+            }
+            Mode::Lose => std::future::pending().await,
+            Mode::Yield => {
+                tokio::task::yield_now().await;
+                Ok(message)
+            }
+        }
     }
 }
-fn pair() -> (BidirectionalChannel, BidirectionalChannel) {
+fn pair(mode: Mode) -> (BidirectionalChannel, BidirectionalChannel) {
     let (left, incoming_right) = mpsc::channel(1);
     let (right, incoming_left) = mpsc::channel(1);
+    let receiver = |queue| Receiver {
+        queue,
+        mode,
+        saved: None,
+    };
     (
-        Bidirectional::new(Sender(left), Receiver(incoming_left)),
-        Bidirectional::new(Sender(right), Receiver(incoming_right)),
+        Bidirectional::new(Sender(left), receiver(incoming_left)),
+        Bidirectional::new(Sender(right), receiver(incoming_right)),
     )
 }
 #[tokio::test(start_paused = true)]
 async fn helpers_accept_submission_that_waits_for_peer_reception() {
     tokio::time::timeout(Duration::from_secs(5), async {
-        let (left, right) = pair();
+        let (left, right) = pair(Mode::Deliver);
         testkit::roundtrip_both_directions(left, right).await;
-        let (left, right) = pair();
+        let (left, right) = pair(Mode::Deliver);
         testkit::closed_after_peer_drop(left, right, |error| error.to_string() == "closed").await;
-        let (left, right) = pair();
+        let (left, right) = pair(Mode::Deliver);
+        testkit::recv_is_cancel_safe(left, right).await;
+        let (left, right) = pair(Mode::Deliver);
         testkit::too_large_is_recoverable(left, right, MAX, |error| {
             error.kind() == io::ErrorKind::InvalidInput
         })
@@ -72,12 +104,40 @@ async fn helpers_accept_submission_that_waits_for_peer_reception() {
 #[tokio::test(start_paused = true)]
 #[should_panic(expected = "receiver completed before the oversized payload was rejected")]
 async fn limit_check_rejects_an_oversized_payload_that_reaches_the_peer() {
-    let (left, right) = pair();
+    let (left, right) = pair(Mode::Deliver);
     testkit::too_large(left, right, MAX - 1, |_| true).await;
 }
 #[tokio::test(start_paused = true)]
 #[should_panic(expected = "receiver completed before the oversized payload was rejected")]
 async fn recovery_rejects_an_oversized_payload_that_reaches_the_peer() {
-    let (left, right) = pair();
+    let (left, right) = pair(Mode::Deliver);
     testkit::too_large_is_recoverable(left, right, MAX - 1, |_| true).await;
+}
+#[tokio::test(start_paused = true)]
+async fn cancellation_preserves_a_retained_message_while_submission_waits() {
+    let (left, right) = pair(Mode::Retain);
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        testkit::recv_is_cancel_safe(left, right),
+    )
+    .await
+    .expect("retained reception must survive cancellation");
+}
+#[tokio::test(start_paused = true)]
+async fn cancellation_rejects_message_loss_while_submission_waits() {
+    let (left, right) = pair(Mode::Lose);
+    let task = tokio::spawn(testkit::recv_is_cancel_safe(left, right));
+    let result = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("message loss must be detected within the deadline");
+    assert!(result.expect_err("helper accepted message loss").is_panic());
+}
+#[tokio::test(start_paused = true)]
+async fn cancellation_rejects_loss_after_reception_is_acknowledged() {
+    let (left, right) = pair(Mode::Yield);
+    let task = tokio::spawn(testkit::recv_is_cancel_safe(left, right));
+    let result = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("message loss must be detected within the deadline");
+    assert!(result.expect_err("helper accepted message loss").is_panic());
 }
