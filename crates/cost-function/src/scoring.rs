@@ -1,5 +1,7 @@
 //! What a simulated transaction costs the wallet.
 
+use std::time::Instant;
+
 use bitcoin::SignedAmount;
 
 use crate::simulate::WalletStateDiff;
@@ -32,14 +34,31 @@ impl Scorer {
 
         spent.checked_sub(change)
     }
+
+    /// The utility of the payments realized at `instant`.
+    /// Utility is represented as a signed amount, negative values being penalties for most likely missing a deadline.
+    pub(crate) fn payment_utility(
+        &self,
+        diff: &WalletStateDiff,
+        instant: Instant,
+    ) -> Option<SignedAmount> {
+        // Note: currently payoff() can never return a Signed amount but we may want to support penalizing late payments
+        diff.realized
+            .iter()
+            .try_fold(SignedAmount::ZERO, |sum, intent| {
+                sum.checked_add(intent.payoff_curve.payoff(instant).to_signed().ok()?)
+            })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::change::OutputWithoutScriptpubkey;
+    use crate::intent::{Action, FixedPaymentInstructions, Intent, PayoffCurve};
     use crate::wallet::Utxo;
-    use bitcoin::{Amount, OutPoint, Txid, Weight, hashes::Hash};
+    use bitcoin::{Amount, OutPoint, ScriptBuf, Txid, Weight, hashes::Hash};
+    use std::time::Duration;
 
     /// A transaction spending a coin of each value in `spent` and paying back a change
     /// output of each value in `change`.
@@ -92,5 +111,29 @@ mod tests {
     #[test]
     fn spent_coins_worth_more_than_a_signed_amount_holds_have_no_cost() {
         assert_eq!(Scorer.objective_cost(&diff(&[1 << 62, 1 << 62], &[])), None);
+    }
+
+    /// Each realized intent adds what it is worth at that instant.
+    #[test]
+    fn utility_sums_realized_payoffs() {
+        let now = Instant::now();
+        let worth = |sats| {
+            Intent::new(
+                Action::OutputCreation(FixedPaymentInstructions {
+                    script_pubkey: ScriptBuf::new(),
+                    amount: Amount::from_sat(sats),
+                }),
+                PayoffCurve::new(now, [(Duration::ZERO, Amount::from_sat(sats))]),
+            )
+        };
+        let diff = WalletStateDiff {
+            realized: vec![worth(100), worth(200)],
+            ..diff(&[], &[])
+        };
+
+        assert_eq!(
+            Scorer.payment_utility(&diff, now),
+            Some(SignedAmount::from_sat(300))
+        );
     }
 }
