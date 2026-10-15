@@ -2,6 +2,8 @@
 
 pub mod batch;
 pub mod blockspace;
+#[expect(dead_code, reason = "no caller in the crate selects change yet")]
+pub mod change;
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "nothing walks or builds the tree yet")
