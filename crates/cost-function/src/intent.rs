@@ -18,7 +18,7 @@ pub struct FixedPaymentInstructions {
 /// Something the user wants to happen, which can be realized in potentially more than
 /// one way.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Action {
+pub enum Outcome {
     /// Pay someone under instructions they supplied, out of band.
     OutputCreation(FixedPaymentInstructions),
 }
@@ -125,16 +125,16 @@ impl Line {
     }
 }
 
-/// An [`Action`] together with a [`PayoffCurve`] determined by the user.
+/// An [`Outcome`] together with a [`PayoffCurve`] determined by the user.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Intent {
-    pub(crate) inner: Action,
+    pub(crate) inner: Outcome,
     pub(crate) payoff_curve: PayoffCurve,
 }
 
 impl Intent {
     /// Build an intent with the payoff curve the user attached to it.
-    pub fn new(inner: Action, payoff_curve: PayoffCurve) -> Self {
+    pub fn new(inner: Outcome, payoff_curve: PayoffCurve) -> Self {
         Intent {
             inner,
             payoff_curve,
@@ -352,11 +352,11 @@ mod tests {
     }
 
     #[test]
-    fn an_intent_keeps_its_action_and_payoff_curve() {
+    fn an_intent_keeps_its_outcome_and_payoff_curve() {
         let start = Instant::now();
-        let intent = Intent::new(Action::OutputCreation(request()), single_peaked(start));
+        let intent = Intent::new(Outcome::OutputCreation(request()), single_peaked(start));
 
-        assert_eq!(intent.inner, Action::OutputCreation(request()));
+        assert_eq!(intent.inner, Outcome::OutputCreation(request()));
         assert_eq!(intent.payoff_curve, single_peaked(start));
         assert_eq!(intent.clone(), intent);
     }

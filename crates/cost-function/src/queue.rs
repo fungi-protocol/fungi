@@ -57,7 +57,7 @@ impl Queue for InMemoryQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intent::{Action, FixedPaymentInstructions, PayoffCurve};
+    use crate::intent::{FixedPaymentInstructions, Outcome, PayoffCurve};
     use bitcoin::{Amount, ScriptBuf};
     use std::collections::HashSet;
     use std::time::{Duration, Instant};
@@ -65,7 +65,7 @@ mod tests {
     /// Built from an explicit `start` so two calls with the same arguments compare equal.
     fn intent(start: Instant, sats: u64) -> Intent {
         Intent::new(
-            Action::OutputCreation(FixedPaymentInstructions {
+            Outcome::OutputCreation(FixedPaymentInstructions {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
                 amount: Amount::from_sat(sats),
             }),

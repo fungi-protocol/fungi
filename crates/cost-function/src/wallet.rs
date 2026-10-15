@@ -52,7 +52,7 @@ impl WalletStateSnapshot {
 
 #[cfg(test)]
 mod tests {
-    use crate::intent::{Action, FixedPaymentInstructions, PayoffCurve};
+    use crate::intent::{FixedPaymentInstructions, Outcome, PayoffCurve};
 
     use super::*;
     use bitcoin::{ScriptBuf, Txid, hashes::Hash};
@@ -68,7 +68,7 @@ mod tests {
 
     fn intent(start: Instant, sats: u64) -> Intent {
         Intent::new(
-            Action::OutputCreation(FixedPaymentInstructions {
+            Outcome::OutputCreation(FixedPaymentInstructions {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
                 amount: Amount::from_sat(sats),
             }),

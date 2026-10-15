@@ -11,14 +11,14 @@ pub struct Batch<Id> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intent::{Action, FixedPaymentInstructions, Intent, PayoffCurve};
+    use crate::intent::{FixedPaymentInstructions, Intent, Outcome, PayoffCurve};
     use crate::queue::{InMemoryQueue, Queue};
     use bitcoin::{Amount, ScriptBuf};
     use std::time::Instant;
 
     fn intent(start: Instant, sats: u64) -> Intent {
         Intent::new(
-            Action::OutputCreation(FixedPaymentInstructions {
+            Outcome::OutputCreation(FixedPaymentInstructions {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
                 amount: Amount::from_sat(sats),
             }),
