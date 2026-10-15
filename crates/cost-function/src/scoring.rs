@@ -23,6 +23,20 @@ impl Scorer {
         objective_cost.checked_sub(payment_utility)
     }
 
+    /// The [`objective_cost`](Self::objective_cost) of each transaction of a plan, summed.
+    /// `None` if any of them, or their sum, overflows.
+    ///
+    /// Payment utility is left out: every plan realizes every intent, and a batch may settle
+    /// later or collaboratively, so pricing them all at one instant adds nothing true.
+    pub(crate) fn plan_cost<Id: Eq + Hash>(
+        &self,
+        diffs: &[WalletStateDiff<Id>],
+    ) -> Option<SignedAmount> {
+        diffs.iter().try_fold(SignedAmount::ZERO, |sum, diff| {
+            sum.checked_add(self.objective_cost(diff)?)
+        })
+    }
+
     /// The value of the coins `diff` spends, minus the value of the change it pays back:
     /// what the payments and the fee take out of the wallet.
     ///
@@ -167,6 +181,22 @@ mod tests {
         assert_eq!(
             Scorer.cost(&diff, now),
             Some(SignedAmount::from_sat(-9_000))
+        );
+    }
+
+    /// One transaction costs 31,000 sats and the other 5,000. The intent the first realizes
+    /// does not offset it.
+    #[test]
+    fn plan_cost_sums_its_transactions() {
+        let realizing = WalletStateDiff {
+            realized: HashMap::from([(0, intent(Instant::now(), 40_000))]),
+            ..diff(&[100_000], &[69_000])
+        };
+        let diffs = [realizing, diff(&[50_000], &[45_000])];
+
+        assert_eq!(
+            Scorer.plan_cost(&diffs),
+            Some(SignedAmount::from_sat(36_000))
         );
     }
 }

@@ -14,6 +14,7 @@ pub mod change;
 pub(crate) mod decision_tree;
 pub mod intent;
 pub mod plan;
+pub mod privacy;
 pub mod queue;
 #[cfg_attr(
     not(test),
