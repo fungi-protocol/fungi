@@ -1,7 +1,13 @@
 use std::hash::Hash;
 
+use bitcoin::FeeRate;
+use rand::RngCore;
+
 use crate::batch::Batch;
+use crate::change::{ChangeSelector, ChangeStrategy, ScriptpubkeyAssigner};
 use crate::plan::PlanIntent;
+use crate::scoring::Scorer;
+use crate::selection::CoinSelector;
 use crate::wallet::WalletStateSnapshot;
 
 /// Where the next unplaced intent could go.
@@ -9,6 +15,25 @@ use crate::wallet::WalletStateSnapshot;
 pub(crate) enum DecisionTree<Id> {
     Branch(Vec<Node<Id>>),
     Leaf(PlanIntent<Id>),
+}
+
+impl<Id: Clone> DecisionTree<Id> {
+    /// Every plan in the tree, in tree order.
+    pub(crate) fn iter_leaves(&self) -> Vec<PlanIntent<Id>> {
+        match self {
+            DecisionTree::Branch(nodes) => {
+                let mut agg = vec![];
+                for node in nodes {
+                    agg.extend(node.subtree.iter_leaves());
+                }
+
+                agg
+            }
+            DecisionTree::Leaf(plan) => {
+                vec![plan.clone()]
+            }
+        }
+    }
 }
 
 /// One way to place one intent.
@@ -47,6 +72,37 @@ impl<Id: Copy + Ord + Hash> WalletStateSnapshot<Id> {
         // from one run to the next.
         ids.sort();
         Ok(expand(&ids, &mut Vec::new()))
+    }
+
+    /// The plan whose transactions cost the least, trying every plan in the tree.
+    ///
+    /// A plan that can't be funded, or whose cost overflows, is skipped. `None` if no plan
+    /// is left. On a tie, the first plan in tree order wins.
+    pub(crate) fn best_plan<S, C, A, R>(
+        &self,
+        feerate: FeeRate,
+        selector: &S,
+        rng: &mut R,
+        change_strategy: &ChangeStrategy<C, A>,
+    ) -> Result<Option<PlanIntent<Id>>, EnumerationError>
+    where
+        S: CoinSelector,
+        C: ChangeSelector,
+        A: ScriptpubkeyAssigner,
+        R: RngCore,
+    {
+        Ok(self
+            .enumerate()?
+            .iter_leaves()
+            .into_iter()
+            .filter_map(|plan| {
+                let diffs = self
+                    .realize(&plan, feerate, selector, rng, change_strategy)
+                    .ok()?;
+                Some((Scorer.plan_cost(&diffs)?, plan))
+            })
+            .min_by_key(|(cost, _)| *cost)
+            .map(|(_, plan)| plan))
     }
 }
 
@@ -93,9 +149,14 @@ fn expand<Id: Copy + Ord>(unplaced: &[Id], batches: &mut Vec<Vec<Id>>) -> Decisi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::change::single_output::SingleOutputChangeSelector;
     use crate::intent::{Action, FixedPaymentInstructions, Intent, PayoffCurve};
     use crate::queue::{InMemoryQueue, Queue};
-    use bitcoin::{Amount, ScriptBuf};
+    use crate::selection::random::RandomSelector;
+    use crate::wallet::Utxo;
+    use bitcoin::hashes::Hash;
+    use bitcoin::{Amount, OutPoint, ScriptBuf, Txid, Weight};
+    use rand::{SeedableRng, rngs::StdRng};
     use std::collections::BTreeSet;
     use std::time::Instant;
 
@@ -237,5 +298,68 @@ mod tests {
                 limit: 2
             }
         );
+    }
+
+    /// [`pool`] with a coin of each value in `coins`.
+    fn funded(n: usize, coins: &[u64]) -> WalletStateSnapshot<Id> {
+        let coins = coins.iter().zip(0..).map(|(&sats, vout)| {
+            Utxo::new(
+                OutPoint::new(Txid::all_zeros(), vout),
+                Amount::from_sat(sats),
+                Weight::ZERO,
+            )
+        });
+        let intents = pool(n)
+            .intents()
+            .map(|(&id, intent)| (id, intent.clone()))
+            .collect::<Vec<_>>();
+
+        WalletStateSnapshot::new(coins, intents)
+    }
+
+    /// Change that costs nothing to create.
+    struct Free;
+
+    impl ScriptpubkeyAssigner for Free {
+        fn output_weight(&self) -> Weight {
+            Weight::ZERO
+        }
+
+        fn satisfaction_weight(&self) -> Weight {
+            Weight::ZERO
+        }
+
+        fn dust(&self) -> Amount {
+            Amount::ZERO
+        }
+    }
+
+    fn best_plan(wallet: &WalletStateSnapshot<Id>) -> Option<PlanIntent<Id>> {
+        wallet
+            .best_plan(
+                FeeRate::from_sat_per_vb(1).unwrap(),
+                &RandomSelector,
+                &mut StdRng::seed_from_u64(0),
+                &ChangeStrategy::new(SingleOutputChangeSelector, Free),
+            )
+            .unwrap()
+    }
+
+    /// Paying apart costs a second transaction's fee, so batching wins.
+    #[test]
+    fn the_cheapest_plan_wins() {
+        assert_eq!(
+            best_plan(&funded(2, &[100_000, 100_000])),
+            Some(PlanIntent {
+                batches: BTreeSet::from([Batch {
+                    intents: BTreeSet::from([1, 2])
+                }])
+            })
+        );
+    }
+
+    #[test]
+    fn without_coins_there_is_no_plan() {
+        assert_eq!(best_plan(&funded(2, &[])), None);
     }
 }
