@@ -140,6 +140,7 @@ version = "0.0.0"
 dependencies = [
  "bitcoin",
  "proptest",
+ "rand",
 ]
 
 [[package]]
