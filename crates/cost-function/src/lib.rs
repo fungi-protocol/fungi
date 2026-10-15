@@ -15,6 +15,11 @@ pub(crate) mod decision_tree;
 pub mod intent;
 pub mod plan;
 pub mod queue;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "nothing scores a simulated state yet")
+)]
+pub(crate) mod scoring;
 #[expect(
     dead_code,
     reason = "no caller in the crate poses a funding request yet"
