@@ -1,0 +1,18 @@
+[package]
+name = "fungi-linked-mailbox"
+description = "Linked mailboxes over BIP77 directories"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bech32 = { version = "0.11", default-features = false, features = ["alloc"] }
+ohttp-client = { version = "0.0.2", features = ["secp256k1"] }
+thiserror = "2"
+
+[dev-dependencies]
+bhttp = "0.7.2"
+bitcoin-ohttp = { version = "0.6.0", features = ["server"] }
+proptest = "1"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
