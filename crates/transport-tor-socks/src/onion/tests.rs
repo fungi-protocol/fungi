@@ -91,3 +91,25 @@ proptest! {
         prop_assert_eq!(Addr::new(format!("{label}{suffix}"), 1), Err(InvalidAddr));
     }
 }
+
+proptest! {
+    #[test]
+    fn text_form_round_trips(label in label(), port: u16) {
+        let addr = Addr::new(format!("{label}.onion"), port).unwrap();
+
+        prop_assert_eq!(addr.to_string(), format!("{label}.onion:{port}"));
+        prop_assert_eq!(addr.to_string().parse(), Ok(addr));
+    }
+
+    #[test]
+    fn text_form_needs_a_port(label in label(), port in "|:|:port|:65536") {
+        let text = format!("{label}.onion{port}");
+
+        prop_assert_eq!(text.parse::<Addr>(), Err(InvalidAddr));
+    }
+}
+
+#[test]
+fn text_form_needs_a_host() {
+    assert_eq!(":9735".parse::<Addr>(), Err(InvalidAddr));
+}

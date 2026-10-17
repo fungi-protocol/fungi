@@ -1,5 +1,8 @@
 //! Onion service addresses.
 
+use std::fmt;
+use std::str::FromStr;
+
 use sha3::{Digest, Sha3_256};
 
 /// A v3 onion service hostname and a virtual port.
@@ -9,9 +12,10 @@ pub struct Addr {
     port: u16,
 }
 
-/// The hostname is not a v3 onion address with a valid checksum.
+/// The hostname is not a v3 onion address with a valid checksum, or the text
+/// it was parsed from lacks a `:<port>`.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
-#[error("expected a v3 onion address")]
+#[error("invalid onion address")]
 pub struct InvalidAddr;
 
 impl Addr {
@@ -31,6 +35,22 @@ impl Addr {
     /// The virtual port on the onion service.
     pub fn port(&self) -> u16 {
         self.port
+    }
+}
+
+impl fmt::Display for Addr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.host, self.port)
+    }
+}
+
+impl FromStr for Addr {
+    type Err = InvalidAddr;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let (host, port) = text.rsplit_once(':').ok_or(InvalidAddr)?;
+        let port = port.parse().map_err(|_| InvalidAddr)?;
+        Self::new(host.to_owned(), port)
     }
 }
 

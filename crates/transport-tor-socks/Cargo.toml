@@ -8,11 +8,11 @@ edition.workspace = true
 fungi-transport = { path = "../transport" }
 sha3 = { version = "0.12", default-features = false }
 thiserror = "2"
-tokio = { version = "1", features = ["io-util", "net"] }
+tokio = { version = "1", features = ["io-util", "macros", "net"] }
 
 [dev-dependencies]
 proptest = "=1.11.0"
-tokio = { version = "1", features = ["macros", "rt", "test-util", "time"] }
+tokio = { version = "1", features = ["rt", "test-util", "time"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
