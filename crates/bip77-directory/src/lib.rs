@@ -13,6 +13,10 @@ use bech32::{Hrp, NoChecksum};
 use fungi_mailboxes::{Directory, MailboxSecret};
 use url::Url;
 
+mod ohttp;
+
+pub use ohttp::{ENCAPSULATED_MESSAGE_BYTES, OhttpClient, OhttpClientError, Relay, SingleRelay};
+
 /// A BIP77 mailbox identifier encoded as 13 uppercase bech32 characters.
 ///
 /// Uses the first 64 bits of a [`MailboxSecret`], rather than a Payjoin

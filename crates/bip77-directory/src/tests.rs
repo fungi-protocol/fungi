@@ -1,10 +1,13 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 
 use fungi_mailboxes::{Directory, PAYLOAD_BYTES, Reader, Writer, derive_mailbox_secret};
 
 use super::*;
+
+type Ciphertexts = Arc<Mutex<Vec<Vec<u8>>>>;
 
 /// Storage semantics of payjoin-mailroom's mailbox endpoints.
 #[derive(Debug, Default)]
@@ -184,4 +187,341 @@ fn directory_urls_without_a_path_are_rejected() {
         Bip77Directory::new((), "mailto:directory@example.com"),
         Err(DirectoryUrlError::NoPath)
     ));
+}
+
+#[derive(Debug)]
+struct LoopbackRelay {
+    server: ::ohttp::Server,
+    ciphertexts: Ciphertexts,
+    mailboxes: Mutex<HashMap<Vec<u8>, Vec<u8>>>,
+}
+
+impl Relay for LoopbackRelay {
+    type Error = Infallible;
+
+    async fn post(&self, body: Vec<u8>) -> Result<Vec<u8>, Self::Error> {
+        assert_eq!(body.len(), ENCAPSULATED_MESSAGE_BYTES);
+        self.ciphertexts.lock().unwrap().push(body.clone());
+
+        let (plaintext, response_context) = self.server.decapsulate(&body).unwrap();
+        assert_eq!(plaintext.len(), 8104);
+        let request = bhttp::Message::read_bhttp(&mut Cursor::new(plaintext)).unwrap();
+        let method = request.control().method().unwrap();
+        let path = request.control().path().unwrap().to_vec();
+        let (status, content) = match method {
+            b"POST" => {
+                self.mailboxes
+                    .lock()
+                    .unwrap()
+                    .entry(path)
+                    .or_insert_with(|| request.content().to_vec());
+                (200_u16, Vec::new())
+            }
+            b"GET" => match self.mailboxes.lock().unwrap().get(&path).cloned() {
+                Some(message) => (200, message),
+                None => (202, Vec::new()),
+            },
+            _ => (405, Vec::new()),
+        };
+
+        let mut response = bhttp::Message::response(bhttp::StatusCode::try_from(status).unwrap());
+        response.write_content(&content);
+        let mut padded = [0; 8144];
+        response
+            .write_bhttp(bhttp::Mode::KnownLength, &mut padded.as_mut_slice())
+            .unwrap();
+        let encapsulated = response_context.encapsulate(&padded).unwrap();
+        assert_eq!(encapsulated.len(), ENCAPSULATED_MESSAGE_BYTES);
+        Ok(encapsulated)
+    }
+}
+
+fn loopback_relay() -> (LoopbackRelay, Vec<u8>, Ciphertexts) {
+    use ::ohttp::hpke::{Aead, Kdf, Kem};
+    use ::ohttp::{KeyConfig, SymmetricSuite};
+
+    let config = KeyConfig::new(
+        1,
+        Kem::K256Sha256,
+        vec![SymmetricSuite::new(Kdf::HkdfSha256, Aead::ChaCha20Poly1305)],
+    )
+    .unwrap();
+    let server = ::ohttp::Server::new(config).unwrap();
+    let encoded_config = server.config().encode().unwrap();
+    let ciphertexts = Arc::new(Mutex::new(Vec::new()));
+    let mailboxes = Mutex::new(HashMap::from([(
+        b"/QQQQQQQQQQQQQ".to_vec(),
+        b"mailbox payload".to_vec(),
+    )]));
+    (
+        LoopbackRelay {
+            server,
+            ciphertexts: Arc::clone(&ciphertexts),
+            mailboxes,
+        },
+        encoded_config,
+        ciphertexts,
+    )
+}
+
+fn ohttp_loopback() -> (SingleRelay<LoopbackRelay>, Ciphertexts) {
+    let (relay, keys, ciphertexts) = loopback_relay();
+    let client = OhttpClient::new(keys).unwrap();
+    (SingleRelay::new(client, relay), ciphertexts)
+}
+
+fn mailbox_request() -> DirectoryRequest {
+    DirectoryRequest {
+        method: Method::Get,
+        target: "https://directory.test/QQQQQQQQQQQQQ".to_owned(),
+        body: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn ohttp_client_owns_context_and_never_reuses_ciphertext() {
+    let (client, ciphertexts) = ohttp_loopback();
+
+    let first = client.send(mailbox_request()).await.unwrap();
+    let second = client.send(mailbox_request()).await.unwrap();
+    assert_eq!(first.status, 200);
+    assert_eq!(first.body, b"mailbox payload");
+    assert_eq!(second, first);
+
+    let ciphertexts = ciphertexts.lock().unwrap();
+    assert_eq!(ciphertexts.len(), 2);
+    assert_ne!(ciphertexts[0], ciphertexts[1]);
+}
+
+#[tokio::test]
+async fn messages_pass_over_ohttp() {
+    let (client, ciphertexts) = ohttp_loopback();
+    let directory = Bip77Directory::new(client, "https://directory.test").unwrap();
+    let mut writer = Writer::new(&directory, [8; 32]);
+    let mut reader = Reader::new(&directory, [8; 32]);
+
+    writer.write(b"through OHTTP").await.unwrap();
+    assert_eq!(reader.read().await.unwrap(), b"through OHTTP");
+    writer.write(b"next message").await.unwrap();
+    assert_eq!(reader.read().await.unwrap(), b"next message");
+
+    // Each message needs one POST and one GET. Resuming reception must not
+    // re-fetch an earlier mailbox.
+    let ciphertexts = ciphertexts.lock().unwrap();
+    assert_eq!(ciphertexts.len(), 4);
+    assert!(ciphertexts.windows(2).all(|pair| pair[0] != pair[1]));
+}
+
+#[tokio::test]
+async fn oversized_message_is_rejected_before_reaching_the_relay() {
+    let (client, ciphertexts) = ohttp_loopback();
+    let error = client
+        .send(DirectoryRequest {
+            method: Method::Post,
+            target: "https://directory.test/mailbox".to_owned(),
+            body: vec![0; ENCAPSULATED_MESSAGE_BYTES],
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(error, OhttpClientError::Bhttp(_)));
+    assert!(ciphertexts.lock().unwrap().is_empty());
+}
+
+struct CorruptRelay {
+    inner: LoopbackRelay,
+    truncate: bool,
+}
+
+impl Relay for CorruptRelay {
+    type Error = Infallible;
+
+    async fn post(&self, body: Vec<u8>) -> Result<Vec<u8>, Self::Error> {
+        let mut response = self.inner.post(body).await?;
+        if self.truncate {
+            response.pop();
+        } else {
+            *response.last_mut().unwrap() ^= 1;
+        }
+        Ok(response)
+    }
+}
+
+#[tokio::test]
+async fn malformed_or_tampered_responses_are_rejected() {
+    for truncate in [false, true] {
+        let (relay, keys, _) = loopback_relay();
+        let client = OhttpClient::new(keys).unwrap();
+        let relay = CorruptRelay {
+            inner: relay,
+            truncate,
+        };
+        let result = client.send(&relay, mailbox_request()).await;
+        if truncate {
+            assert!(matches!(result, Err(OhttpClientError::MessageSize { .. })));
+        } else {
+            assert!(matches!(result, Err(OhttpClientError::Ohttp(_))));
+        }
+    }
+}
+
+#[tokio::test]
+async fn invalid_targets_are_rejected_before_contacting_the_relay() {
+    let (client, ciphertexts) = ohttp_loopback();
+    for target in [
+        "not a URL",
+        "file:///mailbox",
+        "ftp://directory.test/mailbox",
+        "https://user:password@directory.test/mailbox",
+        "https://directory.test/mailbox#fragment",
+    ] {
+        assert!(
+            client
+                .send(DirectoryRequest {
+                    method: Method::Get,
+                    target: target.to_owned(),
+                    body: Vec::new(),
+                })
+                .await
+                .is_err()
+        );
+    }
+    assert!(ciphertexts.lock().unwrap().is_empty());
+}
+
+struct ReplayRelay {
+    inner: LoopbackRelay,
+    response: Mutex<Option<Vec<u8>>>,
+}
+
+impl Relay for ReplayRelay {
+    type Error = Infallible;
+
+    async fn post(&self, body: Vec<u8>) -> Result<Vec<u8>, Self::Error> {
+        if let Some(response) = self.response.lock().unwrap().clone() {
+            return Ok(response);
+        }
+        let response = self.inner.post(body).await?;
+        *self.response.lock().unwrap() = Some(response.clone());
+        Ok(response)
+    }
+}
+
+#[tokio::test]
+async fn response_from_a_previous_request_is_rejected() {
+    let (relay, keys, _) = loopback_relay();
+    let client = OhttpClient::new(keys).unwrap();
+    let relay = ReplayRelay {
+        inner: relay,
+        response: Mutex::new(None),
+    };
+    assert_eq!(
+        client.send(&relay, mailbox_request()).await.unwrap().body,
+        b"mailbox payload"
+    );
+    assert!(matches!(
+        client.send(&relay, mailbox_request()).await,
+        Err(OhttpClientError::Ohttp(_))
+    ));
+}
+
+struct BrokenRelay;
+
+impl Relay for BrokenRelay {
+    type Error = std::io::Error;
+    async fn post(&self, _: Vec<u8>) -> Result<Vec<u8>, Self::Error> {
+        Err(std::io::Error::other("relay unavailable"))
+    }
+}
+
+#[tokio::test]
+async fn relay_failures_reach_mailbox_callers() {
+    let (_, keys, _) = loopback_relay();
+    let client = SingleRelay::new(OhttpClient::new(keys).unwrap(), BrokenRelay);
+    let directory = Bip77Directory::new(client, "https://directory.test").unwrap();
+    assert!(matches!(
+        Writer::new(&directory, [22; 32]).write(&[1]).await,
+        Err(fungi_mailboxes::Error::Directory(DirectoryError::Client(
+            OhttpClientError::Relay(_)
+        )))
+    ));
+    assert!(matches!(
+        Reader::new(&directory, [22; 32]).read().await,
+        Err(fungi_mailboxes::Error::Directory(DirectoryError::Client(
+            OhttpClientError::Relay(_)
+        )))
+    ));
+}
+
+struct ResponseRelay {
+    server: ::ohttp::Server,
+    plaintext: Vec<u8>,
+    requests: Arc<Mutex<Vec<bhttp::Message>>>,
+}
+
+impl Relay for ResponseRelay {
+    type Error = Infallible;
+    async fn post(&self, body: Vec<u8>) -> Result<Vec<u8>, Self::Error> {
+        let (plaintext, context) = self.server.decapsulate(&body).unwrap();
+        self.requests
+            .lock()
+            .unwrap()
+            .push(bhttp::Message::read_bhttp(&mut Cursor::new(plaintext)).unwrap());
+        Ok(context.encapsulate(&self.plaintext).unwrap())
+    }
+}
+
+#[tokio::test]
+async fn encrypted_response_must_contain_valid_bhttp_response_control() {
+    for missing_status in [false, true] {
+        let (relay, keys, _) = loopback_relay();
+        let mut plaintext = vec![0xff; 8144];
+        if missing_status {
+            plaintext.fill(0);
+            bhttp::Message::request(
+                b"GET".to_vec(),
+                b"https".to_vec(),
+                b"directory.test".to_vec(),
+                b"/".to_vec(),
+            )
+            .write_bhttp(bhttp::Mode::KnownLength, &mut plaintext.as_mut_slice())
+            .unwrap();
+        }
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let client = OhttpClient::new(keys).unwrap();
+        let relay = ResponseRelay {
+            server: relay.server,
+            plaintext,
+            requests: requests.clone(),
+        };
+        let error = client
+            .send(
+                &relay,
+                DirectoryRequest {
+                    method: Method::Get,
+                    target: "https://[::1]:8443/mailbox?poll=1".to_owned(),
+                    body: Vec::new(),
+                },
+            )
+            .await
+            .unwrap_err();
+        if missing_status {
+            assert!(matches!(error, OhttpClientError::MissingStatus));
+        } else {
+            assert!(matches!(error, OhttpClientError::Bhttp(_)));
+        }
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests[0].control().authority(),
+            Some(b"[::1]:8443".as_slice())
+        );
+        assert_eq!(
+            requests[0].control().path(),
+            Some(b"/mailbox?poll=1".as_slice())
+        );
+    }
+}
+
+#[test]
+fn invalid_key_configuration_is_rejected() {
+    assert!(OhttpClient::new(Vec::new()).is_err());
 }
