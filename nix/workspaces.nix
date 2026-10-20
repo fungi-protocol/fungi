@@ -9,6 +9,7 @@
       cost-function = { };
       fungi-transport = { };
       fungi-mailboxes = { };
+      fungi-bip77-directory = { };
     };
   };
 }
