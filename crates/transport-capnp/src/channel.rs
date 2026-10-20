@@ -1,7 +1,7 @@
 use std::io;
 use std::sync::Arc;
 
-use fungi_transport::{Channel, RecvChannel, SendChannel, Unspecified};
+use fungi_transport::{Bidirectional, Channel, RecvChannel, SendChannel, Unspecified};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
@@ -9,6 +9,9 @@ use crate::client::{
     Bootstrap, ChannelCommand, Link, PendingReceive, new_link, runtime, start_client,
 };
 use crate::error::{RecvError, SendError};
+
+/// Owned independent RPC directions for one remote capability.
+pub type CapnpBidirectional = Bidirectional<CapnpSendHalf, CapnpRecvHalf>;
 
 /// A remote byte channel that retains received responses across cancellation.
 ///
@@ -44,6 +47,48 @@ impl CapnpChannel {
     }
 }
 
+/// Owned sending direction retaining the RPC link and the native send limit.
+#[derive(Debug)]
+pub struct CapnpSendHalf {
+    commands: mpsc::Sender<ChannelCommand>,
+    send_slot: Arc<Semaphore>,
+    link: Arc<Link>,
+}
+/// Owned receiving direction retaining canceled receive responses and the link.
+#[derive(Debug)]
+pub struct CapnpRecvHalf {
+    commands: mpsc::Sender<ChannelCommand>,
+    pending: PendingReceive,
+    _link: Arc<Link>,
+}
+
+impl CapnpChannel {
+    /// Separate the directions while preserving pending reception and link ownership.
+    ///
+    /// Privacy remains `Unspecified`:
+    ///
+    /// ```compile_fail
+    /// use fungi_transport::{MessageUnlinkability, SendChannel};
+    /// use fungi_transport_capnp::CapnpBidirectional;
+    /// fn anonymous<C: SendChannel<Privacy = MessageUnlinkability>>(_: C) {}
+    /// fn submit(channel: CapnpBidirectional) { anonymous(channel); }
+    /// ```
+    pub fn into_channel(self) -> CapnpBidirectional {
+        Bidirectional::new(
+            CapnpSendHalf {
+                commands: self.commands.clone(),
+                send_slot: self.send_slot,
+                link: Arc::clone(&self.link),
+            },
+            CapnpRecvHalf {
+                commands: self.commands,
+                pending: self.pending,
+                _link: self.link,
+            },
+        )
+    }
+}
+
 impl Channel for CapnpChannel {}
 
 impl SendChannel for CapnpChannel {
@@ -60,6 +105,25 @@ impl SendChannel for CapnpChannel {
     }
 }
 impl RecvChannel for CapnpChannel {
+    type RecvError = RecvError;
+    async fn recv(&mut self) -> Result<Vec<u8>, RecvError> {
+        receive_message(&self.commands, &mut self.pending).await
+    }
+}
+impl SendChannel for CapnpSendHalf {
+    type Privacy = Unspecified;
+    type SendError = SendError;
+    async fn send(&mut self, message: Vec<u8>) -> Result<(), SendError> {
+        send_message(
+            &self.commands,
+            &self.send_slot,
+            self.link.max_message_len,
+            message,
+        )
+        .await
+    }
+}
+impl RecvChannel for CapnpRecvHalf {
     type RecvError = RecvError;
     async fn recv(&mut self) -> Result<Vec<u8>, RecvError> {
         receive_message(&self.commands, &mut self.pending).await
