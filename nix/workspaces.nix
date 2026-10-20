@@ -8,6 +8,7 @@
     packages = {
       cost-function = { };
       fungi-transport = { };
+      fungi-transport-testkit = { };
     };
   };
 }
