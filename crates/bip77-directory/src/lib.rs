@@ -14,8 +14,10 @@ use fungi_mailboxes::{Directory, MailboxSecret};
 use url::Url;
 
 mod ohttp;
+mod transport;
 
 pub use ohttp::{ENCAPSULATED_MESSAGE_BYTES, OhttpClient, OhttpClientError, Relay, SingleRelay};
+pub use transport::{Builder, Receiver, Sender};
 
 /// A BIP77 mailbox identifier encoded as 13 uppercase bech32 characters.
 ///
