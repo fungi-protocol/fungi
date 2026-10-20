@@ -5,11 +5,14 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+fungi-transport = { path = "../transport" }
 sha3 = { version = "0.12", default-features = false }
 thiserror = "2"
+tokio = { version = "1", features = ["io-util"] }
 
 [dev-dependencies]
 proptest = "=1.11.0"
+tokio = { version = "1", features = ["macros", "rt", "test-util", "time"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
