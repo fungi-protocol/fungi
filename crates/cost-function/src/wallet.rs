@@ -5,7 +5,7 @@ use bitcoin::{Amount, OutPoint, Weight};
 use crate::intent::Intent;
 
 /// A coin the wallet can spend.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Utxo {
     pub(crate) outpoint: OutPoint,
     pub(crate) value: Amount,

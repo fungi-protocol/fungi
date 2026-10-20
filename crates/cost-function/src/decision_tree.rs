@@ -1,32 +1,40 @@
-use crate::plan::PlanIntent;
+//! A decision tree for placing satisfying a batches. Each node is a way to place an input or output.
+//! NOTE / TODO: currently this is a naive implemenation that does not navigate the tree at all. Its a single
+//! node / leaf.
 
-/// Where the next unplaced intent could go.
-pub(crate) enum DecisionTree<Id> {
-    Branch(Vec<Node<Id>>),
-    Leaf(PlanIntent<Id>),
+use crate::{change::OutputWithoutScriptpubkey, wallet::Utxo};
+
+/// The coins to spend and the change outputs to create.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Leaf {
+    pub(crate) inputs: Vec<Utxo>,
+    pub(crate) change: Vec<OutputWithoutScriptpubkey>,
 }
 
-/// One way to place one intent.
-pub(crate) struct Node<Id> {
-    pub(crate) subtree: DecisionTree<Id>,
+/// Where the next input or output could go.
+pub(crate) enum DecisionTree {
+    Branch(Vec<Node>),
+    // Note: outputs are not id'd. This will not detect duplicates
+    Leaf(Leaf),
+}
+
+/// One way to place one input or output.
+pub(crate) struct Node {
+    pub(crate) subtree: DecisionTree,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::queue::{InMemoryQueue, Queue};
-    use std::collections::BTreeSet;
 
-    type Id = <InMemoryQueue as Queue>::Id;
-
-    fn nodes_of(tree: &DecisionTree<Id>) -> &[Node<Id>] {
+    fn nodes_of(tree: &DecisionTree) -> &[Node] {
         match tree {
             DecisionTree::Branch(nodes) => nodes,
             DecisionTree::Leaf(_) => &[],
         }
     }
 
-    fn plan_of(tree: &DecisionTree<Id>) -> Option<&PlanIntent<Id>> {
+    fn plan_of(tree: &DecisionTree) -> Option<&Leaf> {
         match tree {
             DecisionTree::Leaf(plan) => Some(plan),
             DecisionTree::Branch(_) => None,
@@ -34,9 +42,10 @@ mod tests {
     }
 
     #[test]
-    fn an_edge_places_one_intent_and_leads_to_the_rest() {
-        let finished = PlanIntent {
-            batches: BTreeSet::new(),
+    fn an_edge_places_one_input_or_output_and_leads_to_the_rest() {
+        let finished = Leaf {
+            inputs: Vec::new(),
+            change: Vec::new(),
         };
 
         let tree = DecisionTree::Branch(vec![Node {
