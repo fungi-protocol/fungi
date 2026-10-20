@@ -1,5 +1,7 @@
 //! Steps the wallet takes to construct a transaction.
 
+use std::time::Instant;
+
 use bitcoin::{TxIn, TxOut};
 
 /// One step in constructing a transaction.
@@ -14,3 +16,7 @@ pub(crate) enum Action {
 /// Actions without a known time of execution
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct UnSequencedActions(pub(crate) Vec<Action>);
+
+/// Actions that have a sequence
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SequencedActions(pub(crate) Vec<(Action, Instant)>);
