@@ -9,6 +9,7 @@ use fungi_transport::{Bidirectional, RecvChannel, SendChannel, Unspecified};
 use fungi_transport_testkit::testkit;
 use tokio::sync::{mpsc, oneshot};
 
+const MAX: usize = 8;
 type Message = (Vec<u8>, oneshot::Sender<()>);
 struct Sender(mpsc::Sender<Message>);
 struct Receiver(mpsc::Receiver<Message>);
@@ -18,6 +19,12 @@ impl SendChannel for Sender {
     type Privacy = Unspecified;
     type SendError = io::Error;
     async fn send(&mut self, message: Vec<u8>) -> Result<(), io::Error> {
+        if message.len() > MAX {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "payload exceeds limit",
+            ));
+        }
         let (acknowledge, received) = oneshot::channel();
         self.0
             .send((message, acknowledge))
@@ -53,7 +60,24 @@ async fn helpers_accept_submission_that_waits_for_peer_reception() {
         testkit::roundtrip_both_directions(left, right).await;
         let (left, right) = pair();
         testkit::closed_after_peer_drop(left, right, |error| error.to_string() == "closed").await;
+        let (left, right) = pair();
+        testkit::too_large_is_recoverable(left, right, MAX, |error| {
+            error.kind() == io::ErrorKind::InvalidInput
+        })
+        .await;
     })
     .await
     .expect("helpers must drive reception while submission waits");
+}
+#[tokio::test(start_paused = true)]
+#[should_panic(expected = "receiver completed before the oversized payload was rejected")]
+async fn limit_check_rejects_an_oversized_payload_that_reaches_the_peer() {
+    let (left, right) = pair();
+    testkit::too_large(left, right, MAX - 1, |_| true).await;
+}
+#[tokio::test(start_paused = true)]
+#[should_panic(expected = "receiver completed before the oversized payload was rejected")]
+async fn recovery_rejects_an_oversized_payload_that_reaches_the_peer() {
+    let (left, right) = pair();
+    testkit::too_large_is_recoverable(left, right, MAX - 1, |_| true).await;
 }
