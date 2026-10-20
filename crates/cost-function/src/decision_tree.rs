@@ -2,13 +2,42 @@
 //! NOTE / TODO: currently this is a naive implemenation that does not navigate the tree at all. Its a single
 //! node / leaf.
 
-use crate::{change::OutputWithoutScriptpubkey, wallet::Utxo};
+use bitcoin::TxOut;
+use rand::{RngCore, seq::SliceRandom};
 
-/// The coins to spend and the change outputs to create.
+use crate::{
+    action::{Action, UnSequencedActions},
+    wallet::Utxo,
+};
+
+/// The coins to spend, the payments to make and the change outputs to create.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Leaf {
     pub(crate) inputs: Vec<Utxo>,
-    pub(crate) change: Vec<OutputWithoutScriptpubkey>,
+    pub(crate) payments: Vec<TxOut>,
+    pub(crate) change: Vec<TxOut>,
+}
+
+impl Leaf {
+    /// Inputs and outputs are each shuffled, so registration order does not reveal which
+    /// coins were picked first or which output is change.
+    pub(crate) fn to_sequence_of_actions(&self, rng: &mut impl RngCore) -> UnSequencedActions {
+        let mut input_actions: Vec<Action> = self
+            .inputs
+            .iter()
+            .map(|input| Action::RegisterInput(input.to_txin()))
+            .collect();
+        input_actions.shuffle(rng);
+        let mut output_actions: Vec<Action> = self
+            .payments
+            .iter()
+            .chain(&self.change)
+            .map(|output| Action::RegisterOutput(output.clone()))
+            .collect();
+        output_actions.shuffle(rng);
+
+        UnSequencedActions(input_actions.into_iter().chain(output_actions).collect())
+    }
 }
 
 /// Where the next input or output could go.
@@ -37,6 +66,11 @@ pub(crate) struct Node {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
+    use bitcoin::{Amount, OutPoint, ScriptBuf, Txid, Weight, hashes::Hash};
+    use rand::{SeedableRng, rngs::StdRng};
+
     use super::*;
 
     fn nodes_of(tree: &DecisionTree) -> &[Node] {
@@ -57,6 +91,7 @@ mod tests {
     fn an_edge_places_one_input_or_output_and_leads_to_the_rest() {
         let finished = Leaf {
             inputs: Vec::new(),
+            payments: Vec::new(),
             change: Vec::new(),
         };
 
@@ -75,14 +110,13 @@ mod tests {
 
     #[test]
     fn iter_leaves_collects_every_leaf_in_tree_order() {
-        let output = |sats| OutputWithoutScriptpubkey {
+        let output = |sats| TxOut {
             value: bitcoin::Amount::from_sat(sats),
-            weight: bitcoin::Weight::ZERO,
-            satisfaction_weight: bitcoin::Weight::ZERO,
-            dust: bitcoin::Amount::ZERO,
+            script_pubkey: ScriptBuf::new(),
         };
         let leaf = |sats| Leaf {
             inputs: Vec::new(),
+            payments: Vec::new(),
             change: vec![output(sats)],
         };
         let node = |subtree| Node { subtree };
@@ -99,5 +133,58 @@ mod tests {
             tree.iter_leaves().collect::<Vec<_>>(),
             vec![&leaf(1), &leaf(2), &leaf(3)]
         );
+    }
+
+    #[test]
+    fn change_is_not_always_the_last_output() {
+        let output = |sats| TxOut {
+            value: bitcoin::Amount::from_sat(sats),
+            script_pubkey: ScriptBuf::new(),
+        };
+        let leaf = Leaf {
+            inputs: Vec::new(),
+            payments: vec![output(1), output(2)],
+            change: vec![output(3)],
+        };
+
+        let change_positions: BTreeSet<_> = (0..16)
+            .map(|seed| {
+                let actions = leaf.to_sequence_of_actions(&mut StdRng::seed_from_u64(seed));
+                actions
+                    .0
+                    .iter()
+                    .position(|action| *action == Action::RegisterOutput(output(3)))
+            })
+            .collect();
+
+        assert!(change_positions.len() > 1);
+    }
+
+    #[test]
+    fn inputs_are_not_always_registered_in_the_same_order() {
+        let coin = |vout| {
+            Utxo::new(
+                OutPoint::new(Txid::all_zeros(), vout),
+                Amount::from_sat(1_000),
+                Weight::ZERO,
+            )
+        };
+        let leaf = Leaf {
+            inputs: vec![coin(0), coin(1), coin(2)],
+            payments: Vec::new(),
+            change: Vec::new(),
+        };
+
+        let first_positions: BTreeSet<_> = (0..16)
+            .map(|seed| {
+                let actions = leaf.to_sequence_of_actions(&mut StdRng::seed_from_u64(seed));
+                actions
+                    .0
+                    .iter()
+                    .position(|action| *action == Action::RegisterInput(coin(0).to_txin()))
+            })
+            .collect();
+
+        assert!(first_positions.len() > 1);
     }
 }

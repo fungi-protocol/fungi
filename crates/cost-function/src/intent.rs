@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use bitcoin::{Amount, ScriptBuf};
+use bitcoin::{Amount, ScriptBuf, TxOut};
 
 /// The required information for an output creation intent.
 ///
@@ -138,6 +138,16 @@ impl Intent {
         Intent {
             inner,
             payoff_curve,
+        }
+    }
+
+    /// The output that pays for this intent.
+    pub(crate) fn payment_output(&self) -> TxOut {
+        match &self.inner {
+            Outcome::OutputCreation(instructions) => TxOut {
+                value: instructions.amount,
+                script_pubkey: instructions.script_pubkey.clone(),
+            },
         }
     }
 }
