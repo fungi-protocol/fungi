@@ -18,6 +18,18 @@ pub(crate) enum DecisionTree {
     Leaf(Leaf),
 }
 
+impl DecisionTree {
+    /// Every leaf in the tree, in tree order.
+    pub(crate) fn iter_leaves(&self) -> Box<dyn Iterator<Item = &Leaf> + '_> {
+        match self {
+            DecisionTree::Branch(nodes) => {
+                Box::new(nodes.iter().flat_map(|node| node.subtree.iter_leaves()))
+            }
+            DecisionTree::Leaf(leaf) => Box::new(std::iter::once(leaf)),
+        }
+    }
+}
+
 /// One way to place one input or output.
 pub(crate) struct Node {
     pub(crate) subtree: DecisionTree,
@@ -59,5 +71,33 @@ mod tests {
         // A branch is not a finished plan, and a leaf has nowhere further to go.
         assert_eq!(plan_of(&tree), None);
         assert!(nodes_of(&DecisionTree::Leaf(finished)).is_empty());
+    }
+
+    #[test]
+    fn iter_leaves_collects_every_leaf_in_tree_order() {
+        let output = |sats| OutputWithoutScriptpubkey {
+            value: bitcoin::Amount::from_sat(sats),
+            weight: bitcoin::Weight::ZERO,
+            satisfaction_weight: bitcoin::Weight::ZERO,
+            dust: bitcoin::Amount::ZERO,
+        };
+        let leaf = |sats| Leaf {
+            inputs: Vec::new(),
+            change: vec![output(sats)],
+        };
+        let node = |subtree| Node { subtree };
+
+        let tree = DecisionTree::Branch(vec![
+            node(DecisionTree::Leaf(leaf(1))),
+            node(DecisionTree::Branch(vec![
+                node(DecisionTree::Leaf(leaf(2))),
+                node(DecisionTree::Leaf(leaf(3))),
+            ])),
+        ]);
+
+        assert_eq!(
+            tree.iter_leaves().collect::<Vec<_>>(),
+            vec![&leaf(1), &leaf(2), &leaf(3)]
+        );
     }
 }
