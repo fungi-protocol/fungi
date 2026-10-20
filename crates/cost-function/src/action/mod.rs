@@ -4,6 +4,8 @@ use std::time::Instant;
 
 use bitcoin::{TxIn, TxOut};
 
+pub(crate) mod poisson;
+
 /// One step in constructing a transaction.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Action {
