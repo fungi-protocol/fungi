@@ -23,6 +23,7 @@ pub struct CapnpChannel {
     pub(super) commands: mpsc::Sender<ChannelCommand>,
     pub(super) send_slot: Arc<Semaphore>,
     pub(super) pending: PendingReceive,
+    pub(super) max_recv_message_len: usize,
     pub(super) link: Arc<Link>,
 }
 
@@ -42,6 +43,7 @@ impl CapnpChannel {
             commands,
             send_slot: Arc::new(Semaphore::new(1)),
             pending: None,
+            max_recv_message_len: usize::MAX,
             link,
         })
     }
@@ -59,10 +61,21 @@ pub struct CapnpSendHalf {
 pub struct CapnpRecvHalf {
     commands: mpsc::Sender<ChannelCommand>,
     pending: PendingReceive,
+    max_recv_message_len: usize,
     _link: Arc<Link>,
 }
 
 impl CapnpChannel {
+    /// Limit payloads from newly started receive requests, in bytes.
+    ///
+    /// Defaults to no additional payload limit. Oversized messages are consumed
+    /// without copying the payload and return [`RecvError::TooLarge`]. Pending
+    /// requests retain their original limit. The RPC reader's frame limit is
+    /// unchanged; this check occurs after the frame has been received.
+    pub fn set_max_recv_message_len(&mut self, max: usize) {
+        self.max_recv_message_len = max;
+    }
+
     /// Separate the directions while preserving pending reception and link ownership.
     ///
     /// Privacy remains `Unspecified`:
@@ -83,6 +96,7 @@ impl CapnpChannel {
             CapnpRecvHalf {
                 commands: self.commands,
                 pending: self.pending,
+                max_recv_message_len: self.max_recv_message_len,
                 _link: self.link,
             },
         )
@@ -107,7 +121,7 @@ impl SendChannel for CapnpChannel {
 impl RecvChannel for CapnpChannel {
     type RecvError = RecvError;
     async fn recv(&mut self) -> Result<Vec<u8>, RecvError> {
-        receive_message(&self.commands, &mut self.pending).await
+        receive_message(&self.commands, &mut self.pending, self.max_recv_message_len).await
     }
 }
 impl SendChannel for CapnpSendHalf {
@@ -126,7 +140,7 @@ impl SendChannel for CapnpSendHalf {
 impl RecvChannel for CapnpRecvHalf {
     type RecvError = RecvError;
     async fn recv(&mut self) -> Result<Vec<u8>, RecvError> {
-        receive_message(&self.commands, &mut self.pending).await
+        receive_message(&self.commands, &mut self.pending, self.max_recv_message_len).await
     }
 }
 pub(super) async fn send_message(
@@ -154,11 +168,12 @@ pub(super) async fn send_message(
 pub(super) async fn receive_message(
     commands: &mpsc::Sender<ChannelCommand>,
     pending: &mut PendingReceive,
+    max: usize,
 ) -> Result<Vec<u8>, RecvError> {
     if pending.is_none() {
         let (reply, result) = oneshot::channel();
         commands
-            .send(ChannelCommand::Recv(reply))
+            .send(ChannelCommand::Recv(reply, max))
             .await
             .map_err(|_| RecvError::Closed)?;
         // Retain the response before yielding so cancellation preserves it.
