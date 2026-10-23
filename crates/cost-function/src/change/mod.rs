@@ -1,6 +1,6 @@
 //! Change strategy.
 
-use bitcoin::{Amount, FeeRate, Weight};
+use bitcoin::{Amount, FeeRate, ScriptBuf, TxOut, Weight};
 pub mod single_output;
 
 use crate::blockspace::KnowsWeight;
@@ -22,6 +22,7 @@ pub(crate) trait ChangeSelector {
 /// Reports what a change output will cost before any scriptpubkey is assigned, so change can
 /// be priced without deriving an address for a transaction that may never be broadcast.
 pub(crate) trait ScriptpubkeyAssigner {
+    type Error;
     /// Weight a change output adds to a transaction.
     fn output_weight(&self) -> Weight;
 
@@ -30,6 +31,25 @@ pub(crate) trait ScriptpubkeyAssigner {
 
     /// Smallest value relay policy accepts for a change output.
     fn dust(&self) -> Amount;
+
+    /// Assign a scriptpubkey to each change output.
+    fn assign_scriptpubkey(
+        &self,
+        outputs: &[OutputWithoutScriptpubkey],
+    ) -> Result<Vec<ScriptBuf>, Self::Error>;
+
+    fn to_txouts(&self, outputs: &[OutputWithoutScriptpubkey]) -> Result<Vec<TxOut>, Self::Error> {
+        let scriptpubkeys = self.assign_scriptpubkey(outputs)?;
+        assert_eq!(outputs.len(), scriptpubkeys.len());
+        Ok(scriptpubkeys
+            .into_iter()
+            .zip(outputs)
+            .map(|(scriptpubkey, output)| TxOut {
+                value: output.value,
+                script_pubkey: scriptpubkey,
+            })
+            .collect())
+    }
 }
 
 /// A change output, with everything but its scriptpubkey.
@@ -89,10 +109,18 @@ impl<S: ChangeSelector, A: ScriptpubkeyAssigner> ChangeStrategy<S, A> {
             })
             .collect())
     }
+
+    /// Gives `outputs` their scriptpubkeys, once the transaction is going ahead.
+    pub(crate) fn assign(
+        &self,
+        outputs: &[OutputWithoutScriptpubkey],
+    ) -> Result<Vec<TxOut>, A::Error> {
+        self.assigner.to_txouts(outputs)
+    }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use bitcoin::{ScriptBuf, TxOut};
     use std::convert::Infallible;
@@ -103,9 +131,11 @@ mod tests {
 
     /// Prices change as if paid to [`op_true`]: 40 WU, so 10 sats to create at 1 sat/vB, a
     /// dust value of 474 sats, and nothing to satisfy.
-    struct DummySPKAssigner;
+    pub(crate) struct DummySPKAssigner;
 
     impl ScriptpubkeyAssigner for DummySPKAssigner {
+        type Error = Infallible;
+
         fn output_weight(&self) -> Weight {
             let output = TxOut {
                 value: Amount::ZERO,
@@ -120,6 +150,13 @@ mod tests {
 
         fn dust(&self) -> Amount {
             op_true().minimal_non_dust()
+        }
+
+        fn assign_scriptpubkey(
+            &self,
+            outputs: &[OutputWithoutScriptpubkey],
+        ) -> Result<Vec<ScriptBuf>, Infallible> {
+            Ok(vec![op_true(); outputs.len()])
         }
     }
 
