@@ -6,6 +6,14 @@ edition.workspace = true
 
 [dependencies]
 bech32 = { version = "0.11", default-features = false, features = ["alloc"] }
+hpke = { version = "0.14.1", default-features = false, features = [
+  "alloc",
+  "chacha",
+  "getrandom",
+  "hkdfsha2",
+  "mlkem",
+  "x25519",
+] }
 ohttp-client = { version = "0.0.2", features = ["secp256k1"] }
 thiserror = "2"
 
