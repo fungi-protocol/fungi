@@ -1,0 +1,17 @@
+[package]
+name = "fungi-transport-tor-socks"
+description = "Message channels through an external tor daemon"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror = "2"
+tor-hscrypto = { version = "0.47", default-features = false }
+
+[dev-dependencies]
+data-encoding = "2"
+proptest = "=1.11.0"
+safelog = "0.10"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
