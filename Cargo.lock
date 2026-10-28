@@ -711,8 +711,10 @@ version = "0.0.0"
 dependencies = [
  "bech32",
  "bhttp",
+ "bitcoin-hpke",
  "bitcoin-ohttp",
  "ohttp-client",
+ "secp256k1",
  "thiserror 2.0.20",
 ]
 

@@ -6,7 +6,9 @@ edition.workspace = true
 
 [dependencies]
 bech32 = { version = "0.11", default-features = false, features = ["alloc"] }
+bitcoin-hpke = "0.13.0"
 ohttp-client = { version = "0.0.2", features = ["secp256k1"] }
+secp256k1 = "0.29"
 thiserror = "2"
 
 [dev-dependencies]
