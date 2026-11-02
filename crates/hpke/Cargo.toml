@@ -1,6 +1,6 @@
 [package]
 name = "fungi-hpke"
-description = "X-Wing HPKE handshake that exports a shared secret"
+description = "X-Wing HPKE handshake that exports one key per direction"
 version.workspace = true
 edition.workspace = true
 
