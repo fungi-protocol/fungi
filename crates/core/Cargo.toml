@@ -4,8 +4,10 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
+cost-function = { path = "../cost-function" }
 
 [dev-dependencies]
+bitcoin = "=0.32.8"
 thiserror = "2"
 
 [lints.rust]
