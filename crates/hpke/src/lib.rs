@@ -1,8 +1,9 @@
-//! One HPKE handshake that gives sender and recipient a shared secret.
+//! One HPKE handshake that gives sender and recipient a key for each
+//! direction.
 //!
 //! The sender encrypts a message in place to the recipient's X-Wing public
 //! key and sends the encapsulated key, the ChaCha20Poly1305 ciphertext and the
-//! tag. The secret is exported from the HPKE context.
+//! tag. The keys are exported from the HPKE context.
 
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
@@ -11,16 +12,17 @@ use hpke::kdf::HkdfSha256;
 use hpke::kem::XWing;
 use hpke::{HpkeError, OpModeR, OpModeS};
 
-/// Size of the exported shared secret.
-pub const SHARED_SECRET_BYTES: usize = 32;
+/// Size of each exported key.
+pub const KEY_BYTES: usize = 32;
 
 /// HPKE info of the handshake. A domain separator, so it must be unique
 /// to this protocol.
 const INFO: &[u8] = b"fungi-hpke-info-v0";
 
-/// HPKE exporter context of the shared secret. A domain separator, so it
-/// must be unique to this use.
-const EXPORTER_CONTEXT: &[u8] = b"fungi-hpke-exporter-context-v0";
+/// HPKE exporter contexts of the keys. Domain separators, so each must be
+/// unique to its direction.
+const SENDER_TO_RECIPIENT: &[u8] = b"fungi-hpke-sender-to-recipient-v0";
+const RECIPIENT_TO_SENDER: &[u8] = b"fungi-hpke-recipient-to-sender-v0";
 
 type Kem = XWing;
 /// X-Wing secret key that opens payloads.
@@ -32,14 +34,22 @@ pub type EncappedKey = <Kem as hpke::Kem>::EncappedKey;
 /// ChaCha20Poly1305 tag of the ciphertext.
 pub type Tag = AeadTag<ChaCha20Poly1305>;
 
-/// Secret exported from the handshake.
-pub struct SharedSecret([u8; SHARED_SECRET_BYTES]);
+/// Key exported from the handshake for one direction.
+pub struct Key([u8; KEY_BYTES]);
 
-impl SharedSecret {
-    /// The secret as bytes.
-    pub fn into_bytes(self) -> [u8; SHARED_SECRET_BYTES] {
+impl Key {
+    /// The key as bytes.
+    pub fn into_bytes(self) -> [u8; KEY_BYTES] {
         self.0
     }
+}
+
+/// One party's keys, one for each direction.
+pub struct Keys {
+    /// Key of the payloads this party sends.
+    pub sending: Key,
+    /// Key of the payloads this party receives.
+    pub receiving: Key,
 }
 
 /// Failure to open a payload: it was modified or truncated, or was not sealed
@@ -49,27 +59,31 @@ impl SharedSecret {
 pub struct Error;
 
 /// Encrypt `message` in place to `public_key` and return the encapsulated key,
-/// the tag and the shared secret. Panics if `message` is 2^38 - 64 bytes or
+/// the tag and the sender's keys. Panics if `message` is 2^38 - 64 bytes or
 /// longer, the ChaCha20Poly1305 limit.
-pub fn seal(public_key: &PublicKey, message: &mut [u8]) -> (EncappedKey, Tag, SharedSecret) {
+pub fn seal(public_key: &PublicKey, message: &mut [u8]) -> (EncappedKey, Tag, Keys) {
     let (encapsulated_key, mut context) =
         hpke::setup_sender::<ChaCha20Poly1305, HkdfSha256, Kem>(&OpModeS::Base, public_key, INFO)
             .expect("setting up to a valid public key cannot fail");
     let tag = context
         .seal_inout_detached(message.into(), &[])
         .expect("a fresh context seals a message shorter than the ChaCha20Poly1305 limit");
-    let secret = export_secret(|exporter_context, secret| context.export(exporter_context, secret));
-    (encapsulated_key, tag, secret)
+    let keys = export_keys(
+        |exporter_context, key| context.export(exporter_context, key),
+        SENDER_TO_RECIPIENT,
+        RECIPIENT_TO_SENDER,
+    );
+    (encapsulated_key, tag, keys)
 }
 
-/// Decrypt `message` in place with `secret_key` and return the shared secret.
-/// On error the contents of `message` are unspecified.
+/// Decrypt `message` in place with `secret_key` and return the recipient's
+/// keys. On error the contents of `message` are unspecified.
 pub fn open(
     secret_key: &SecretKey,
     encapsulated_key: &EncappedKey,
     message: &mut [u8],
     tag: &Tag,
-) -> Result<SharedSecret, Error> {
+) -> Result<Keys, Error> {
     let mut context = hpke::setup_receiver::<ChaCha20Poly1305, HkdfSha256, Kem>(
         &OpModeR::Base,
         secret_key,
@@ -80,16 +94,29 @@ pub fn open(
     context
         .open_inout_detached(message.into(), &[], tag)
         .map_err(|_| Error)?;
-    Ok(export_secret(|exporter_context, secret| {
-        context.export(exporter_context, secret)
-    }))
+    Ok(export_keys(
+        |exporter_context, key| context.export(exporter_context, key),
+        RECIPIENT_TO_SENDER,
+        SENDER_TO_RECIPIENT,
+    ))
 }
 
-/// Export the shared secret with `export`.
-fn export_secret(export: impl Fn(&[u8], &mut [u8]) -> Result<(), HpkeError>) -> SharedSecret {
-    let mut secret = [0; SHARED_SECRET_BYTES];
-    export(EXPORTER_CONTEXT, &mut secret).expect("SHARED_SECRET_BYTES is a valid export length");
-    SharedSecret(secret)
+/// Export the keys with `export`, given the exporter contexts of the
+/// directions this party sends and receives in.
+fn export_keys(
+    export: impl Fn(&[u8], &mut [u8]) -> Result<(), HpkeError>,
+    sending: &[u8],
+    receiving: &[u8],
+) -> Keys {
+    let export_key = |exporter_context| {
+        let mut key = [0; KEY_BYTES];
+        export(exporter_context, &mut key).expect("KEY_BYTES is a valid export length");
+        Key(key)
+    };
+    Keys {
+        sending: export_key(sending),
+        receiving: export_key(receiving),
+    }
 }
 
 #[cfg(test)]
@@ -104,26 +131,41 @@ mod tests {
     }
 
     #[test]
-    fn messages_and_shared_secrets_round_trip() {
+    fn messages_and_keys_round_trip() {
         let (secret, public) = keypair(1);
         for message in [&b""[..], b"message", &[0xff; 10_000]] {
             let mut buffer = message.to_vec();
-            let (encapsulated_key, tag, sender_secret) = seal(&public, &mut buffer);
+            let (encapsulated_key, tag, sender) = seal(&public, &mut buffer);
             if !message.is_empty() {
                 assert_ne!(buffer, message);
             }
-            let receiver_secret = open(&secret, &encapsulated_key, &mut buffer, &tag).unwrap();
+            let recipient = open(&secret, &encapsulated_key, &mut buffer, &tag).unwrap();
             assert_eq!(buffer, message);
-            assert_eq!(sender_secret.into_bytes(), receiver_secret.into_bytes());
+            assert_eq!(
+                sender.sending.into_bytes(),
+                recipient.receiving.into_bytes()
+            );
+            assert_eq!(
+                sender.receiving.into_bytes(),
+                recipient.sending.into_bytes()
+            );
         }
     }
 
     #[test]
-    fn each_handshake_has_its_own_shared_secret() {
+    fn directions_have_different_keys() {
+        let (_, public) = keypair(1);
+        let (_, _, keys) = seal(&public, &mut b"message".to_vec());
+        assert_ne!(keys.sending.into_bytes(), keys.receiving.into_bytes());
+    }
+
+    #[test]
+    fn each_handshake_has_its_own_keys() {
         let (_, public) = keypair(1);
         let (_, _, first) = seal(&public, &mut b"message".to_vec());
         let (_, _, second) = seal(&public, &mut b"message".to_vec());
-        assert_ne!(first.into_bytes(), second.into_bytes());
+        assert_ne!(first.sending.into_bytes(), second.sending.into_bytes());
+        assert_ne!(first.receiving.into_bytes(), second.receiving.into_bytes());
     }
 
     #[test]
