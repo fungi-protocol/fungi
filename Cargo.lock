@@ -1113,6 +1113,7 @@ dependencies = [
  "bech32",
  "bhttp",
  "bitcoin-ohttp",
+ "chacha20poly1305 0.11.0",
  "hpke",
  "ohttp-client",
  "thiserror 2.0.20",
