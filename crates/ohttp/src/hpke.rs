@@ -1,18 +1,18 @@
-//! One fixed-size HPKE payload that gives sender and recipient a shared
-//! secret.
+//! One fixed-size HPKE payload that gives sender and recipient a key for
+//! each direction.
 //!
 //! A payload is [`PAYLOAD_BYTES`], the size of a BIP77 mailbox message: an
 //! X-Wing encapsulated key followed by the ChaCha20Poly1305 ciphertext of the
-//! length-prefixed, zero-padded message. The secret is exported from the HPKE
+//! length-prefixed, zero-padded message. The keys are exported from the HPKE
 //! context.
 
 use std::io::Write as _;
 
-use hpke::aead::{AeadCtxR, AeadCtxS, ChaCha20Poly1305};
+use hpke::aead::ChaCha20Poly1305;
 use hpke::hybrid_array::typenum::Unsigned as _;
 use hpke::kdf::HkdfSha256;
 use hpke::kem::XWing;
-use hpke::{Deserializable, OpModeR, OpModeS, Serializable};
+use hpke::{Deserializable, HpkeError, OpModeR, OpModeS, Serializable};
 
 /// Size of a payload, as in BIP77's
 /// [Uniform Payloads](https://github.com/bitcoin/bips/blob/master/bip-0077.md#uniform-payloads).
@@ -21,8 +21,8 @@ pub const PAYLOAD_BYTES: usize = 7168;
 /// Largest message that fits in one payload.
 pub const MAX_MESSAGE_BYTES: usize = PLAINTEXT_BYTES - LENGTH_PREFIX_BYTES;
 
-/// Size of the exported shared secret.
-pub const SHARED_SECRET_BYTES: usize = 32;
+/// Size of each exported key.
+pub const KEY_BYTES: usize = 32;
 
 const ENCAPSULATED_KEY_BYTES: usize = <EncappedKey as Serializable>::OutputSize::USIZE;
 const TAG_BYTES: usize = 16;
@@ -33,13 +33,22 @@ const PLAINTEXT_BYTES: usize = PAYLOAD_BYTES - ENCAPSULATED_KEY_BYTES - TAG_BYTE
 /// HPKE info of the handshake. The value is arbitrary.
 const INFO: &[u8] = b"fungi-hpke-info-v0";
 
-/// HPKE exporter context of the shared secret. The value is arbitrary.
-const EXPORTER_CONTEXT: &[u8] = b"fungi-hpke-exporter-context-v0";
+/// HPKE exporter contexts of the keys. The values are arbitrary.
+const SENDER_TO_RECIPIENT: &[u8] = b"fungi-hpke-sender-to-recipient-v0";
+const RECIPIENT_TO_SENDER: &[u8] = b"fungi-hpke-recipient-to-sender-v0";
 
 type Kem = XWing;
 type EncappedKey = <Kem as hpke::Kem>::EncappedKey;
 type SecretKey = <Kem as hpke::Kem>::PrivateKey;
 type PublicKey = <Kem as hpke::Kem>::PublicKey;
+
+/// One party's keys, one for each direction.
+pub struct Keys {
+    /// Key of the payloads this party sends.
+    pub sending: [u8; KEY_BYTES],
+    /// Key of the payloads this party receives.
+    pub receiving: [u8; KEY_BYTES],
+}
 
 /// Failure to seal or open a payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -61,12 +70,9 @@ pub enum Error {
     Padding,
 }
 
-/// Encrypt `message` to `public_key` and return the payload and the shared
-/// secret.
-pub fn seal(
-    public_key: &PublicKey,
-    message: &[u8],
-) -> Result<(Vec<u8>, [u8; SHARED_SECRET_BYTES]), Error> {
+/// Encrypt `message` to `public_key` and return the payload and the sender's
+/// keys.
+pub fn seal(public_key: &PublicKey, message: &[u8]) -> Result<(Vec<u8>, Keys), Error> {
     if message.len() > MAX_MESSAGE_BYTES {
         return Err(Error::MessageTooLarge(message.len()));
     }
@@ -87,15 +93,17 @@ pub fn seal(
     let mut payload = encapsulated_key.to_bytes().to_vec();
     payload.extend_from_slice(&ciphertext);
     debug_assert_eq!(payload.len(), PAYLOAD_BYTES);
-    Ok((payload, export_sender(&context)))
+    let keys = export_keys(
+        |exporter_context, key| context.export(exporter_context, key),
+        SENDER_TO_RECIPIENT,
+        RECIPIENT_TO_SENDER,
+    );
+    Ok((payload, keys))
 }
 
-/// Decrypt `payload` with `secret_key` and return the message and the shared
-/// secret.
-pub fn open(
-    secret_key: &SecretKey,
-    payload: &[u8],
-) -> Result<(Vec<u8>, [u8; SHARED_SECRET_BYTES]), Error> {
+/// Decrypt `payload` with `secret_key` and return the message and the
+/// recipient's keys.
+pub fn open(secret_key: &SecretKey, payload: &[u8]) -> Result<(Vec<u8>, Keys), Error> {
     if payload.len() != PAYLOAD_BYTES {
         return Err(Error::PayloadSize(payload.len()));
     }
@@ -124,27 +132,28 @@ pub fn open(
     }
     plaintext.truncate(LENGTH_PREFIX_BYTES + length);
     plaintext.drain(..LENGTH_PREFIX_BYTES);
-    Ok((plaintext, export_receiver(&context)))
+    let keys = export_keys(
+        |exporter_context, key| context.export(exporter_context, key),
+        RECIPIENT_TO_SENDER,
+        SENDER_TO_RECIPIENT,
+    );
+    Ok((plaintext, keys))
 }
 
-fn export_sender(
-    context: &AeadCtxS<ChaCha20Poly1305, HkdfSha256, Kem>,
-) -> [u8; SHARED_SECRET_BYTES] {
-    let mut secret = [0; SHARED_SECRET_BYTES];
-    context
-        .export(EXPORTER_CONTEXT, &mut secret)
-        .expect("SHARED_SECRET_BYTES is a valid export length");
-    secret
-}
-
-fn export_receiver(
-    context: &AeadCtxR<ChaCha20Poly1305, HkdfSha256, Kem>,
-) -> [u8; SHARED_SECRET_BYTES] {
-    let mut secret = [0; SHARED_SECRET_BYTES];
-    context
-        .export(EXPORTER_CONTEXT, &mut secret)
-        .expect("SHARED_SECRET_BYTES is a valid export length");
-    secret
+/// Export the keys with `export`, given the exporter contexts of the
+/// directions this party sends and receives in.
+fn export_keys(
+    export: impl Fn(&[u8], &mut [u8]) -> Result<(), HpkeError>,
+    sending: &[u8],
+    receiving: &[u8],
+) -> Keys {
+    let mut keys = Keys {
+        sending: [0; KEY_BYTES],
+        receiving: [0; KEY_BYTES],
+    };
+    export(sending, &mut keys.sending).expect("KEY_BYTES is a valid export length");
+    export(receiving, &mut keys.receiving).expect("KEY_BYTES is a valid export length");
+    keys
 }
 
 #[cfg(test)]
@@ -159,23 +168,32 @@ mod tests {
     }
 
     #[test]
-    fn messages_and_shared_secrets_round_trip() {
+    fn messages_and_keys_round_trip() {
         let (secret, public) = keypair(1);
         for message in [&b""[..], b"message", &[0xff; MAX_MESSAGE_BYTES]] {
-            let (payload, sender_secret) = seal(&public, message).unwrap();
+            let (payload, sender) = seal(&public, message).unwrap();
             assert_eq!(payload.len(), PAYLOAD_BYTES);
-            let (opened, receiver_secret) = open(&secret, &payload).unwrap();
+            let (opened, recipient) = open(&secret, &payload).unwrap();
             assert_eq!(opened, message);
-            assert_eq!(sender_secret, receiver_secret);
+            assert_eq!(sender.sending, recipient.receiving);
+            assert_eq!(sender.receiving, recipient.sending);
         }
     }
 
     #[test]
-    fn each_handshake_has_its_own_shared_secret() {
+    fn directions_have_different_keys() {
+        let (_, public) = keypair(1);
+        let (_, keys) = seal(&public, b"message").unwrap();
+        assert_ne!(keys.sending, keys.receiving);
+    }
+
+    #[test]
+    fn each_handshake_has_its_own_keys() {
         let (_, public) = keypair(1);
         let (_, first) = seal(&public, b"message").unwrap();
         let (_, second) = seal(&public, b"message").unwrap();
-        assert_ne!(first, second);
+        assert_ne!(first.sending, second.sending);
+        assert_ne!(first.receiving, second.receiving);
     }
 
     #[test]
@@ -188,8 +206,8 @@ mod tests {
     fn oversized_message_is_rejected() {
         let (_, public) = keypair(1);
         assert_eq!(
-            seal(&public, &[0; MAX_MESSAGE_BYTES + 1]),
-            Err(Error::MessageTooLarge(MAX_MESSAGE_BYTES + 1))
+            seal(&public, &[0; MAX_MESSAGE_BYTES + 1]).err(),
+            Some(Error::MessageTooLarge(MAX_MESSAGE_BYTES + 1))
         );
     }
 
@@ -200,7 +218,10 @@ mod tests {
         for size in [PAYLOAD_BYTES - 1, PAYLOAD_BYTES + 1] {
             let mut payload = payload.clone();
             payload.resize(size, 0);
-            assert_eq!(open(&secret, &payload), Err(Error::PayloadSize(size)));
+            assert_eq!(
+                open(&secret, &payload).err(),
+                Some(Error::PayloadSize(size))
+            );
         }
     }
 
@@ -209,7 +230,7 @@ mod tests {
         let (_, public) = keypair(1);
         let (other_secret, _) = keypair(2);
         let (payload, _) = seal(&public, b"message").unwrap();
-        assert_eq!(open(&other_secret, &payload), Err(Error::Decryption));
+        assert_eq!(open(&other_secret, &payload).err(), Some(Error::Decryption));
     }
 
     /// Seal `plaintext` as is, without a length prefix or padding.
@@ -231,8 +252,8 @@ mod tests {
         let mut plaintext = vec![0; PLAINTEXT_BYTES];
         plaintext[..LENGTH_PREFIX_BYTES].copy_from_slice(&u16::MAX.to_be_bytes());
         assert_eq!(
-            open(&secret, &seal_plaintext(&public, &plaintext)),
-            Err(Error::MessageLength)
+            open(&secret, &seal_plaintext(&public, &plaintext)).err(),
+            Some(Error::MessageLength)
         );
     }
 
@@ -242,8 +263,8 @@ mod tests {
         let mut plaintext = vec![0; PLAINTEXT_BYTES];
         plaintext[PLAINTEXT_BYTES - 1] = 1;
         assert_eq!(
-            open(&secret, &seal_plaintext(&public, &plaintext)),
-            Err(Error::Padding)
+            open(&secret, &seal_plaintext(&public, &plaintext)).err(),
+            Some(Error::Padding)
         );
     }
 }
