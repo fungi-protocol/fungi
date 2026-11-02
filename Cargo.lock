@@ -1103,6 +1103,8 @@ dependencies = [
 name = "fungi-core"
 version = "0.0.0"
 dependencies = [
+ "bitcoin",
+ "cost-function",
  "thiserror 2.0.20",
 ]
 

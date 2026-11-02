@@ -21,7 +21,7 @@ pub(crate) trait ChangeSelector {
 ///
 /// Reports what a change output will cost before any scriptpubkey is assigned, so change can
 /// be priced without deriving an address for a transaction that may never be broadcast.
-pub(crate) trait ScriptpubkeyAssigner {
+pub trait ScriptpubkeyAssigner {
     /// Weight a change output adds to a transaction.
     fn output_weight(&self) -> Weight;
 
