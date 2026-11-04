@@ -10,7 +10,7 @@ use crate::decision_space::DecisionSpace;
 use crate::decision_tree::{DecisionTree, Leaf};
 use crate::intent::Intent;
 use crate::queue::Queue;
-use crate::selection::{CoinSelector, FundingRequest};
+use crate::selection::{CoinSelector, FundingRequest, cover_count_growth};
 
 /// A coin the wallet can spend.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,6 +65,10 @@ impl<Q: Queue, U: UtxoSnapshot> WalletStateSnapshot<Q, U> {
 
     /// The actions that realize the queue: funded by `selector`, with change from
     /// `change_strategy`. `None` if the queue is empty.
+    ///
+    /// # Panics
+    ///
+    /// If [`cover_count_growth`] overflows for `feerate`.
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "no driver loop asks for a plan yet")
@@ -82,6 +86,10 @@ impl<Q: Queue, U: UtxoSnapshot> WalletStateSnapshot<Q, U> {
         A: ScriptpubkeyAssigner,
         R: RngCore,
     {
+        // The selector and change strategy share one feerate, so change outputs that grow the
+        // output count are covered too.
+        let feerate = cover_count_growth(feerate).expect("feerate overflows");
+
         // MVP: the decision space yields only the trivial partition: with one batch with all intents
         let Some(plan_intent) = DecisionSpace::new(&self.queue).iter().next() else {
             return Ok(None);
@@ -215,8 +223,9 @@ mod tests {
 
     #[test]
     fn the_best_plan_spends_the_coin_pays_every_intent_and_returns_change() {
-        // At 1 sat/vB the coin's input costs 40 sats, each payment 10 sats, the transaction
-        // overhead 11 sats and the change output 10 sats: 10,000 - 40 - 2,000 - 20 - 11 - 10.
+        // At 1 sat/vB, raised to 251 sat/kwu by `cover_count_growth`, the coin's input costs
+        // 41 sats, each payment 11 sats, the transaction overhead 11 sats and the change output
+        // 11 sats: 10,000 - 41 - 2,000 - 22 - 11 - 11.
         // The two payments are identical, and both are registered.
         assert_eq!(
             best_plan([utxo(0, 10_000)], &[1_000, 1_000]),
@@ -224,7 +233,7 @@ mod tests {
                 Action::RegisterInput(utxo(0, 10_000).to_txin()),
                 Action::RegisterOutput(op_true_output(1_000)),
                 Action::RegisterOutput(op_true_output(1_000)),
-                Action::RegisterOutput(op_true_output(7_919)),
+                Action::RegisterOutput(op_true_output(7_915)),
             ])))
         );
     }
