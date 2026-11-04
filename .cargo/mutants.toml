@@ -1,0 +1,2 @@
+# Backend suites may live in other workspace crates.
+test_workspace = true

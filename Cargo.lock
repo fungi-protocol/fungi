@@ -1125,6 +1125,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fungi-transport-testkit"
+version = "0.0.0"
+dependencies = [
+ "fungi-transport",
+ "futures-util",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "fungi-transport-tor-socks"
 version = "0.0.0"
 dependencies = [
