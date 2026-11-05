@@ -73,6 +73,13 @@ impl<S> Channel<S> {
     /// Carry messages whose payload is at most `max_message_len` bytes on
     /// `stream`. That much is allocated once a message is split across reads.
     pub fn new(stream: S, max_message_len: u32) -> Self {
+        Self::tagged(stream, max_message_len)
+    }
+}
+
+impl<S, P> Channel<S, P> {
+    /// Like [`Channel::new`], for a stream whose privacy the caller vouches for.
+    pub(crate) fn tagged(stream: S, max_message_len: u32) -> Self {
         Self {
             stream,
             max_message_len,
