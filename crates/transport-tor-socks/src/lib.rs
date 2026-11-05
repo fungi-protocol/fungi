@@ -3,12 +3,16 @@
 //! Message channels through an external tor daemon.
 
 mod connector;
+mod control;
 pub mod framed;
+mod listener;
 pub mod onion;
 pub mod record;
 mod socks5;
 
 pub use connector::{ConnectError, Connector};
+pub use control::ControlAuth;
+pub use listener::{AcceptError, ListenError, Listener};
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
