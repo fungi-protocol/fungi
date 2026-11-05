@@ -1,11 +1,10 @@
-//! Messages over a byte stream.
+//! Messages over a byte stream. Each message is one [`tlv`] record.
 //!
-//! Each message travels as one [`record`]: its type, its length, and its
-//! payload. The type tells the receiver what the message is. The channel
-//! yields every type; whoever dispatches them ignores an unknown odd type
-//! and fails on an unknown even one.
+//! The channel returns messages of any type. The caller applies BOLT #1's
+//! rule for unknown types: ignore odd ones, fail on even ones.
 
 use std::collections::VecDeque;
+use std::convert::Infallible;
 use std::fmt;
 use std::io;
 use std::mem;
@@ -14,47 +13,55 @@ use std::num::NonZeroUsize;
 use fungi_transport::RecvChannel;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use crate::record::{self, Item};
+use crate::reassembly::{Item, LendingIterator, State};
+use crate::tlv::{self, TypedSlice};
 
-/// How many bytes one read takes from the stream at most.
+/// The maximum number of bytes requested in one read.
 const READ_LEN: usize = 4096;
 
-/// A message: its type and its payload.
-pub type Message = (u64, Vec<u8>);
+/// A message's type and payload.
+pub type Message = TypedSlice<Vec<u8>>;
 
-/// A message channel over a byte stream.
-pub struct Channel<S> {
+/// Receives messages from a byte stream.
+///
+/// A message payload is at most `N` bytes long. The decoding function receives
+/// borrowed records and produces owned messages before they enter the queue.
+pub struct Channel<S, const N: usize, T = Message, E = Infallible> {
+    decode: fn(TypedSlice<&[u8]>) -> Result<T, E>,
     stream: S,
-    max_message_len: u32,
-    records: record::Buffer,
+    /// The parse state between reads.
+    state: State<N>,
     read: Box<[u8]>,
-    /// What earlier reads brought and was not yet received: at most one read.
-    received: VecDeque<Result<Message, record::Error>>,
+    /// Parsed from the last read, not yet returned by `recv`. Empty before
+    /// each read.
+    received: VecDeque<Result<T, RecvError<E>>>,
+    /// Set once `recv` fails.
     failed: bool,
 }
 
-/// Failure to receive a message. The channel yields no further messages.
+/// Why `recv` failed. Every later `recv` fails with [`RecvError::Closed`].
 #[derive(Debug, thiserror::Error)]
-pub enum RecvError {
-    /// The stream ended between messages, or an earlier receive failed.
+pub enum RecvError<E = Infallible> {
+    /// A complete record could not be decoded as a message.
+    #[error(transparent)]
+    Decode(E),
+    /// The stream ended between messages, or an earlier `recv` failed.
     #[error("channel closed")]
     Closed,
-    /// The peer sent a malformed record, or the stream ended inside one.
+    /// The peer sent an invalid record, or the stream ended inside one.
     #[error(transparent)]
-    Record(#[from] record::Error),
-    /// The stream failed.
+    Record(#[from] tlv::Error),
+    /// Reading from the stream failed.
     #[error(transparent)]
     Io(#[from] io::Error),
 }
 
-impl<S> Channel<S> {
-    /// Carry messages whose payload is at most `max_message_len` bytes on
-    /// `stream`. That much is allocated once a message is split across reads.
-    pub fn new(stream: S, max_message_len: u32) -> Self {
+impl<S, const N: usize, T, E> Channel<S, N, T, E> {
+    pub fn new(stream: S, decode: fn(TypedSlice<&[u8]>) -> Result<T, E>) -> Self {
         Self {
+            decode,
             stream,
-            max_message_len,
-            records: record::Buffer::new(max_message_len),
+            state: State::default(),
             read: vec![0; READ_LEN].into_boxed_slice(),
             received: VecDeque::new(),
             failed: false,
@@ -62,40 +69,46 @@ impl<S> Channel<S> {
     }
 }
 
-/// Leaves out message bytes, so a channel can be logged. The stream is left
-/// out too, as its own `Debug` may show the bytes it buffers.
-impl<S> fmt::Debug for Channel<S> {
+/// Shows no message bytes, so a channel can be logged.
+///
+/// Leaves out the stream, because its own `Debug` may show buffered bytes.
+impl<S, const N: usize, T, E> fmt::Debug for Channel<S, N, T, E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Channel")
-            .field("max_message_len", &self.max_message_len)
+            .field("max_message_len", &N)
             .field("failed", &self.failed)
             .finish_non_exhaustive()
     }
 }
 
-impl<S: AsyncRead + Send + Unpin> RecvChannel<Message> for Channel<S> {
-    type RecvError = RecvError;
+impl<S, const N: usize, T, E> RecvChannel<T> for Channel<S, N, T, E>
+where
+    S: AsyncRead + Send + Unpin,
+    T: Send,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    type RecvError = RecvError<E>;
 
-    async fn recv(&mut self) -> Result<Message, RecvError> {
+    async fn recv(&mut self) -> Result<T, RecvError<E>> {
         if self.failed {
             return Err(RecvError::Closed);
         }
 
-        let message = self.next_message().await;
+        let message = self.read_message().await;
         self.failed = message.is_err();
 
         message
     }
 }
 
-impl<S: AsyncRead + Unpin> Channel<S> {
-    /// Reading from the stream is the only await, and what a read brings is
-    /// parsed before the next, so a receive dropped by `select!` loses
-    /// nothing.
-    async fn next_message(&mut self) -> Result<Message, RecvError> {
+impl<S: AsyncRead + Unpin, const N: usize, T, E> Channel<S, N, T, E> {
+    /// Cancel safe. The read is the only await, and its bytes are parsed
+    /// before the next read. So dropping the future, as `select!` does, loses
+    /// no bytes.
+    async fn read_message(&mut self) -> Result<T, RecvError<E>> {
         loop {
             if let Some(message) = self.received.pop_front() {
-                return Ok(message?);
+                return message;
             }
 
             let read = match self.stream.read(&mut self.read).await {
@@ -103,27 +116,33 @@ impl<S: AsyncRead + Unpin> Channel<S> {
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(error.into()),
             };
-            // Reading no bytes is how a stream reports its end.
+            // A read of zero bytes means the stream ended.
             if NonZeroUsize::new(read).is_none() {
-                self.records.end()?;
+                self.state.end()?;
                 return Err(RecvError::Closed);
             }
             self.parse(read);
         }
     }
 
-    /// Queue what the first `len` bytes of `read` complete.
+    /// Parses the first `len` bytes of `read` into `received`.
     fn parse(&mut self, len: usize) {
-        // Handed back at the end of the input.
-        let buffer = mem::replace(&mut self.records, record::Buffer::new(0));
-        let mut parsed = buffer.parse(&self.read[..len]);
-        while let Some(item) = parsed.next() {
+        let mut records = mem::take(&mut self.state).resume(&self.read[..len]);
+        while let Some(item) = records.next() {
             match item {
-                Ok(Item::Record(ty, payload)) => {
-                    self.received.push_back(Ok((ty, payload.to_vec())))
+                Ok(Item::Record(record)) => {
+                    let message = (self.decode)(record).map_err(RecvError::Decode);
+                    let failed = message.is_err();
+                    self.received.push_back(message);
+                    if failed {
+                        break;
+                    }
                 }
-                Ok(Item::Suspend(buffer)) => self.records = buffer,
-                Err(error) => self.received.push_back(Err(error)),
+                Ok(Item::Incomplete(state)) => self.state = state,
+                Err(error) => {
+                    self.received.push_back(Err(RecvError::Record(error)));
+                    break;
+                }
             }
         }
     }
@@ -142,121 +161,161 @@ mod tests {
     use tokio::io::{AsyncRead, AsyncWriteExt, DuplexStream, ReadBuf};
 
     use super::{Channel, Message, READ_LEN, RecvError};
-    use crate::record;
+    use crate::tlv::{self, TypedSlice};
 
-    const MAX: u32 = 16;
+    const MAX: usize = 32;
 
-    fn frame(ty: u64, payload: &[u8]) -> Vec<u8> {
-        record::encode([(ty, payload)])
+    fn encode_frame(ty: u64, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        TypedSlice { ty, value: payload }.encode(&mut out).unwrap();
+        out
     }
 
-    fn message(ty: u64, payload: &[u8]) -> Message {
-        (ty, payload.to_vec())
+    fn make_message(ty: u64, payload: &[u8]) -> Message {
+        TypedSlice {
+            ty,
+            value: payload.to_vec(),
+        }
     }
 
-    /// A channel reading what the test writes to the returned stream.
-    fn reading(max_message_len: u32) -> (DuplexStream, Channel<DuplexStream>) {
+    /// A channel, and the stream end the test writes to.
+    fn open() -> (DuplexStream, Channel<DuplexStream, MAX>) {
         let (peer, stream) = tokio::io::duplex(64);
-        (peer, Channel::new(stream, max_message_len))
+        (
+            peer,
+            Channel::new(stream, |record| {
+                Ok(TypedSlice {
+                    ty: record.ty,
+                    value: record.value.to_vec(),
+                })
+            }),
+        )
     }
 
     /// A channel reading `bytes` followed by the end of the stream.
-    async fn reading_all(bytes: &[u8]) -> Channel<DuplexStream> {
+    async fn open_with(bytes: &[u8]) -> Channel<DuplexStream, MAX> {
         let (mut peer, stream) = tokio::io::duplex(bytes.len().max(1));
         peer.write_all(bytes).await.unwrap();
-        Channel::new(stream, MAX)
+        Channel::new(stream, |record| {
+            Ok(TypedSlice {
+                ty: record.ty,
+                value: record.value.to_vec(),
+            })
+        })
     }
 
     #[tokio::test]
     async fn receives_messages_in_stream_order() {
-        let bytes = [frame(2, b"first"), frame(1, b""), frame(253, b"second")].concat();
-        let mut channel = reading_all(&bytes).await;
+        let bytes = [
+            encode_frame(2, b"first"),
+            encode_frame(1, b""),
+            encode_frame(253, b"second"),
+        ]
+        .concat();
+        let mut channel = open_with(&bytes).await;
 
-        assert_eq!(channel.recv().await.unwrap(), message(2, b"first"));
-        assert_eq!(channel.recv().await.unwrap(), message(1, b""));
-        assert_eq!(channel.recv().await.unwrap(), message(253, b"second"));
+        assert_eq!(channel.recv().await.unwrap(), make_message(2, b"first"));
+        assert_eq!(channel.recv().await.unwrap(), make_message(1, b""));
+        assert_eq!(channel.recv().await.unwrap(), make_message(253, b"second"));
     }
 
     #[tokio::test]
     async fn refuses_a_non_minimal_length() {
-        let mut channel = reading_all(&[0x02, 0xfd, 0x00, 0x01, b'x']).await;
+        let mut channel = open_with(&[0x02, 0xfd, 0x00, 0x01, b'x']).await;
 
         assert!(matches!(
             channel.recv().await,
-            Err(RecvError::Record(record::Error::NonMinimal))
+            Err(RecvError::Record(tlv::Error::NonMinimal))
         ));
     }
 
     #[tokio::test]
     async fn stream_end_between_messages_closes() {
-        let mut channel = reading_all(&frame(2, b"last")).await;
+        let mut channel = open_with(&encode_frame(2, b"last")).await;
 
-        assert_eq!(channel.recv().await.unwrap(), message(2, b"last"));
+        assert_eq!(channel.recv().await.unwrap(), make_message(2, b"last"));
         assert!(matches!(channel.recv().await, Err(RecvError::Closed)));
     }
 
     #[tokio::test]
     async fn stream_end_inside_a_message_truncates() {
-        let mut channel = reading_all(&frame(2, b"cut")[..4]).await;
+        let mut channel = open_with(&encode_frame(2, b"cut")[..4]).await;
 
         assert!(matches!(
             channel.recv().await,
-            Err(RecvError::Record(record::Error::Truncated))
+            Err(RecvError::Record(tlv::Error::Truncated))
         ));
     }
 
-    /// The announced length is refused before any of the payload is read, so a
-    /// peer cannot make the receiver allocate what it announces. The stream
-    /// stays open, so a receive that waited for the payload would time out.
+    /// A length above the limit fails as soon as the header is read, so a peer
+    /// cannot make the receiver wait for, or hold, a payload that long. The
+    /// stream stays open, so a `recv` waiting for the payload would time out.
     #[tokio::test(start_paused = true)]
     async fn refuses_a_length_above_the_limit() {
-        let (mut peer, mut channel) = reading(MAX);
-        peer.write_all(&[0x02, 17]).await.unwrap();
+        let (mut peer, mut channel) = open();
+        peer.write_all(&[0x02, MAX as u8 + 1]).await.unwrap();
 
         let received = tokio::time::timeout(Duration::from_secs(1), channel.recv()).await;
 
         assert!(matches!(
             received,
-            Ok(Err(RecvError::Record(record::Error::TooLarge {
-                len: 17,
+            Ok(Err(RecvError::Record(tlv::Error::TooLarge {
+                len: 33,
                 max: MAX
             })))
         ));
     }
 
-    /// After a failure the position in the stream is unknown, so bytes that
-    /// follow must not be read as a message.
+    /// After an error the position in the stream is unknown, so the bytes that
+    /// follow must not be parsed as a message.
     #[tokio::test]
     async fn yields_nothing_after_a_failure() {
-        let bytes = [&[0x02, 17][..], &frame(2, b"next")].concat();
-        let mut channel = reading_all(&bytes).await;
+        let bytes = [&[0x02, MAX as u8 + 1][..], &encode_frame(2, b"next")].concat();
+        let mut channel = open_with(&bytes).await;
 
         assert!(matches!(channel.recv().await, Err(RecvError::Record(_))));
         assert!(matches!(channel.recv().await, Err(RecvError::Closed)));
     }
 
-    /// One read can bring more than a message; the rest waits for the next
-    /// receive, even past the bytes one read takes.
+    /// A header cut off at the end of one read is checked once the next read
+    /// completes it.
+    #[tokio::test(start_paused = true)]
+    async fn refuses_a_non_minimal_length_split_across_reads() {
+        let (mut peer, mut channel) = open();
+        peer.write_all(&[0x02, 0xfd]).await.unwrap();
+        let waiting = tokio::time::timeout(Duration::from_millis(1), channel.recv());
+        assert!(waiting.await.is_err());
+
+        peer.write_all(&[0x00, 0x01, b'x']).await.unwrap();
+
+        assert!(matches!(
+            channel.recv().await,
+            Err(RecvError::Record(tlv::Error::NonMinimal))
+        ));
+    }
+
+    /// One read can hold several messages. Each later `recv` returns the next
+    /// one, and messages past the first `READ_LEN` bytes arrive too.
     #[tokio::test]
     async fn keeps_the_rest_of_a_read_for_later_messages() {
-        let payload = [7; MAX as usize];
+        let payload = [7; MAX - 2];
         let count = READ_LEN / payload.len() + 2;
-        let bytes = frame(2, &payload).repeat(count);
-        let mut channel = reading_all(&bytes).await;
+        let bytes = encode_frame(2, &payload).repeat(count);
+        let mut channel = open_with(&bytes).await;
 
         for _ in 0..count {
-            assert_eq!(channel.recv().await.unwrap(), message(2, &payload));
+            assert_eq!(channel.recv().await.unwrap(), make_message(2, &payload));
         }
         assert!(matches!(channel.recv().await, Err(RecvError::Closed)));
     }
 
-    /// A receive dropped while waiting, as in a `select!` arm, keeps the bytes it
-    /// already took from the stream.
+    /// Dropping a `recv` that is waiting, as `select!` does, keeps the bytes it
+    /// already read.
     #[tokio::test(start_paused = true)]
     async fn canceled_receive_resumes_inside_the_message() {
-        let (mut peer, mut channel) = reading(MAX);
+        let (mut peer, mut channel) = open();
 
-        for byte in frame(2, b"whole") {
+        for byte in encode_frame(2, b"whole") {
             let waiting = tokio::time::timeout(Duration::from_millis(1), channel.recv());
             assert!(waiting.await.is_err());
 
@@ -264,15 +323,16 @@ mod tests {
         }
         drop(peer);
 
-        assert_eq!(channel.recv().await.unwrap(), message(2, b"whole"));
+        assert_eq!(channel.recv().await.unwrap(), make_message(2, b"whole"));
         assert!(matches!(channel.recv().await, Err(RecvError::Closed)));
     }
 
-    /// Neither the bytes the channel holds nor those still in the stream show.
+    /// The output shows neither the bytes the channel holds nor those still in
+    /// the stream.
     #[tokio::test(start_paused = true)]
     async fn debug_output_omits_message_bytes() {
-        let (mut peer, mut channel) = reading(MAX);
-        let secret = frame(2, b"secret");
+        let (mut peer, mut channel) = open();
+        let secret = encode_frame(2, b"secret");
         peer.write_all(&secret[..5]).await.unwrap();
 
         let waiting = tokio::time::timeout(Duration::from_millis(1), channel.recv());
@@ -281,12 +341,13 @@ mod tests {
 
         assert_eq!(
             format!("{channel:?}"),
-            "Channel { max_message_len: 16, failed: false, .. }"
+            "Channel { max_message_len: 32, failed: false, .. }"
         );
     }
 
-    /// Fails the first read, then yields its bytes and ends. Ending keeps a
-    /// channel that wrongly retries the failure from waiting forever.
+    /// A stream whose first read fails. The second read returns `bytes`, and
+    /// the third reports the end, so a channel that wrongly retries after the
+    /// failure ends instead of waiting forever.
     struct FailsOnce {
         error: Option<io::ErrorKind>,
         bytes: &'static [u8],
@@ -306,17 +367,22 @@ mod tests {
         }
     }
 
-    fn failing_once(kind: io::ErrorKind, bytes: &'static [u8]) -> Channel<FailsOnce> {
+    fn open_failing_once(kind: io::ErrorKind, bytes: &'static [u8]) -> Channel<FailsOnce, MAX> {
         let stream = FailsOnce {
             error: Some(kind),
             bytes,
         };
-        Channel::new(stream, MAX)
+        Channel::new(stream, |record| {
+            Ok(TypedSlice {
+                ty: record.ty,
+                value: record.value.to_vec(),
+            })
+        })
     }
 
     #[tokio::test]
     async fn reports_a_stream_failure() {
-        let mut channel = failing_once(io::ErrorKind::ConnectionReset, &[]);
+        let mut channel = open_failing_once(io::ErrorKind::ConnectionReset, &[]);
 
         let Err(RecvError::Io(error)) = channel.recv().await else {
             panic!("expected the stream failure");
@@ -325,12 +391,131 @@ mod tests {
         assert!(matches!(channel.recv().await, Err(RecvError::Closed)));
     }
 
-    /// An interrupted read asks to be retried, so it must not end the channel.
+    /// `Interrupted` means the read should be retried, so it does not fail the
+    /// channel.
     #[tokio::test]
     async fn retries_an_interrupted_read() {
-        let mut channel = failing_once(io::ErrorKind::Interrupted, &[2, 1, b'x']);
+        let mut channel = open_failing_once(io::ErrorKind::Interrupted, &[2, 1, b'x']);
 
-        assert_eq!(channel.recv().await.unwrap(), message(2, b"x"));
+        assert_eq!(channel.recv().await.unwrap(), make_message(2, b"x"));
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Dummy {
+        Ping,
+        Note { number: u64, text: String },
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    enum DecodeError {
+        #[error(transparent)]
+        Tlv(#[from] tlv::Error),
+        #[error(transparent)]
+        Utf8(#[from] std::str::Utf8Error),
+        #[error("invalid dummy message")]
+        Invalid,
+    }
+
+    // The dummy format has two levels of nested TLVs. Unknown odd fields
+    // are ignored; only the final text field is copied into the owned enum.
+    fn decode_dummy(record: TypedSlice<&[u8]>) -> Result<Dummy, DecodeError> {
+        match record.ty {
+            0 if record.value.is_empty() => Ok(Dummy::Ping),
+            2 => {
+                let mut number = None;
+                let mut text = None;
+                for field in tlv::decode(record.value) {
+                    let field = field?;
+                    assert_subslice(record.value, field.value);
+                    match field.ty {
+                        0 if number.is_none() => {
+                            number = Some(u64::from_be_bytes(
+                                field.value.try_into().map_err(|_| DecodeError::Invalid)?,
+                            ));
+                        }
+                        2 => {
+                            for nested in tlv::decode(field.value) {
+                                let nested = nested?;
+                                assert_subslice(field.value, nested.value);
+                                match nested.ty {
+                                    0 if text.is_none() => {
+                                        text = Some(std::str::from_utf8(nested.value)?);
+                                    }
+                                    ty if ty % 2 == 1 => {}
+                                    _ => return Err(DecodeError::Invalid),
+                                }
+                            }
+                        }
+                        ty if ty % 2 == 1 => {}
+                        _ => return Err(DecodeError::Invalid),
+                    }
+                }
+                let number = number.ok_or(DecodeError::Invalid)?;
+                let text = text.ok_or(DecodeError::Invalid)?;
+                Ok(Dummy::Note {
+                    number,
+                    text: text.to_owned(),
+                })
+            }
+            _ => Err(DecodeError::Invalid),
+        }
+    }
+
+    fn assert_subslice(parent: &[u8], child: &[u8]) {
+        let start = parent.as_ptr() as usize;
+        let child_start = child.as_ptr() as usize;
+        assert!(child_start >= start);
+        assert!(child_start + child.len() <= start + parent.len());
+    }
+
+    fn dummy_note() -> Vec<u8> {
+        let metadata = [encode_frame(0, b"hello"), encode_frame(1, b"ignored")].concat();
+        let fields = [
+            encode_frame(0, &42u64.to_be_bytes()),
+            encode_frame(2, &metadata),
+        ]
+        .concat();
+        encode_frame(2, &fields)
+    }
+
+    #[tokio::test]
+    async fn decodes_nested_slices_before_queueing_owned_messages() {
+        let bytes = [encode_frame(0, b""), dummy_note()].concat();
+        for chunk_len in [bytes.len(), 1] {
+            let mut channel = Channel::<_, 64, Dummy, DecodeError>::new(&[][..], decode_dummy);
+            for chunk in bytes.chunks(chunk_len) {
+                channel.read[..chunk.len()].copy_from_slice(chunk);
+                channel.parse(chunk.len());
+            }
+            // The queue already contains enums. Reusing the read buffer cannot
+            // change them, and no encoded message payload is retained in it.
+            channel.read.fill(0);
+            assert_eq!(channel.received.len(), 2);
+            assert_eq!(channel.recv().await.unwrap(), Dummy::Ping);
+            assert_eq!(
+                channel.recv().await.unwrap(),
+                Dummy::Note {
+                    number: 42,
+                    text: "hello".into()
+                }
+            );
+            assert!(matches!(channel.recv().await, Err(RecvError::Closed)));
+        }
+    }
+
+    #[tokio::test]
+    async fn decoding_failure_follows_queued_messages_and_is_terminal() {
+        // A nested TLV announces two bytes but contains only one.
+        let malformed = encode_frame(2, &encode_frame(2, &[0, 2, b'x']));
+        let bytes = [encode_frame(0, b""), malformed, dummy_note()].concat();
+        let mut channel = Channel::<_, 64, Dummy, DecodeError>::new(&bytes[..], decode_dummy);
+        assert_eq!(channel.recv().await.unwrap(), Dummy::Ping);
+        assert_eq!(channel.received.len(), 1);
+        assert!(matches!(
+            channel.recv().await,
+            Err(RecvError::Decode(DecodeError::Tlv(tlv::Error::Truncated)))
+        ));
+        assert!(matches!(channel.recv().await, Err(RecvError::Closed)));
     }
 
     fn block_on<F: Future>(future: F) -> F::Output {
@@ -340,17 +525,22 @@ mod tests {
             .block_on(future)
     }
 
-    fn within_limit() -> impl Strategy<Value = Vec<Message>> {
-        let payload = prop::collection::vec(any::<u8>(), 0..=MAX as usize);
-        prop::collection::vec((any::<u64>(), payload), 0..8)
+    fn generate_within_limit() -> impl Strategy<Value = Vec<Message>> {
+        let payload = prop::collection::vec(any::<u8>(), 0..=MAX);
+        prop::collection::vec(
+            (any::<u64>(), payload).prop_map(|(ty, value)| TypedSlice { ty, value }),
+            0..8,
+        )
     }
 
     proptest! {
         #[test]
-        fn receives_any_messages_within_the_limit(messages in within_limit()) {
+        fn receives_any_messages_within_the_limit(messages in generate_within_limit()) {
             block_on(async {
-                let bytes = record::encode(messages.iter().map(|(ty, payload)| (*ty, &payload[..])));
-                let (mut peer, mut channel) = reading(MAX);
+                let mut bytes = Vec::new();
+                let records = messages.iter().map(|message| TypedSlice { ty: message.ty, value: &message.value });
+                tlv::encode(records, &mut bytes).unwrap();
+                let (mut peer, mut channel) = open();
                 let writing = async move { peer.write_all(&bytes).await.unwrap() };
                 let receiving = async {
                     for message in &messages {
@@ -366,14 +556,14 @@ mod tests {
         #[test]
         fn arbitrary_bytes_end_in_a_failure(bytes in prop::collection::vec(any::<u8>(), 0..64)) {
             block_on(async {
-                let mut channel = reading_all(&bytes).await;
+                let mut channel = open_with(&bytes).await;
 
                 // Every record takes at least a type and a length from the stream.
                 for _ in 0..=bytes.len() / 2 {
-                    let Ok((_, payload)) = channel.recv().await else {
+                    let Ok(TypedSlice { value: payload, .. }) = channel.recv().await else {
                         break;
                     };
-                    assert!(payload.len() <= MAX as usize);
+                    assert!(payload.len() <= MAX);
                 }
                 assert!(matches!(channel.recv().await, Err(RecvError::Closed)));
             });

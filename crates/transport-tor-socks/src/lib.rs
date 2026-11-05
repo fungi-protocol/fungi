@@ -4,4 +4,5 @@
 
 pub mod framed;
 pub mod onion;
-pub mod record;
+mod reassembly;
+pub mod tlv;
