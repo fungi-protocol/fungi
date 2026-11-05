@@ -2,4 +2,6 @@
 
 //! Message channels through an external tor daemon.
 
+pub mod framed;
 pub mod onion;
+pub mod record;
