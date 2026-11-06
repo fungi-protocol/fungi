@@ -1,13 +1,20 @@
-//! One fixed-size HPKE payload that gives sender and recipient a key for
-//! each direction.
+//! Fixed-size payloads between a sender and a recipient: one HPKE payload
+//! that gives both a key for each direction, then symmetric payloads under
+//! those keys.
 //!
-//! A payload is [`PAYLOAD_BYTES`], the size of a BIP77 mailbox message: an
-//! X-Wing encapsulated key followed by the ChaCha20Poly1305 ciphertext of the
-//! length-prefixed, zero-padded message. The keys are exported from the HPKE
-//! context.
+//! Every payload is [`PAYLOAD_BYTES`], the size of a BIP77 mailbox message,
+//! and encrypts a length-prefixed, zero-padded message.
+//!
+//! A payload from [`seal`] is an X-Wing encapsulated key followed by the HPKE
+//! ChaCha20Poly1305 ciphertext. The keys are exported from the HPKE context.
+//!
+//! A payload from [`seal_symmetric`] is a random nonce followed by the
+//! XChaCha20Poly1305 ciphertext.
 
 use std::io::Write as _;
 
+use chacha20poly1305::aead::{Aead as _, Generate as _, KeyInit as _, Payload};
+use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use hpke::aead::ChaCha20Poly1305;
 use hpke::hybrid_array::typenum::Unsigned as _;
 use hpke::kdf::HkdfSha256;
@@ -18,17 +25,22 @@ use hpke::{Deserializable, HpkeError, OpModeR, OpModeS, Serializable};
 /// [Uniform Payloads](https://github.com/bitcoin/bips/blob/master/bip-0077.md#uniform-payloads).
 pub const PAYLOAD_BYTES: usize = 7168;
 
-/// Largest message that fits in one payload.
-pub const MAX_MESSAGE_BYTES: usize = PLAINTEXT_BYTES - LENGTH_PREFIX_BYTES;
+/// Largest message that fits in a payload from [`seal`].
+pub const MAX_MESSAGE_BYTES: usize = HANDSHAKE_PLAINTEXT_BYTES - LENGTH_PREFIX_BYTES;
+
+/// Largest message that fits in a payload from [`seal_symmetric`].
+pub const MAX_SYMMETRIC_MESSAGE_BYTES: usize = SYMMETRIC_PLAINTEXT_BYTES - LENGTH_PREFIX_BYTES;
 
 /// Size of each exported key.
 pub const KEY_BYTES: usize = 32;
 
 const ENCAPSULATED_KEY_BYTES: usize = <EncappedKey as Serializable>::OutputSize::USIZE;
+const NONCE_BYTES: usize = 24;
 const TAG_BYTES: usize = 16;
 /// Size of the big-endian message length at the start of a plaintext.
 const LENGTH_PREFIX_BYTES: usize = 2;
-const PLAINTEXT_BYTES: usize = PAYLOAD_BYTES - ENCAPSULATED_KEY_BYTES - TAG_BYTES;
+const HANDSHAKE_PLAINTEXT_BYTES: usize = PAYLOAD_BYTES - ENCAPSULATED_KEY_BYTES - TAG_BYTES;
+const SYMMETRIC_PLAINTEXT_BYTES: usize = PAYLOAD_BYTES - NONCE_BYTES - TAG_BYTES;
 
 /// HPKE info of the handshake. The value is arbitrary.
 const INFO: &[u8] = b"fungi-hpke-info-v0";
@@ -53,16 +65,17 @@ pub struct Keys {
 /// Failure to seal or open a payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
-    /// The message is longer than [`MAX_MESSAGE_BYTES`].
-    #[error("message has {0} bytes, more than {MAX_MESSAGE_BYTES}")]
+    /// The message is longer than [`MAX_MESSAGE_BYTES`] or
+    /// [`MAX_SYMMETRIC_MESSAGE_BYTES`].
+    #[error("message has {0} bytes, more than fits in a payload")]
     MessageTooLarge(usize),
     /// The payload is not [`PAYLOAD_BYTES`] long.
     #[error("payload has {0} bytes, expected {PAYLOAD_BYTES}")]
     PayloadSize(usize),
-    /// The payload was modified, or was not sealed to this key.
+    /// The payload was modified, or was not sealed with this key and `aad`.
     #[error("payload cannot be decrypted")]
     Decryption,
-    /// The decrypted length prefix exceeds [`MAX_MESSAGE_BYTES`].
+    /// The decrypted length prefix exceeds the rest of the plaintext.
     #[error("decrypted message length is invalid")]
     MessageLength,
     /// The decrypted bytes after the message are not all zero.
@@ -73,16 +86,7 @@ pub enum Error {
 /// Encrypt `message` to `public_key` and return the payload and the sender's
 /// keys.
 pub fn seal(public_key: &PublicKey, message: &[u8]) -> Result<(Vec<u8>, Keys), Error> {
-    if message.len() > MAX_MESSAGE_BYTES {
-        return Err(Error::MessageTooLarge(message.len()));
-    }
-    let length = u16::try_from(message.len()).expect("MAX_MESSAGE_BYTES fits in u16");
-    let mut plaintext = [0u8; PLAINTEXT_BYTES];
-    let mut w = &mut plaintext[..];
-    w.write_all(&length.to_be_bytes())
-        .expect("plaintext buffer sized to fit");
-    w.write_all(message).expect("plaintext buffer sized to fit");
-
+    let plaintext = pad::<HANDSHAKE_PLAINTEXT_BYTES>(message)?;
     let (encapsulated_key, mut context) =
         hpke::setup_sender::<ChaCha20Poly1305, HkdfSha256, Kem>(&OpModeS::Base, public_key, INFO)
             .expect("setting up to a valid public key cannot fail");
@@ -116,28 +120,16 @@ pub fn open(secret_key: &SecretKey, payload: &[u8]) -> Result<(Vec<u8>, Keys), E
         INFO,
     )
     .expect("X-Wing decapsulation cannot fail");
-    let mut plaintext = context
+    let plaintext = context
         .open(ciphertext, &[])
         .map_err(|_| Error::Decryption)?;
-
-    let (length, rest) = plaintext.split_at(LENGTH_PREFIX_BYTES);
-    let length = usize::from(u16::from_be_bytes(
-        length.try_into().expect("split at the length size"),
-    ));
-    if length > rest.len() {
-        return Err(Error::MessageLength);
-    }
-    if rest[length..].iter().any(|&byte| byte != 0) {
-        return Err(Error::Padding);
-    }
-    plaintext.truncate(LENGTH_PREFIX_BYTES + length);
-    plaintext.drain(..LENGTH_PREFIX_BYTES);
+    let message = unpad(plaintext)?;
     let keys = export_keys(
         |exporter_context, key| context.export(exporter_context, key),
         RECIPIENT_TO_SENDER,
         SENDER_TO_RECIPIENT,
     );
-    Ok((plaintext, keys))
+    Ok((message, keys))
 }
 
 /// Export the keys with `export`, given the exporter contexts of the
@@ -154,6 +146,77 @@ fn export_keys(
     export(sending, &mut keys.sending).expect("KEY_BYTES is a valid export length");
     export(receiving, &mut keys.receiving).expect("KEY_BYTES is a valid export length");
     keys
+}
+
+/// Encrypt `message` with `key` and return the payload. [`open_symmetric`]
+/// needs the same `aad`.
+pub fn seal_symmetric(key: &[u8; KEY_BYTES], aad: &[u8], message: &[u8]) -> Result<Vec<u8>, Error> {
+    let plaintext = pad::<SYMMETRIC_PLAINTEXT_BYTES>(message)?;
+    let nonce = XNonce::generate();
+    let ciphertext = XChaCha20Poly1305::new(&Key::from(*key))
+        .encrypt(
+            &nonce,
+            Payload {
+                msg: &plaintext,
+                aad,
+            },
+        )
+        .expect("a payload-sized plaintext cannot fail to encrypt");
+
+    let mut payload = nonce.to_vec();
+    payload.extend_from_slice(&ciphertext);
+    debug_assert_eq!(payload.len(), PAYLOAD_BYTES);
+    Ok(payload)
+}
+
+/// Decrypt `payload` with `key` and return the message.
+pub fn open_symmetric(key: &[u8; KEY_BYTES], aad: &[u8], payload: &[u8]) -> Result<Vec<u8>, Error> {
+    if payload.len() != PAYLOAD_BYTES {
+        return Err(Error::PayloadSize(payload.len()));
+    }
+    let (nonce, ciphertext) = payload.split_at(NONCE_BYTES);
+    let nonce = XNonce::try_from(nonce).expect("split at the nonce size");
+    let plaintext = XChaCha20Poly1305::new(&Key::from(*key))
+        .decrypt(
+            &nonce,
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
+        .map_err(|_| Error::Decryption)?;
+    unpad(plaintext)
+}
+
+/// Prefix `message` with its length and pad it with zeros to `N` bytes.
+fn pad<const N: usize>(message: &[u8]) -> Result<[u8; N], Error> {
+    if message.len() > N - LENGTH_PREFIX_BYTES {
+        return Err(Error::MessageTooLarge(message.len()));
+    }
+    let length = u16::try_from(message.len()).expect("PAYLOAD_BYTES fits in u16");
+    let mut plaintext = [0u8; N];
+    let mut w = &mut plaintext[..];
+    w.write_all(&length.to_be_bytes())
+        .expect("plaintext buffer sized to fit");
+    w.write_all(message).expect("plaintext buffer sized to fit");
+    Ok(plaintext)
+}
+
+/// Undo [`pad`].
+fn unpad(mut plaintext: Vec<u8>) -> Result<Vec<u8>, Error> {
+    let (length, rest) = plaintext.split_at(LENGTH_PREFIX_BYTES);
+    let length = usize::from(u16::from_be_bytes(
+        length.try_into().expect("split at the length size"),
+    ));
+    if length > rest.len() {
+        return Err(Error::MessageLength);
+    }
+    if rest[length..].iter().any(|&byte| byte != 0) {
+        return Err(Error::Padding);
+    }
+    plaintext.truncate(LENGTH_PREFIX_BYTES + length);
+    plaintext.drain(..LENGTH_PREFIX_BYTES);
+    Ok(plaintext)
 }
 
 #[cfg(test)]
@@ -197,9 +260,11 @@ mod tests {
     }
 
     #[test]
-    fn max_message_size() {
+    fn max_message_sizes() {
         // 7168 - 1120 - 16 - 2.
         assert_eq!(MAX_MESSAGE_BYTES, 6030);
+        // 7168 - 24 - 16 - 2.
+        assert_eq!(MAX_SYMMETRIC_MESSAGE_BYTES, 7126);
     }
 
     #[test]
@@ -249,7 +314,7 @@ mod tests {
     #[test]
     fn invalid_length_prefix_is_rejected() {
         let (secret, public) = keypair(1);
-        let mut plaintext = vec![0; PLAINTEXT_BYTES];
+        let mut plaintext = vec![0; HANDSHAKE_PLAINTEXT_BYTES];
         plaintext[..LENGTH_PREFIX_BYTES].copy_from_slice(&u16::MAX.to_be_bytes());
         assert_eq!(
             open(&secret, &seal_plaintext(&public, &plaintext)).err(),
@@ -260,11 +325,102 @@ mod tests {
     #[test]
     fn nonzero_padding_is_rejected() {
         let (secret, public) = keypair(1);
-        let mut plaintext = vec![0; PLAINTEXT_BYTES];
-        plaintext[PLAINTEXT_BYTES - 1] = 1;
+        let mut plaintext = vec![0; HANDSHAKE_PLAINTEXT_BYTES];
+        plaintext[HANDSHAKE_PLAINTEXT_BYTES - 1] = 1;
         assert_eq!(
             open(&secret, &seal_plaintext(&public, &plaintext)).err(),
             Some(Error::Padding)
         );
+    }
+
+    const AAD: &[u8] = b"aad";
+
+    fn handshake() -> (Keys, Keys) {
+        let (secret, public) = keypair(1);
+        let (payload, sender) = seal(&public, b"").unwrap();
+        let (_, recipient) = open(&secret, &payload).unwrap();
+        (sender, recipient)
+    }
+
+    #[test]
+    fn symmetric_messages_round_trip_in_both_directions() {
+        let (sender, recipient) = handshake();
+        for message in [&b""[..], b"message", &[0xff; MAX_SYMMETRIC_MESSAGE_BYTES]] {
+            for (from, to) in [(&sender, &recipient), (&recipient, &sender)] {
+                let payload = seal_symmetric(&from.sending, AAD, message).unwrap();
+                assert_eq!(payload.len(), PAYLOAD_BYTES);
+                assert_eq!(
+                    open_symmetric(&to.receiving, AAD, &payload).unwrap(),
+                    message
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn symmetric_wrong_key_or_aad_is_rejected() {
+        let (sender, _) = handshake();
+        let payload = seal_symmetric(&sender.sending, AAD, b"message").unwrap();
+        assert_eq!(
+            open_symmetric(&sender.receiving, AAD, &payload),
+            Err(Error::Decryption)
+        );
+        assert_eq!(
+            open_symmetric(&sender.sending, b"other", &payload),
+            Err(Error::Decryption)
+        );
+    }
+
+    #[test]
+    fn symmetric_modified_payload_is_rejected() {
+        let (sender, _) = handshake();
+        let mut payload = seal_symmetric(&sender.sending, AAD, b"message").unwrap();
+        payload[PAYLOAD_BYTES - 1] ^= 1;
+        assert_eq!(
+            open_symmetric(&sender.sending, AAD, &payload),
+            Err(Error::Decryption)
+        );
+    }
+
+    #[test]
+    fn symmetric_oversized_message_is_rejected() {
+        let (sender, _) = handshake();
+        assert_eq!(
+            seal_symmetric(&sender.sending, AAD, &[0; MAX_SYMMETRIC_MESSAGE_BYTES + 1]),
+            Err(Error::MessageTooLarge(MAX_SYMMETRIC_MESSAGE_BYTES + 1))
+        );
+    }
+
+    #[test]
+    fn symmetric_wrong_size_payload_is_rejected() {
+        let (sender, _) = handshake();
+        let payload = seal_symmetric(&sender.sending, AAD, b"message").unwrap();
+        for size in [PAYLOAD_BYTES - 1, PAYLOAD_BYTES + 1] {
+            let mut payload = payload.clone();
+            payload.resize(size, 0);
+            assert_eq!(
+                open_symmetric(&sender.sending, AAD, &payload),
+                Err(Error::PayloadSize(size))
+            );
+        }
+    }
+
+    /// Every bit position takes both values across payloads of the same
+    /// message, as in rust-payjoin's `test_encrypted_payload_bit_uniformity`.
+    ///
+    /// Fails by chance with negligible probability.
+    #[test]
+    fn symmetric_payload_bits_vary() {
+        let (sender, _) = handshake();
+        let message = [0; MAX_SYMMETRIC_MESSAGE_BYTES];
+        let seal = || seal_symmetric(&sender.sending, AAD, &message).unwrap();
+        let first = seal();
+        let mut differing = vec![0u8; PAYLOAD_BYTES];
+        for _ in 0..80 {
+            for (bits, (a, b)) in differing.iter_mut().zip(first.iter().zip(&seal())) {
+                *bits |= a ^ b;
+            }
+        }
+        assert!(differing.iter().all(|&bits| bits == 0xff));
     }
 }
