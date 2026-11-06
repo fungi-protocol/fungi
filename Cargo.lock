@@ -1113,6 +1113,7 @@ dependencies = [
  "bech32",
  "bhttp",
  "bitcoin-ohttp",
+ "hpke",
  "ohttp-client",
  "thiserror 2.0.20",
 ]
