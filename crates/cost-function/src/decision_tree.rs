@@ -48,7 +48,7 @@ pub(crate) enum DecisionTree {
 }
 
 impl DecisionTree {
-    /// Every leaf in the tree, in tree order.
+    /// Every leaf in the tree.
     pub(crate) fn iter_leaves(&self) -> Box<dyn Iterator<Item = &Leaf> + '_> {
         match self {
             DecisionTree::Branch(nodes) => {
