@@ -4,7 +4,9 @@
 
 mod duplex;
 mod privacy;
+pub mod reassembly;
 pub mod shared;
+pub mod tlv;
 mod traits;
 mod transform;
 
