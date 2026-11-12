@@ -103,7 +103,7 @@ impl<'a> TreeNode<'a> {
                 .iter()
                 .enumerate()
                 .filter(|(i, _)| picked(bitset, *i))
-                .map(|(_, utxo)| Action::RegisterInput(utxo.to_txin()))
+                .map(|(_, utxo)| Action::RegisterInput(utxo.clone()))
                 .collect(),
         )
     }
@@ -154,8 +154,8 @@ mod tests {
         assert_eq!(
             node.to_sequence_of_actions(),
             UnSequencedActions(vec![
-                Action::RegisterInput(coin(0).to_txin()),
-                Action::RegisterInput(coin(2).to_txin()),
+                Action::RegisterInput(coin(0)),
+                Action::RegisterInput(coin(2)),
             ])
         );
     }
