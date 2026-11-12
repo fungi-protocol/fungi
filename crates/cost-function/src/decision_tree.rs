@@ -7,6 +7,7 @@ use rand::{RngCore, seq::SliceRandom};
 
 use crate::{
     action::{Action, UnSequencedActions},
+    change::OutputWithoutScriptpubkey,
     wallet::Utxo,
 };
 
@@ -15,7 +16,7 @@ use crate::{
 pub(crate) struct Leaf {
     pub(crate) inputs: Vec<Utxo>,
     pub(crate) payments: Vec<TxOut>,
-    pub(crate) change: Vec<TxOut>,
+    pub(crate) change: Vec<OutputWithoutScriptpubkey>,
 }
 
 impl Leaf {
@@ -25,14 +26,18 @@ impl Leaf {
         let mut input_actions: Vec<Action> = self
             .inputs
             .iter()
-            .map(|input| Action::RegisterInput(input.to_txin()))
+            .map(|input| Action::Input(input.to_txin()))
             .collect();
         input_actions.shuffle(rng);
         let mut output_actions: Vec<Action> = self
             .payments
             .iter()
-            .chain(&self.change)
-            .map(|output| Action::RegisterOutput(output.clone()))
+            .map(|output| Action::Output(output.clone()))
+            .chain(
+                self.change
+                    .iter()
+                    .map(|change| Action::SelfSpendOutPut(change.clone())),
+            )
             .collect();
         output_actions.shuffle(rng);
 
@@ -80,6 +85,15 @@ mod tests {
         }
     }
 
+    fn change_output(sats: u64) -> OutputWithoutScriptpubkey {
+        OutputWithoutScriptpubkey {
+            value: Amount::from_sat(sats),
+            weight: Weight::ZERO,
+            satisfaction_weight: Weight::ZERO,
+            dust: Amount::ZERO,
+        }
+    }
+
     fn plan_of(tree: &DecisionTree) -> Option<&Leaf> {
         match tree {
             DecisionTree::Leaf(plan) => Some(plan),
@@ -110,14 +124,10 @@ mod tests {
 
     #[test]
     fn iter_leaves_collects_every_leaf_in_tree_order() {
-        let output = |sats| TxOut {
-            value: bitcoin::Amount::from_sat(sats),
-            script_pubkey: ScriptBuf::new(),
-        };
         let leaf = |sats| Leaf {
             inputs: Vec::new(),
             payments: Vec::new(),
-            change: vec![output(sats)],
+            change: vec![change_output(sats)],
         };
         let node = |subtree| Node { subtree };
 
@@ -144,7 +154,7 @@ mod tests {
         let leaf = Leaf {
             inputs: Vec::new(),
             payments: vec![output(1), output(2)],
-            change: vec![output(3)],
+            change: vec![change_output(3)],
         };
 
         let change_positions: BTreeSet<_> = (0..16)
@@ -153,7 +163,7 @@ mod tests {
                 actions
                     .0
                     .iter()
-                    .position(|action| *action == Action::RegisterOutput(output(3)))
+                    .position(|action| *action == Action::SelfSpendOutPut(change_output(3)))
             })
             .collect();
 
@@ -181,7 +191,7 @@ mod tests {
                 actions
                     .0
                     .iter()
-                    .position(|action| *action == Action::RegisterInput(coin(0).to_txin()))
+                    .position(|action| *action == Action::Input(coin(0).to_txin()))
             })
             .collect();
 

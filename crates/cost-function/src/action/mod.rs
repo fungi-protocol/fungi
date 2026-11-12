@@ -2,13 +2,17 @@
 
 use bitcoin::{TxIn, TxOut};
 
+use crate::change::OutputWithoutScriptpubkey;
+
 /// One step in constructing a transaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Action {
     /// Add an input to the transaction.
-    RegisterInput(TxIn),
+    Input(TxIn),
     /// Add an output to the transaction.
-    RegisterOutput(TxOut),
+    Output(TxOut),
+    /// Add an output that pays back to the wallet.
+    SelfSpendOutPut(OutputWithoutScriptpubkey),
 }
 
 /// Actions without a known time of execution
