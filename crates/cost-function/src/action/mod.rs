@@ -2,13 +2,21 @@
 
 use bitcoin::{TxIn, TxOut};
 
+use crate::change::OutputWithoutScriptpubkey;
+
 /// One step in constructing a transaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "retain the planner action vocabulary"
+)]
 pub(crate) enum Action {
     /// Add an input to the transaction.
     RegisterInput(TxIn),
     /// Add an output to the transaction.
     RegisterOutput(TxOut),
+    /// Add an change output,
+    RegisterChangeOutPut(OutputWithoutScriptpubkey),
 }
 
 /// Actions without a known time of execution

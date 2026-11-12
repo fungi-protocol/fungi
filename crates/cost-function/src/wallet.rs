@@ -75,7 +75,7 @@ impl<Q: Queue, U: UtxoSnapshot> WalletStateSnapshot<Q, U> {
         selector: &S,
         rng: &mut R,
         change_strategy: &ChangeStrategy<C, A>,
-    ) -> PlanResult<S::Error, C::Error, A::Error>
+    ) -> PlanResult<S::Error, C::Error>
     where
         S: CoinSelector,
         C: ChangeSelector,
@@ -116,7 +116,6 @@ impl<Q: Queue, U: UtxoSnapshot> WalletStateSnapshot<Q, U> {
         let change = change_strategy
             .change(&selection, feerate)
             .map_err(PlanError::Change)?;
-        let change = change_strategy.assign(&change).map_err(PlanError::Assign)?;
 
         // TODO: this takes the leaf that spends every selected coin, which is not necessarily
         // the best plan. Future work should walk the tree, simulate the wallet diff, and score
@@ -124,33 +123,34 @@ impl<Q: Queue, U: UtxoSnapshot> WalletStateSnapshot<Q, U> {
         let mut actions = TreeNode::new(&selection.selected_inputs)
             .most_inclusive()
             .to_sequence_of_actions();
-        actions.0.extend(
-            payments
-                .into_iter()
-                .chain(change)
-                .map(Action::RegisterOutput),
-        );
+        actions
+            .0
+            .extend(payments.into_iter().map(Action::RegisterOutput));
+
+        actions
+            .0
+            .extend(change.into_iter().map(Action::RegisterChangeOutPut));
+
         Ok(Some(actions))
     }
 }
 
 /// The actions of the best plan, `None` if there is nothing to do.
-pub(crate) type PlanResult<S, C, A> = Result<Option<UnSequencedActions>, PlanError<S, C, A>>;
+pub(crate) type PlanResult<S, C> = Result<Option<UnSequencedActions>, PlanError<S, C>>;
 
 /// Why a plan could not be built.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum PlanError<S, C, A> {
+pub(crate) enum PlanError<S, C> {
     /// The coins could not fund the payments.
     Selection(S),
     /// The surplus could not be split into change.
     Change(C),
-    /// The change could not be given scriptpubkeys.
-    Assign(A),
 }
 
 #[cfg(test)]
 mod tests {
     use crate::action::Action;
+    use crate::change::OutputWithoutScriptpubkey;
     use crate::change::single_output::SingleOutputChangeSelector;
     use crate::change::tests::DummySPKAssigner;
     use crate::intent::{FixedPaymentInstructions, Outcome, PayoffCurve};
@@ -188,7 +188,7 @@ mod tests {
         }
     }
 
-    type Plan = PlanResult<RandomSelectionError, Infallible, Infallible>;
+    type Plan = PlanResult<RandomSelectionError, Infallible>;
 
     fn best_plan(utxos: impl IntoIterator<Item = Utxo>, intents: &[u64]) -> Plan {
         let start = Instant::now();
@@ -225,7 +225,12 @@ mod tests {
                 Action::RegisterInput(utxo(0, 10_000).to_txin()),
                 Action::RegisterOutput(op_true_output(1_000)),
                 Action::RegisterOutput(op_true_output(1_000)),
-                Action::RegisterOutput(op_true_output(7_919)),
+                Action::RegisterChangeOutPut(OutputWithoutScriptpubkey {
+                    value: Amount::from_sat(7_919),
+                    weight: Weight::from_wu(40),
+                    satisfaction_weight: Weight::ZERO,
+                    dust: Amount::from_sat(474),
+                }),
             ])))
         );
     }
