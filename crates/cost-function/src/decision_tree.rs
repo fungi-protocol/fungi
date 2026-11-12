@@ -26,7 +26,7 @@ impl Leaf {
         let mut input_actions: Vec<Action> = self
             .inputs
             .iter()
-            .map(|input| Action::Input(input.to_txin()))
+            .map(|input| Action::Input(input.clone()))
             .collect();
         input_actions.shuffle(rng);
         let mut output_actions: Vec<Action> = self
@@ -191,7 +191,7 @@ mod tests {
                 actions
                     .0
                     .iter()
-                    .position(|action| *action == Action::Input(coin(0).to_txin()))
+                    .position(|action| *action == Action::Input(coin(0)))
             })
             .collect();
 

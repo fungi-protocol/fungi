@@ -1,6 +1,6 @@
 //! What the wallet owns, and what it has been asked to do.
 
-use bitcoin::{Amount, FeeRate, OutPoint, TxIn, TxOut, Weight};
+use bitcoin::{Amount, FeeRate, OutPoint, TxOut, Weight};
 use rand::RngCore;
 use std::collections::{BTreeMap, HashSet};
 
@@ -28,15 +28,6 @@ impl Utxo {
             outpoint,
             value,
             satisfaction_weight,
-        }
-    }
-
-    pub(crate) fn to_txin(&self) -> TxIn {
-        TxIn {
-            previous_output: self.outpoint,
-            // TODO: nsequence must match wallet preferences and should be consistent across the
-            // whole collaborative session.
-            ..Default::default()
         }
     }
 }
@@ -155,7 +146,7 @@ mod tests {
     use crate::selection::random::{RandomSelectionError, RandomSelector};
 
     use super::*;
-    use bitcoin::{ScriptBuf, Sequence, Txid, hashes::Hash};
+    use bitcoin::{ScriptBuf, Txid, hashes::Hash};
     use rand::{SeedableRng, rngs::StdRng};
     use std::convert::Infallible;
     use std::time::Instant;
@@ -219,7 +210,7 @@ mod tests {
         assert_eq!(
             best_plan([utxo(0, 10_000)], &[1_000, 1_000]),
             Ok(Some(UnSequencedActions(vec![
-                Action::Input(utxo(0, 10_000).to_txin()),
+                Action::Input(utxo(0, 10_000)),
                 Action::Output(op_true_output(1_000)),
                 Action::Output(op_true_output(1_000)),
                 Action::SelfSpendOutPut(OutputWithoutScriptpubkey {
@@ -250,19 +241,6 @@ mod tests {
             Err(PlanError::Selection(
                 RandomSelectionError::NoCombinationCovers
             ))
-        );
-    }
-
-    #[test]
-    fn a_coin_becomes_an_unsigned_input_spending_its_outpoint() {
-        assert_eq!(
-            utxo(3, 10_000).to_txin(),
-            TxIn {
-                previous_output: OutPoint::new(Txid::all_zeros(), 3),
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
-                witness: bitcoin::Witness::new(),
-            }
         );
     }
 }
