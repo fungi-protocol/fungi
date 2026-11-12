@@ -2,6 +2,8 @@
 
 use bitcoin::{TxIn, TxOut};
 
+use crate::change::OutputWithoutScriptpubkey;
+
 /// One step in constructing a transaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Action {
@@ -9,6 +11,8 @@ pub(crate) enum Action {
     RegisterInput(TxIn),
     /// Add an output to the transaction.
     RegisterOutput(TxOut),
+    /// Add an change output,
+    RegisterChangeOutPut(OutputWithoutScriptpubkey),
 }
 
 /// Actions without a known time of execution
