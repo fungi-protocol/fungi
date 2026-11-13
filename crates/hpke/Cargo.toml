@@ -1,0 +1,18 @@
+[package]
+name = "fungi-hpke"
+description = "X-Wing HPKE handshake that exports a shared secret"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+hpke = { version = "0.14.1", default-features = false, features = [
+  "chacha",
+  "getrandom",
+  "hkdfsha2",
+  "mlkem",
+  "x25519",
+] }
+thiserror = "2"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }

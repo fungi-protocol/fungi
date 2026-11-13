@@ -1107,6 +1107,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "fungi-hpke"
+version = "0.0.0"
+dependencies = [
+ "hpke",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "fungi-ohttp"
 version = "0.0.0"
 dependencies = [
