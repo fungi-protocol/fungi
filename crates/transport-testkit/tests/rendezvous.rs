@@ -5,7 +5,7 @@
 
 use std::{io, time::Duration};
 
-use fungi_transport::{Duplex, RecvChannel, SendChannel, Unspecified};
+use fungi_transport::{ChannelBuilder, Duplex, RecvChannel, SendChannel, Unspecified};
 use fungi_transport_testkit::testkit;
 use tokio::sync::{mpsc, oneshot};
 
@@ -88,6 +88,33 @@ fn pair(mode: Mode) -> (BidirectionalChannel, BidirectionalChannel) {
     )
 }
 
+struct Connector(mpsc::Sender<BidirectionalChannel>);
+struct Listener(mpsc::Receiver<BidirectionalChannel>);
+impl ChannelBuilder for Connector {
+    type Privacy = Unspecified;
+    type Input = ();
+    type Channel = BidirectionalChannel;
+    type BuildError = io::Error;
+    async fn build(&mut self, _: &()) -> Result<BidirectionalChannel, io::Error> {
+        let (client, server) = pair(Mode::Deliver);
+        self.0.send(server).await.map_err(io::Error::other)?;
+        Ok(client)
+    }
+}
+
+impl ChannelBuilder for Listener {
+    type Privacy = Unspecified;
+    type Input = ();
+    type Channel = BidirectionalChannel;
+    type BuildError = io::Error;
+    async fn build(&mut self, _: &()) -> Result<BidirectionalChannel, io::Error> {
+        self.0
+            .recv()
+            .await
+            .ok_or_else(|| io::Error::other("listener closed"))
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn helpers_accept_submission_that_waits_for_peer_reception() {
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -100,6 +127,8 @@ async fn helpers_accept_submission_that_waits_for_peer_reception() {
             error.kind() == io::ErrorKind::InvalidInput
         })
         .await;
+        let (queue, receiver) = mpsc::channel(1);
+        testkit::build_use_drop_rebuild(Connector(queue), Listener(receiver), &()).await;
     })
     .await
     .expect("helpers must drive reception while submission waits");
