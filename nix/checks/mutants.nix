@@ -30,7 +30,7 @@
                     cargo-mutants
                     cargo-nextest
                   ]);
-                buildPhaseCargoCommand = "cargo mutants --manifest-path ${pkgs.lib.escapeShellArg "./${cargoWorkspace.cargoManifestPath}"} --workspace --in-place --test-tool nextest";
+                buildPhaseCargoCommand = "cargo mutants --manifest-path ${pkgs.lib.escapeShellArg "./${cargoWorkspace.cargoManifestPath}"} --workspace --all-features --in-place --test-tool nextest";
                 installPhase = "mkdir -p $out";
               }
             )
