@@ -4,10 +4,10 @@ use bitcoin::{Amount, FeeRate, OutPoint, TxIn, TxOut, Weight};
 use rand::RngCore;
 use std::collections::{BTreeMap, HashSet};
 
-use crate::action::UnSequencedActions;
+use crate::action::{Action, UnSequencedActions};
 use crate::change::{ChangeSelector, ChangeStrategy, ScriptpubkeyAssigner};
 use crate::decision_space::DecisionSpace;
-use crate::decision_tree::{DecisionTree, Leaf};
+use crate::decision_tree::TreeNode;
 use crate::intent::Intent;
 use crate::queue::Queue;
 use crate::selection::{CoinSelector, FundingRequest};
@@ -118,18 +118,19 @@ impl<Q: Queue, U: UtxoSnapshot> WalletStateSnapshot<Q, U> {
             .map_err(PlanError::Change)?;
         let change = change_strategy.assign(&change).map_err(PlanError::Assign)?;
 
-        let tree = DecisionTree::Leaf(Leaf {
-            inputs: selection.selected_inputs,
-            payments,
-            change,
-        });
-
-        // TODO: this returns the first leaf, which is not necessarily the best plan.
-        // Future work should iterate over leaves, simulate the wallet diff, and score the results.
-        Ok(tree
-            .iter_leaves()
-            .next()
-            .map(|leaf| leaf.to_sequence_of_actions(rng)))
+        // TODO: this takes the leaf that spends every selected coin, which is not necessarily
+        // the best plan. Future work should walk the tree, simulate the wallet diff, and score
+        // the leaves.
+        let mut actions = TreeNode::new(&selection.selected_inputs)
+            .most_inclusive()
+            .to_sequence_of_actions();
+        actions.0.extend(
+            payments
+                .into_iter()
+                .chain(change)
+                .map(Action::RegisterOutput),
+        );
+        Ok(Some(actions))
     }
 }
 
