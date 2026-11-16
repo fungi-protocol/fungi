@@ -5,6 +5,10 @@ version.workspace = true
 
 [dependencies]
 bitcoin = "=0.32.8"
+num-bigint = "0.4"
+num-integer = "0.1"
+num-rational = "0.4"
+num-traits = "0.2"
 rand = "=0.9.5"
 
 [dev-dependencies]

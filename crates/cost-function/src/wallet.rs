@@ -1,15 +1,19 @@
 //! What the wallet owns, and what it has been asked to do.
 
-use bitcoin::{Amount, FeeRate, OutPoint, TxIn, TxOut, Weight};
+use bitcoin::{Amount, FeeRate, OutPoint, TxOut, Weight};
 use rand::RngCore;
 use std::collections::{BTreeMap, HashSet};
 
-use crate::action::UnSequencedActions;
-use crate::change::{ChangeSelector, ChangeStrategy, ScriptpubkeyAssigner};
+use crate::action::Action;
+use crate::candidate::Candidate;
+use crate::change::single_output::SingleOutputChangeSelector;
+use crate::change::{ChangeCosts, ChangeSelector, ChangeStrategy};
 use crate::decision_space::DecisionSpace;
-use crate::decision_tree::{DecisionTree, Leaf};
+use crate::decision_tree::TreeNode;
 use crate::intent::Intent;
 use crate::queue::Queue;
+pub use crate::selection::random::RandomSelectionError as FundingError;
+use crate::selection::random::RandomSelector;
 use crate::selection::{CoinSelector, FundingRequest};
 
 /// A coin the wallet can spend.
@@ -21,6 +25,13 @@ pub struct Utxo {
 }
 
 impl Utxo {
+    pub fn outpoint(&self) -> OutPoint {
+        self.outpoint
+    }
+    pub fn value(&self) -> Amount {
+        self.value
+    }
+
     /// `satisfaction_weight` is the weight of the scriptSig and witness that spend this
     /// coin, excluding the outpoint and nsequence.
     pub fn new(outpoint: OutPoint, value: Amount, satisfaction_weight: Weight) -> Self {
@@ -28,15 +39,6 @@ impl Utxo {
             outpoint,
             value,
             satisfaction_weight,
-        }
-    }
-
-    pub(crate) fn to_txin(&self) -> TxIn {
-        TxIn {
-            previous_output: self.outpoint,
-            // TODO: nsequence must match wallet preferences and should be consistent across the
-            // whole collaborative session.
-            ..Default::default()
         }
     }
 }
@@ -63,23 +65,37 @@ impl<Q: Queue, U: UtxoSnapshot> WalletStateSnapshot<Q, U> {
         }
     }
 
-    /// The actions that realize the queue: funded by `selector`, with change from
-    /// `change_strategy`. `None` if the queue is empty.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "no driver loop asks for a plan yet")
-    )]
-    pub(crate) fn best_plan<S, C, A, R>(
+    /// Fund the queue once using random coin selection and one change output.
+    /// This is the single-outcome entry point, not a search for an optimal plan.
+    pub fn funded_candidate<C: ChangeCosts, R: RngCore>(
+        &self,
+        feerate: FeeRate,
+        rng: &mut R,
+        costs: &C,
+    ) -> Result<Option<Candidate<Q::Id>>, FundingError> {
+        match self.fund_with(
+            feerate,
+            &RandomSelector,
+            rng,
+            &ChangeStrategy::new(SingleOutputChangeSelector, costs),
+        ) {
+            Ok(candidate) => Ok(candidate),
+            Err(PlanError::Selection(error)) => Err(error),
+            Err(PlanError::Change(never)) => match never {},
+        }
+    }
+
+    fn fund_with<S, C, A, R>(
         &self,
         feerate: FeeRate,
         selector: &S,
         rng: &mut R,
         change_strategy: &ChangeStrategy<C, A>,
-    ) -> PlanResult<S::Error, C::Error, A::Error>
+    ) -> CandidateResult<Q::Id, S::Error, C::Error>
     where
         S: CoinSelector,
         C: ChangeSelector,
-        A: ScriptpubkeyAssigner,
+        A: ChangeCosts,
         R: RngCore,
     {
         // MVP: the decision space yields only the trivial partition: with one batch with all intents
@@ -116,51 +132,61 @@ impl<Q: Queue, U: UtxoSnapshot> WalletStateSnapshot<Q, U> {
         let change = change_strategy
             .change(&selection, feerate)
             .map_err(PlanError::Change)?;
-        let change = change_strategy.assign(&change).map_err(PlanError::Assign)?;
 
-        let tree = DecisionTree::Leaf(Leaf {
-            inputs: selection.selected_inputs,
+        // TODO: this takes the leaf that spends every selected coin, which is not necessarily
+        // the best plan. Future work should walk the tree, simulate the wallet diff, and score
+        // the leaves.
+        let mut actions = TreeNode::new(&selection.selected_inputs)
+            .most_inclusive()
+            .to_sequence_of_actions();
+        actions
+            .0
+            .extend(payments.into_iter().map(Action::RegisterOutput));
+
+        actions
+            .0
+            .extend(change.into_iter().map(Action::RegisterChangeOutPut));
+
+        let payments = batch
+            .intents
+            .iter()
+            .map(|id| (*id, intents[id].payment_output()))
+            .collect();
+        let payoffs = batch
+            .intents
+            .iter()
+            .map(|id| intents[id].payoff_curve.clone())
+            .collect();
+        Ok(Some(Candidate {
+            actions,
             payments,
-            change,
-        });
-
-        // TODO: this returns the first leaf, which is not necessarily the best plan.
-        // Future work should iterate over leaves, simulate the wallet diff, and score the results.
-        Ok(tree
-            .iter_leaves()
-            .next()
-            .map(|leaf| leaf.to_sequence_of_actions(rng)))
+            payoffs,
+        }))
     }
 }
 
-/// The actions of the best plan, `None` if there is nothing to do.
-pub(crate) type PlanResult<S, C, A> = Result<Option<UnSequencedActions>, PlanError<S, C, A>>;
+type CandidateResult<I, S, C> = Result<Option<Candidate<I>>, PlanError<S, C>>;
 
 /// Why a plan could not be built.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum PlanError<S, C, A> {
+pub(crate) enum PlanError<S, C> {
     /// The coins could not fund the payments.
     Selection(S),
     /// The surplus could not be split into change.
     Change(C),
-    /// The change could not be given scriptpubkeys.
-    Assign(A),
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::action::Action;
-    use crate::change::single_output::SingleOutputChangeSelector;
-    use crate::change::tests::DummySPKAssigner;
+    use crate::action::{Action, UnSequencedActions};
+    use crate::change::OutputWithoutScriptpubkey;
+    use crate::change::tests::DummyChangeCosts;
     use crate::intent::{FixedPaymentInstructions, Outcome, PayoffCurve};
     use crate::queue::InMemoryQueue;
-    use crate::selection::random::{RandomSelectionError, RandomSelector};
 
     use super::*;
-    use bitcoin::{ScriptBuf, Sequence, Txid, hashes::Hash};
+    use bitcoin::{ScriptBuf, Txid, hashes::Hash};
     use rand::{SeedableRng, rngs::StdRng};
-    use std::convert::Infallible;
-    use std::time::Instant;
 
     fn utxo(vout: u32, sats: u64) -> Utxo {
         Utxo::new(
@@ -170,13 +196,13 @@ mod tests {
         )
     }
 
-    fn intent(start: Instant, sats: u64) -> Intent {
+    fn intent(sats: u64) -> Intent {
         Intent::new(
             Outcome::OutputCreation(FixedPaymentInstructions {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
                 amount: Amount::from_sat(sats),
             }),
-            PayoffCurve::new(start, []),
+            PayoffCurve::new(0, []).unwrap(),
         )
     }
 
@@ -187,18 +213,19 @@ mod tests {
         }
     }
 
-    type Plan = PlanResult<RandomSelectionError, Infallible, Infallible>;
+    fn best_plan(
+        utxos: impl IntoIterator<Item = Utxo>,
+        intents: &[u64],
+    ) -> Result<Option<UnSequencedActions>, FundingError> {
+        let queue = InMemoryQueue::new(intents.iter().map(|&sats| intent(sats)));
 
-    fn best_plan(utxos: impl IntoIterator<Item = Utxo>, intents: &[u64]) -> Plan {
-        let start = Instant::now();
-        let queue = InMemoryQueue::new(intents.iter().map(|&sats| intent(start, sats)));
-
-        WalletStateSnapshot::new(DummyUtxoSnapshot(utxos.into_iter().collect()), queue).best_plan(
-            FeeRate::from_sat_per_vb(1).unwrap(),
-            &RandomSelector,
-            &mut StdRng::seed_from_u64(0),
-            &ChangeStrategy::new(SingleOutputChangeSelector, DummySPKAssigner),
-        )
+        WalletStateSnapshot::new(DummyUtxoSnapshot(utxos.into_iter().collect()), queue)
+            .funded_candidate(
+                FeeRate::from_sat_per_vb(1).unwrap(),
+                &mut StdRng::seed_from_u64(0),
+                &DummyChangeCosts,
+            )
+            .map(|candidate| candidate.map(|candidate| candidate.actions))
     }
 
     fn op_true_output(sats: u64) -> TxOut {
@@ -221,10 +248,15 @@ mod tests {
         assert_eq!(
             best_plan([utxo(0, 10_000)], &[1_000, 1_000]),
             Ok(Some(UnSequencedActions(vec![
-                Action::RegisterInput(utxo(0, 10_000).to_txin()),
+                Action::RegisterInput(utxo(0, 10_000)),
                 Action::RegisterOutput(op_true_output(1_000)),
                 Action::RegisterOutput(op_true_output(1_000)),
-                Action::RegisterOutput(op_true_output(7_919)),
+                Action::RegisterChangeOutPut(OutputWithoutScriptpubkey {
+                    value: Amount::from_sat(7_919),
+                    weight: Weight::from_wu(40),
+                    satisfaction_weight: Weight::ZERO,
+                    dust: Amount::from_sat(474),
+                }),
             ])))
         );
     }
@@ -233,9 +265,7 @@ mod tests {
     fn a_plan_the_coins_cannot_fund_is_an_error() {
         assert_eq!(
             best_plan([utxo(0, 1_000)], &[1_000]),
-            Err(PlanError::Selection(
-                RandomSelectionError::NoCombinationCovers
-            ))
+            Err(FundingError::NoCombinationCovers)
         );
     }
 
@@ -244,22 +274,7 @@ mod tests {
         // Counted twice, coin 0 would cover the payment; counted once, it cannot.
         assert_eq!(
             best_plan([utxo(0, 1_000), utxo(1, 10), utxo(0, 1_000)], &[1_500]),
-            Err(PlanError::Selection(
-                RandomSelectionError::NoCombinationCovers
-            ))
-        );
-    }
-
-    #[test]
-    fn a_coin_becomes_an_unsigned_input_spending_its_outpoint() {
-        assert_eq!(
-            utxo(3, 10_000).to_txin(),
-            TxIn {
-                previous_output: OutPoint::new(Txid::all_zeros(), 3),
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
-                witness: bitcoin::Witness::new(),
-            }
+            Err(FundingError::NoCombinationCovers)
         );
     }
 }

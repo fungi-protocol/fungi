@@ -33,7 +33,10 @@
             # Checks act on every member, not only on Cargo's default members;
             # packages narrow this down again with --package.
             cargoExtraArgs = "${manifestArgs} --workspace";
-            cargoVendorDir = craneLib.vendorCargoDeps { cargoLock = lockfile; };
+            cargoVendorDir = craneLib.vendorCargoDeps {
+              cargoLock = lockfile;
+              outputHashes = spec.outputHashes or { };
+            };
             postUnpack = ''
               cd "$sourceRoot/${workspaceDir}"
               sourceRoot=.

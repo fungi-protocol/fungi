@@ -40,6 +40,11 @@ impl InMemoryQueue {
         queue
     }
 
+    /// Remove an intent whose outcome has been observed; its ID is never reused.
+    pub fn remove(&mut self, id: u64) -> Option<Intent> {
+        self.intents.remove(&id)
+    }
+
     /// Add an intent, returning the id it will be known by.
     pub fn push(&mut self, intent: Intent) -> u64 {
         let id = self.next_id;
@@ -63,19 +68,14 @@ mod tests {
     use crate::intent::{FixedPaymentInstructions, Outcome, PayoffCurve};
     use bitcoin::{Amount, ScriptBuf};
     use std::collections::HashSet;
-    use std::time::{Duration, Instant};
 
-    /// Built from an explicit `start` so two calls with the same arguments compare equal.
-    fn intent(start: Instant, sats: u64) -> Intent {
+    fn intent(sats: u64) -> Intent {
         Intent::new(
             Outcome::OutputCreation(FixedPaymentInstructions {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
                 amount: Amount::from_sat(sats),
             }),
-            PayoffCurve::new(
-                start,
-                vec![(Duration::from_secs(60), Amount::from_sat(sats))],
-            ),
+            PayoffCurve::new(0, vec![(600_000, Amount::from_sat(sats))]).unwrap(),
         )
     }
 
@@ -87,10 +87,18 @@ mod tests {
     }
 
     #[test]
+    fn resolving_an_intent_preserves_other_ids_and_does_not_reuse_its_id() {
+        let mut queue = InMemoryQueue::new([intent(1), intent(2)]);
+        assert_eq!(queue.remove(0), Some(intent(1)));
+        assert_eq!(queue.remove(0), None);
+        assert_eq!(queue.iter().map(|(id, _)| id).collect::<Vec<_>>(), [1]);
+        assert_eq!(queue.push(intent(3)), 2);
+    }
+
+    #[test]
     fn every_intent_is_yielded_under_its_own_id() {
-        let start = Instant::now();
-        let mut queue = InMemoryQueue::new([intent(start, 1), intent(start, 2)]);
-        let pushed = queue.push(intent(start, 3));
+        let mut queue = InMemoryQueue::new([intent(1), intent(2)]);
+        let pushed = queue.push(intent(3));
 
         let ids: HashSet<u64> = queue.iter().map(|(id, _)| id).collect();
 
@@ -100,8 +108,31 @@ mod tests {
                 .iter()
                 .find(|&(id, _)| id == pushed)
                 .map(|(_, held)| held),
-            Some(&intent(start, 3))
+            Some(&intent(3))
         );
         assert_eq!(queue.clone(), queue);
+    }
+}
+
+#[cfg(test)]
+mod removal_tests {
+    use super::*;
+    use crate::intent::{FixedPaymentInstructions, Outcome, PayoffCurve};
+    use bitcoin::{Amount, ScriptBuf};
+
+    #[test]
+    fn removing_one_obligation_preserves_another_and_never_reuses_its_id() {
+        let intent = Intent::new(
+            Outcome::OutputCreation(FixedPaymentInstructions {
+                script_pubkey: ScriptBuf::new(),
+                amount: Amount::from_sat(1),
+            }),
+            PayoffCurve::new(0, []).unwrap(),
+        );
+        let mut queue = InMemoryQueue::new([intent.clone(), intent.clone()]);
+        assert!(queue.remove(0).is_some());
+        assert_eq!(queue.iter().map(|(id, _)| id).collect::<Vec<_>>(), [1]);
+        assert_eq!(queue.push(intent), 2);
+        assert!(queue.remove(0).is_none());
     }
 }
