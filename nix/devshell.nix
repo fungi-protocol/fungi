@@ -10,7 +10,9 @@
       mkDevShell =
         craneLib:
         craneLib.devShell {
+          BITCOIND = pkgs.lib.getExe' pkgs.bitcoind "bitcoind";
           packages = with pkgs; [
+            bitcoind
             cargo-llvm-cov
             cargo-nextest
             cargo-shear
