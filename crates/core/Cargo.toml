@@ -4,9 +4,12 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
+bitcoin = "=0.32.8"
+cost-function = { path = "../cost-function" }
+thiserror = "2"
 
 [dev-dependencies]
-thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
