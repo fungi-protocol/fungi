@@ -5,7 +5,7 @@ use rand::RngCore;
 use std::collections::{BTreeMap, HashSet};
 
 use crate::action::{Action, UnSequencedActions};
-use crate::change::{ChangeSelector, ChangeStrategy, ScriptpubkeyAssigner};
+use crate::change::{ChangeCosts, ChangeSelector, ChangeStrategy};
 use crate::decision_space::DecisionSpace;
 use crate::decision_tree::TreeNode;
 use crate::intent::Intent;
@@ -70,7 +70,7 @@ impl<Q: Queue, U: UtxoSnapshot> WalletStateSnapshot<Q, U> {
     where
         S: CoinSelector,
         C: ChangeSelector,
-        A: ScriptpubkeyAssigner,
+        A: ChangeCosts,
         R: RngCore,
     {
         // MVP: the decision space yields only the trivial partition: with one batch with all intents
@@ -143,7 +143,7 @@ mod tests {
     use crate::action::Action;
     use crate::change::OutputWithoutScriptpubkey;
     use crate::change::single_output::SingleOutputChangeSelector;
-    use crate::change::tests::DummySPKAssigner;
+    use crate::change::tests::DummyChangeCosts;
     use crate::intent::{FixedPaymentInstructions, Outcome, PayoffCurve};
     use crate::queue::InMemoryQueue;
     use crate::selection::random::{RandomSelectionError, RandomSelector};
@@ -189,7 +189,7 @@ mod tests {
             FeeRate::from_sat_per_vb(1).unwrap(),
             &RandomSelector,
             &mut StdRng::seed_from_u64(0),
-            &ChangeStrategy::new(SingleOutputChangeSelector, DummySPKAssigner),
+            &ChangeStrategy::new(SingleOutputChangeSelector, DummyChangeCosts),
         )
     }
 
