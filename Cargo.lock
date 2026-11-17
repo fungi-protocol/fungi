@@ -1100,6 +1100,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fungi-bip77-directory"
+version = "0.0.0"
+dependencies = [
+ "bech32",
+ "fungi-mailboxes",
+ "thiserror 2.0.20",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "fungi-core"
 version = "0.0.0"
 dependencies = [
