@@ -169,6 +169,15 @@ checksum = "32637268377fc7b10a8c6d51de3e7fba1ce5dd371a96e342b34e6078db558e7f"
 
 [[package]]
 name = "bhttp"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16fc24bc615b9fd63148f59b218ea58a444b55762f8845da910e23aca686398b"
+dependencies = [
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "bhttp"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9d305a54bcb99974213b4c78a486c34091e83c5d6d6572f7f4331c904ea9d127"
@@ -1104,7 +1113,10 @@ name = "fungi-bip77-directory"
 version = "0.0.0"
 dependencies = [
  "bech32",
+ "bhttp 0.6.1",
+ "bitcoin-ohttp",
  "fungi-mailboxes",
+ "rand 0.8.8",
  "thiserror 2.0.20",
  "tokio",
  "url",
@@ -1136,7 +1148,7 @@ name = "fungi-ohttp"
 version = "0.0.0"
 dependencies = [
  "bech32",
- "bhttp",
+ "bhttp 0.7.2",
  "bitcoin-ohttp",
  "ohttp-client",
  "thiserror 2.0.20",
@@ -1861,7 +1873,7 @@ version = "0.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4968faff1e25fa5790bc3f68dc81cff9d09ca9245729fb069b1e59c698ccbd2b"
 dependencies = [
- "bhttp",
+ "bhttp 0.7.2",
  "bitcoin-ohttp",
  "getrandom 0.3.4",
  "ohttp",
