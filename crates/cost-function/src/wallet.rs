@@ -4,12 +4,16 @@ use bitcoin::{Amount, FeeRate, OutPoint, TxOut, Weight};
 use rand::RngCore;
 use std::collections::{BTreeMap, HashSet};
 
-use crate::action::{Action, UnSequencedActions};
+use crate::action::Action;
+use crate::candidate::Candidate;
+use crate::change::single_output::SingleOutputChangeSelector;
 use crate::change::{ChangeCosts, ChangeSelector, ChangeStrategy};
 use crate::decision_space::DecisionSpace;
 use crate::decision_tree::TreeNode;
 use crate::intent::Intent;
 use crate::queue::Queue;
+pub use crate::selection::random::RandomSelectionError as FundingError;
+use crate::selection::random::RandomSelector;
 use crate::selection::{CoinSelector, FundingRequest};
 
 /// A coin the wallet can spend.
@@ -21,6 +25,13 @@ pub struct Utxo {
 }
 
 impl Utxo {
+    pub fn outpoint(&self) -> OutPoint {
+        self.outpoint
+    }
+    pub fn value(&self) -> Amount {
+        self.value
+    }
+
     /// `satisfaction_weight` is the weight of the scriptSig and witness that spend this
     /// coin, excluding the outpoint and nsequence.
     pub fn new(outpoint: OutPoint, value: Amount, satisfaction_weight: Weight) -> Self {
@@ -54,19 +65,33 @@ impl<Q: Queue, U: UtxoSnapshot> WalletStateSnapshot<Q, U> {
         }
     }
 
-    /// The actions that realize the queue: funded by `selector`, with change from
-    /// `change_strategy`. `None` if the queue is empty.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "no driver loop asks for a plan yet")
-    )]
-    pub(crate) fn best_plan<S, C, A, R>(
+    /// Fund the queue once using random coin selection and one change output.
+    /// This is the single-outcome entry point, not a search for an optimal plan.
+    pub fn funded_candidate<C: ChangeCosts, R: RngCore>(
+        &self,
+        feerate: FeeRate,
+        rng: &mut R,
+        costs: &C,
+    ) -> Result<Option<Candidate<Q::Id>>, FundingError> {
+        match self.fund_with(
+            feerate,
+            &RandomSelector,
+            rng,
+            &ChangeStrategy::new(SingleOutputChangeSelector, costs),
+        ) {
+            Ok(candidate) => Ok(candidate),
+            Err(PlanError::Selection(error)) => Err(error),
+            Err(PlanError::Change(never)) => match never {},
+        }
+    }
+
+    fn fund_with<S, C, A, R>(
         &self,
         feerate: FeeRate,
         selector: &S,
         rng: &mut R,
         change_strategy: &ChangeStrategy<C, A>,
-    ) -> PlanResult<S::Error, C::Error>
+    ) -> CandidateResult<Q::Id, S::Error, C::Error>
     where
         S: CoinSelector,
         C: ChangeSelector,
@@ -122,12 +147,25 @@ impl<Q: Queue, U: UtxoSnapshot> WalletStateSnapshot<Q, U> {
             .0
             .extend(change.into_iter().map(Action::RegisterChangeOutPut));
 
-        Ok(Some(actions))
+        let payments = batch
+            .intents
+            .iter()
+            .map(|id| (*id, intents[id].payment_output()))
+            .collect();
+        let payoffs = batch
+            .intents
+            .iter()
+            .map(|id| intents[id].payoff_curve.clone())
+            .collect();
+        Ok(Some(Candidate {
+            actions,
+            payments,
+            payoffs,
+        }))
     }
 }
 
-/// The actions of the best plan, `None` if there is nothing to do.
-pub(crate) type PlanResult<S, C> = Result<Option<UnSequencedActions>, PlanError<S, C>>;
+type CandidateResult<I, S, C> = Result<Option<Candidate<I>>, PlanError<S, C>>;
 
 /// Why a plan could not be built.
 #[derive(Debug, PartialEq, Eq)]
@@ -140,18 +178,15 @@ pub(crate) enum PlanError<S, C> {
 
 #[cfg(test)]
 mod tests {
-    use crate::action::Action;
+    use crate::action::{Action, UnSequencedActions};
     use crate::change::OutputWithoutScriptpubkey;
-    use crate::change::single_output::SingleOutputChangeSelector;
     use crate::change::tests::DummyChangeCosts;
     use crate::intent::{FixedPaymentInstructions, Outcome, PayoffCurve};
     use crate::queue::InMemoryQueue;
-    use crate::selection::random::{RandomSelectionError, RandomSelector};
 
     use super::*;
     use bitcoin::{ScriptBuf, Txid, hashes::Hash};
     use rand::{SeedableRng, rngs::StdRng};
-    use std::convert::Infallible;
     use std::time::Instant;
 
     fn utxo(vout: u32, sats: u64) -> Utxo {
@@ -179,18 +214,20 @@ mod tests {
         }
     }
 
-    type Plan = PlanResult<RandomSelectionError, Infallible>;
-
-    fn best_plan(utxos: impl IntoIterator<Item = Utxo>, intents: &[u64]) -> Plan {
+    fn best_plan(
+        utxos: impl IntoIterator<Item = Utxo>,
+        intents: &[u64],
+    ) -> Result<Option<UnSequencedActions>, FundingError> {
         let start = Instant::now();
         let queue = InMemoryQueue::new(intents.iter().map(|&sats| intent(start, sats)));
 
-        WalletStateSnapshot::new(DummyUtxoSnapshot(utxos.into_iter().collect()), queue).best_plan(
-            FeeRate::from_sat_per_vb(1).unwrap(),
-            &RandomSelector,
-            &mut StdRng::seed_from_u64(0),
-            &ChangeStrategy::new(SingleOutputChangeSelector, DummyChangeCosts),
-        )
+        WalletStateSnapshot::new(DummyUtxoSnapshot(utxos.into_iter().collect()), queue)
+            .funded_candidate(
+                FeeRate::from_sat_per_vb(1).unwrap(),
+                &mut StdRng::seed_from_u64(0),
+                &DummyChangeCosts,
+            )
+            .map(|candidate| candidate.map(|candidate| candidate.actions))
     }
 
     fn op_true_output(sats: u64) -> TxOut {
@@ -230,9 +267,7 @@ mod tests {
     fn a_plan_the_coins_cannot_fund_is_an_error() {
         assert_eq!(
             best_plan([utxo(0, 1_000)], &[1_000]),
-            Err(PlanError::Selection(
-                RandomSelectionError::NoCombinationCovers
-            ))
+            Err(FundingError::NoCombinationCovers)
         );
     }
 
@@ -241,9 +276,7 @@ mod tests {
         // Counted twice, coin 0 would cover the payment; counted once, it cannot.
         assert_eq!(
             best_plan([utxo(0, 1_000), utxo(1, 10), utxo(0, 1_000)], &[1_500]),
-            Err(PlanError::Selection(
-                RandomSelectionError::NoCombinationCovers
-            ))
+            Err(FundingError::NoCombinationCovers)
         );
     }
 }
