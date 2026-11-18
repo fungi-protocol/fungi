@@ -748,3 +748,157 @@ fn duplicate_signer_capabilities_are_rejected() {
     );
     assert!(matches!(result, Err(err) if err.0.contains("duplicate signer")));
 }
+
+const BATCH_RAMPS: [u64; 2] = [10 * SLOTS_PER_SECOND, 100 * SLOTS_PER_SECOND];
+const BATCH_PEAK_PAYOFF: Amount = Amount::from_sat(20_000);
+
+fn split_fixture(now: Instant, funded: bool) -> Wallet {
+    let mut snapshot = fixture(now, 1, true, true).snapshot().clone();
+    if funded {
+        snapshot
+            .coins
+            .extend(fixture(now, 2, true, true).snapshot().coins.clone());
+    }
+    let grid = ScheduleGrid::new(now);
+    let intents = BATCH_RAMPS.map(|slots| {
+        Intent::new(
+            Outcome::OutputCreation(FixedPaymentInstructions {
+                script_pubkey: script(2),
+                amount: Amount::from_sat(10_000),
+            }),
+            PayoffCurve::new(0, [(slots, BATCH_PEAK_PAYOFF)]).unwrap(),
+        )
+    });
+    State::new(
+        InMemoryQueue::new(intents),
+        snapshot,
+        FeeRate::from_sat_per_vb(2).unwrap(),
+        [1; 16],
+        dummy::Change::new(script(3), Weight::from_wu(70), []),
+        StdRng::seed_from_u64(0),
+        grid,
+    )
+}
+
+#[test]
+fn joint_outcome_readiness_uses_all_batches_without_reserving_wallet_coins() {
+    let now = Instant::now();
+    let mut state = split_fixture(now, true)
+        .with_batches(vec![vec![0], vec![1]])
+        .unwrap();
+    let next = schedule(state.decide(now)).expect("expected a jointly funded candidate");
+    assert_eq!(state.transactions().len(), 2);
+    let spent: Vec<_> = state
+        .transactions()
+        .values()
+        .flat_map(|tx| tx.candidate().inputs().map(|coin| coin.outpoint()))
+        .collect();
+    assert_eq!(spent.len(), 2);
+    assert_ne!(spent[0], spent[1]);
+    assert!(
+        spent
+            .iter()
+            .all(|coin| state.snapshot().coins.contains_key(coin))
+    );
+    assert_eq!(state.pending().iter().count(), 2);
+
+    let cost_sats = state
+        .transactions()
+        .values()
+        .map(|tx| tx.candidate().objective_cost().unwrap().to_sat())
+        .sum::<i64>();
+    let elapsed = next.at - now;
+    assert!(
+        elapsed
+            .subsec_nanos()
+            .is_multiple_of(ScheduleGrid::JIFFY.subsec_nanos())
+    );
+
+    // Both payoffs are still on their rising segments. For t microseconds
+    // their sum is peak * t * (1 / short + 1 / long). Cross-multiply to
+    // locate the first strictly favorable tick using integers.
+    let [short, long] =
+        BATCH_RAMPS.map(|slots| u128::from(slots) * ScheduleGrid::AUTHORED_STEP.as_micros());
+    let scaled_cost = u128::try_from(cost_sats).unwrap() * short * long;
+    let payoff_per_tick = u128::from(BATCH_PEAK_PAYOFF.to_sat()) * (short + long);
+    let tick = elapsed.as_micros();
+    assert!(tick > 0 && tick <= short);
+    assert!((tick - 1) * payoff_per_tick <= scaled_cost);
+    assert!(scaled_cost < tick * payoff_per_tick);
+}
+
+#[test]
+fn actions_after_start_inherit_the_complete_outcomes_readiness() {
+    let now = Instant::now();
+    let grid = ScheduleGrid::new(now);
+    let mut state = split_fixture(now, true)
+        .with_batches(vec![vec![1], vec![0]])
+        .unwrap();
+    let start = schedule(state.decide(now)).unwrap();
+    let execution = start.action.id().0;
+    assert_eq!(start.action.action, Action::Start);
+    let candidate = state.transactions()[&execution].candidate();
+    assert!(candidate.ready_at(start.at, grid).unwrap() > start.at);
+
+    state.apply(start.action);
+    state.completed((execution, Action::Start), Ok(Update::Applied));
+
+    let next = schedule(state.decide(start.at)).unwrap();
+    assert_eq!(next.at, start.at);
+    assert_eq!(next.action.id(), (execution, Action::Input(0)));
+}
+
+#[test]
+fn a_partial_funding_does_not_admit_an_incomplete_outcome() {
+    let now = Instant::now();
+    let mut state = split_fixture(now, false)
+        .with_batches(vec![vec![0], vec![1]])
+        .unwrap();
+    assert!(matches!(state.decide(now), Decision::Wait));
+    assert!(state.transactions().is_empty());
+    assert_eq!(state.planning_errors().len(), 1);
+    assert_eq!(state.snapshot().coins.len(), 1);
+    assert_eq!(state.pending().iter().count(), 2);
+}
+
+#[test]
+fn initial_batches_reject_repeated_unknown_and_empty_allocations() {
+    let now = Instant::now();
+    for batches in [
+        vec![vec![0], vec![0]],
+        vec![vec![0, 0]],
+        vec![vec![9]],
+        vec![vec![]],
+    ] {
+        assert!(split_fixture(now, true).with_batches(batches).is_err());
+    }
+}
+
+#[test]
+fn evaluated_batches_cannot_be_reassigned() {
+    let now = Instant::now();
+    let mut state = split_fixture(now, true);
+    let _decision = state.decide(now);
+    assert!(state.with_batches(vec![vec![0], vec![1]]).is_err());
+}
+
+#[test]
+fn invalidation_identifies_which_batch_lost_its_assumptions() {
+    let now = Instant::now();
+    let mut state = split_fixture(now, true)
+        .with_batches(vec![vec![0], vec![1]])
+        .unwrap();
+    let _decision = state.decide(now);
+    let ids: Vec<_> = state.transactions().keys().copied().collect();
+    assert_eq!(ids.len(), 2);
+    state.observe(Observation::TransactionInvalidated(
+        ids[1],
+        "input spent".into(),
+    ));
+    assert_eq!(state.transactions()[&ids[0]].status(), &Status::Running);
+    assert!(
+        matches!(state.transactions()[&ids[1]].status(), Status::Failed(err) if err.0 == "input spent")
+    );
+    assert!(matches!(state.decide(now), Decision::Wait));
+    assert_eq!(state.pending().iter().count(), 2);
+}
