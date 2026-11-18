@@ -9,6 +9,10 @@ pub(super) struct Path(BTreeMap<Action, Vec<Action>>);
 impl Path {
     pub fn new(outcome: &Candidate<u64>) -> Self {
         let inputs: Vec<_> = (0..outcome.inputs().count()).map(Action::Input).collect();
+        let payments = outcome.payments().count();
+        let outputs: Vec<_> = (0..payments + outcome.change().count())
+            .map(Action::Output)
+            .collect();
         let mut actions = BTreeMap::from([(Action::Start, vec![])]);
         for input in &inputs {
             actions.insert(input.clone(), vec![Action::Start]);
@@ -16,6 +20,20 @@ impl Path {
         actions.insert(
             Action::CloseInputs,
             inputs.into_iter().chain([Action::Start]).collect(),
+        );
+        for i in 0..payments {
+            actions.insert(Action::Output(i), vec![Action::CloseInputs]);
+        }
+        for i in 0..outcome.change().count() {
+            actions.insert(Action::AllocateChange(i), vec![Action::CloseInputs]);
+            actions.insert(
+                Action::Output(payments + i),
+                vec![Action::AllocateChange(i)],
+            );
+        }
+        actions.insert(
+            Action::CloseOutputs,
+            outputs.into_iter().chain([Action::CloseInputs]).collect(),
         );
         Self(actions)
     }
