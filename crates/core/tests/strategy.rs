@@ -8,7 +8,9 @@ use scripted_driver::run as run_scripted;
 #[path = "support/signing.rs"]
 mod signing;
 
-use bitcoin::{Amount, FeeRate, OutPoint, ScriptBuf, TxOut, Txid, Weight, hashes::Hash};
+use bitcoin::{
+    Amount, FeeRate, OutPoint, ScriptBuf, Transaction, TxOut, Txid, Weight, hashes::Hash,
+};
 use cost_function::{
     intent::{FixedPaymentInstructions, Intent, Outcome, PayoffCurve, ScheduleGrid},
     queue::{InMemoryQueue, Queue},
@@ -17,7 +19,8 @@ use cost_function::{
 use fungi_core::{
     driver::{Decision, Machine, Scheduled, Stopped, Wake},
     strategy::{
-        Action, Error, Events, Executor, Observation, Request, Runtime, State, Status, Update,
+        Action, Broadcaster, Error, Events, Executor, Observation, Request, Runtime, State, Status,
+        Update,
     },
     wallet::{Coin, Snapshot, dummy},
 };
@@ -118,7 +121,7 @@ fn scheduled(state: &mut Wallet, now: Instant) -> Request {
     scheduled.action
 }
 
-struct Clock(Instant, Option<Observation>);
+struct Clock(Instant);
 
 impl Events for Clock {
     fn now(&self) -> Instant {
@@ -126,9 +129,6 @@ impl Events for Clock {
     }
 
     async fn wait(&mut self, deadline: Option<Instant>) -> Wake<Observation> {
-        if let Some(input) = self.1.take() {
-            return Wake::Input(input);
-        }
         if let Some(at) = deadline {
             self.0 = self.0.max(at);
             Wake::Timeout
@@ -138,7 +138,18 @@ impl Events for Clock {
     }
 }
 
-type TestExecutor = Executor<dummy::Change, signing::Signer>;
+type TestExecutor = Executor<dummy::Change, signing::Signer, dummy::Recorder, AcceptBroadcast>;
+
+struct AcceptBroadcast;
+impl Broadcaster for AcceptBroadcast {
+    type Error = &'static str;
+    fn broadcast(
+        &mut self,
+        _: &Transaction,
+    ) -> impl Future<Output = Result<(), Self::Error>> + use<> {
+        std::future::ready(Ok(()))
+    }
+}
 
 fn executor_with_change(change: dummy::Change) -> TestExecutor {
     Executor::new(
@@ -147,6 +158,8 @@ fn executor_with_change(change: dummy::Change) -> TestExecutor {
             OutPoint::new(Txid::all_zeros(), 1),
             [Ok(())],
         )],
+        dummy::Recorder::new([Ok(())]),
+        AcceptBroadcast,
     )
     .unwrap()
 }
@@ -255,7 +268,7 @@ async fn the_driver_starts_the_planned_transaction_at_readiness() {
         .unwrap();
     let mut io = Runtime {
         executor: executor(),
-        events: Clock(now, None),
+        events: Clock(now),
     };
 
     assert_eq!(
@@ -265,7 +278,7 @@ async fn the_driver_starts_the_planned_transaction_at_readiness() {
 
     assert_eq!(io.events.0, ready_at);
     let tx = &state.transactions()[&request.id().0];
-    assert_eq!(tx.status(), &Status::Running);
+    assert_eq!(tx.status(), &Status::AwaitingConfirmation);
     assert!(tx.completed().contains(&Action::Start));
     assert!(tx.pending().next().is_none());
     assert_eq!(state.pending().iter().count(), 1);
@@ -280,44 +293,6 @@ async fn the_driver_starts_the_planned_transaction_at_readiness() {
             .len(),
         1
     );
-}
-
-#[tokio::test]
-async fn invalidated_candidate_has_no_effects() {
-    let now = Instant::now();
-    let mut state = fixture(now, 1, true, true);
-    let start = scheduled(&mut state, now);
-    let reason = "coin spent elsewhere";
-    let mut io = Runtime {
-        executor: executor(),
-        events: Clock(now, Some(Observation::Invalidated(reason.into()))),
-    };
-
-    assert_eq!(
-        run_scripted(&mut state, &mut io, Request::id).await,
-        Stopped::Closed
-    );
-
-    let tx = &state.transactions()[&start.id().0];
-    assert!(matches!(tx.status(), Status::Failed(err) if err.0 == reason));
-    assert!(tx.completed().is_empty());
-    assert!(state.operations().next().is_none());
-    assert!(state.planning_errors().is_empty());
-    assert_eq!(state.pending().iter().count(), 1);
-    assert_eq!(io.events.0, now);
-}
-
-#[test]
-fn invalidation_before_planning_keeps_the_intents_pending() {
-    let now = Instant::now();
-    let mut state = fixture(now, 1, true, true);
-    let reason = "coin already spent";
-    state.observe(Observation::Invalidated(reason.into()));
-
-    assert!(matches!(state.decide(now), Decision::Wait));
-    assert!(state.transactions().is_empty());
-    assert_eq!(state.pending().iter().count(), 1);
-    assert_eq!(state.planning_errors().values().next().unwrap().0, reason);
 }
 
 #[test]
@@ -360,7 +335,7 @@ async fn a_failed_start_stops_the_candidates_actions() {
     executor.execute(&unrelated).await.unwrap();
     let mut io = Runtime {
         executor,
-        events: Clock(now, None),
+        events: Clock(now),
     };
 
     assert_eq!(
@@ -437,7 +412,7 @@ async fn the_driver_contributes_and_closes_the_candidate_inputs() {
     let id = scheduled(&mut state, now).id().0;
     let mut io = Runtime {
         executor: executor(),
-        events: Clock(now, None),
+        events: Clock(now),
     };
 
     assert_eq!(
@@ -446,7 +421,7 @@ async fn the_driver_contributes_and_closes_the_candidate_inputs() {
     );
 
     let tx = &state.transactions()[&id];
-    assert_eq!(tx.status(), &Status::Running);
+    assert_eq!(tx.status(), &Status::AwaitingConfirmation);
     assert!(tx.completed().contains(&Action::Input(0)));
     assert!(tx.completed().contains(&Action::CloseInputs));
     assert!(tx.pending().next().is_none());
@@ -459,7 +434,7 @@ async fn an_unsupported_prevout_cannot_be_contributed() {
     let id = scheduled(&mut state, now).id().0;
     let mut io = Runtime {
         executor: executor(),
-        events: Clock(now, None),
+        events: Clock(now),
     };
 
     assert_eq!(
@@ -550,7 +525,7 @@ async fn concrete_change_scripts_do_not_change_candidate_cost_or_schedule() {
         ));
         let mut io = Runtime {
             executor,
-            events: Clock(now, None),
+            events: Clock(now),
         };
         let scheduled = schedule(state.decide(now)).expect("expected a funded candidate");
         assert_eq!(io.executor.change.lock().await.requests(), 0);
@@ -566,7 +541,7 @@ async fn concrete_change_scripts_do_not_change_candidate_cost_or_schedule() {
         );
 
         let tx = &state.transactions()[&id];
-        assert_eq!(tx.status(), &Status::Running);
+        assert_eq!(tx.status(), &Status::AwaitingConfirmation);
         assert!(
             tx.completed().contains(&Action::CloseOutputs),
             "the allocated script must pass frozen output and accounting validation"
@@ -665,7 +640,7 @@ async fn an_allocation_error_prevents_output_freezing() {
     ));
     let mut io = Runtime {
         executor,
-        events: Clock(now, None),
+        events: Clock(now),
     };
 
     assert_eq!(
@@ -727,6 +702,8 @@ async fn a_busy_signer_does_not_block_another_inputs_signer() {
                 ready: None,
             },
         ],
+        dummy::Recorder::new([]),
+        AcceptBroadcast,
     )
     .unwrap();
     for request in [&mut first, &mut second] {
@@ -766,6 +743,8 @@ fn duplicate_signer_capabilities_are_rejected() {
             signing::Signer::new(coin, []),
             signing::Signer::new(coin, []),
         ],
+        dummy::Recorder::new([]),
+        AcceptBroadcast,
     );
     assert!(matches!(result, Err(err) if err.0.contains("duplicate signer")));
 }

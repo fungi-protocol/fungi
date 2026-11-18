@@ -46,6 +46,8 @@ impl Path {
                 .chain([Action::CloseOutputs])
                 .collect(),
         );
+        actions.insert(Action::Record, vec![Action::Finalize]);
+        actions.insert(Action::Publish, vec![Action::Record]);
         Self(actions)
     }
 

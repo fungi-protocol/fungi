@@ -52,6 +52,8 @@ pub(super) enum Effect {
         outpoint: OutPoint,
         psbt: Psbt,
     },
+    Record(bitcoin::Transaction),
+    Publish(bitcoin::Transaction),
 }
 
 pub(super) struct Execution {
@@ -249,10 +251,17 @@ impl Execution {
                 self.results.insert(Action::Finalize, result.clone());
                 return Ok(Effect::Complete(result));
             }
+            Action::Record => {
+                return Ok(Effect::Record(self.finalized_transaction()?.clone()));
+            }
+            Action::Publish => {
+                if !self.results.contains_key(&Action::Record) {
+                    return Err(error("transaction has not been retained"));
+                }
+                return Ok(Effect::Publish(self.finalized_transaction()?.clone()));
+            }
         }
-        let result = Update::Applied;
-        self.results.insert(action.clone(), result.clone());
-        Ok(Effect::Complete(result))
+        Ok(Effect::Complete(self.applied(action.clone())))
     }
 
     pub(super) fn complete_change(
@@ -280,6 +289,18 @@ impl Execution {
         signing::apply(psbt, snapshot, position, signed)?;
         self.results.insert(Action::Sign(index), Update::Applied);
         Ok(Update::Applied)
+    }
+
+    pub(super) fn applied(&mut self, action: Action) -> Update {
+        self.results.insert(action, Update::Applied);
+        Update::Applied
+    }
+
+    fn finalized_transaction(&self) -> Result<&bitcoin::Transaction, Error> {
+        match self.results.get(&Action::Finalize) {
+            Some(Update::Finalized(payment)) => Ok(&payment.transaction),
+            _ => Err(error("transaction is not finalized")),
+        }
     }
 
     fn active(&self) -> Result<&psbt_v2::v2::Psbt, Error> {

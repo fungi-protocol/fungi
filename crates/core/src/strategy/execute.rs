@@ -5,13 +5,21 @@ use super::{
     construction::{Effect, Execution},
     error,
 };
-use crate::wallet::{ChangeSource, InputSigner};
-use bitcoin::OutPoint;
+use crate::wallet::{ChangeSource, InputSigner, TransactionRecorder};
+use bitcoin::{OutPoint, Transaction};
 use futures::lock::Mutex;
 use std::{
     collections::{BTreeMap, btree_map::Entry},
     sync::Arc,
 };
+
+pub trait Broadcaster {
+    type Error: std::fmt::Display;
+    fn broadcast(
+        &mut self,
+        transaction: &Transaction,
+    ) -> impl Future<Output = Result<(), Self::Error>> + use<Self>;
+}
 
 type Executions = BTreeMap<ExecutionId, Arc<Mutex<Execution>>>;
 
@@ -43,14 +51,16 @@ impl<S: InputSigner> Signers<S> {
 }
 
 /// Capabilities are independent of candidates; a Start request binds an execution.
-pub struct Executor<C, S> {
+pub struct Executor<C, S, R, B> {
     pub change: Arc<Mutex<C>>,
     pub signers: Arc<Signers<S>>,
+    pub recorder: Arc<Mutex<R>>,
+    pub broadcaster: Arc<Mutex<B>>,
     transactions: Arc<std::sync::Mutex<Executions>>,
 }
 
-impl<C: ChangeSource, S: InputSigner> Executor<C, S> {
-    pub fn new(change: C, signers: Vec<S>) -> Result<Self, Error> {
+impl<C: ChangeSource, S: InputSigner, R: TransactionRecorder, B: Broadcaster> Executor<C, S, R, B> {
+    pub fn new(change: C, signers: Vec<S>, recorder: R, broadcaster: B) -> Result<Self, Error> {
         let registered = Arc::new(Signers(std::sync::Mutex::default()));
         for signer in signers {
             registered
@@ -60,6 +70,8 @@ impl<C: ChangeSource, S: InputSigner> Executor<C, S> {
         Ok(Self {
             change: Arc::new(Mutex::new(change)),
             signers: registered,
+            recorder: Arc::new(Mutex::new(recorder)),
+            broadcaster: Arc::new(Mutex::new(broadcaster)),
             transactions: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
         })
     }
@@ -121,15 +133,27 @@ impl<C: ChangeSource, S: InputSigner> Executor<C, S> {
                     .await
                     .complete_sign(index, position, signed)
             }
+            Effect::Record(transaction) => {
+                let io = self.recorder.lock().await.record(&transaction);
+                io.await.map_err(error)?;
+                Ok(execution.lock().await.applied(Action::Record))
+            }
+            Effect::Publish(transaction) => {
+                let io = self.broadcaster.lock().await.broadcast(&transaction);
+                io.await.map_err(error)?;
+                Ok(execution.lock().await.applied(Action::Publish))
+            }
         }
     }
 }
 
-impl<C, S> Clone for Executor<C, S> {
+impl<C, S, R, B> Clone for Executor<C, S, R, B> {
     fn clone(&self) -> Self {
         Self {
             change: self.change.clone(),
             signers: self.signers.clone(),
+            recorder: self.recorder.clone(),
+            broadcaster: self.broadcaster.clone(),
             transactions: self.transactions.clone(),
         }
     }
