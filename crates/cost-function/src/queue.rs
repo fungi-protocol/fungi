@@ -63,19 +63,14 @@ mod tests {
     use crate::intent::{FixedPaymentInstructions, Outcome, PayoffCurve};
     use bitcoin::{Amount, ScriptBuf};
     use std::collections::HashSet;
-    use std::time::{Duration, Instant};
 
-    /// Built from an explicit `start` so two calls with the same arguments compare equal.
-    fn intent(start: Instant, sats: u64) -> Intent {
+    fn intent(sats: u64) -> Intent {
         Intent::new(
             Outcome::OutputCreation(FixedPaymentInstructions {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
                 amount: Amount::from_sat(sats),
             }),
-            PayoffCurve::new(
-                start,
-                vec![(Duration::from_secs(60), Amount::from_sat(sats))],
-            ),
+            PayoffCurve::new(0, vec![(600_000, Amount::from_sat(sats))]).unwrap(),
         )
     }
 
@@ -88,9 +83,8 @@ mod tests {
 
     #[test]
     fn every_intent_is_yielded_under_its_own_id() {
-        let start = Instant::now();
-        let mut queue = InMemoryQueue::new([intent(start, 1), intent(start, 2)]);
-        let pushed = queue.push(intent(start, 3));
+        let mut queue = InMemoryQueue::new([intent(1), intent(2)]);
+        let pushed = queue.push(intent(3));
 
         let ids: HashSet<u64> = queue.iter().map(|(id, _)| id).collect();
 
@@ -100,7 +94,7 @@ mod tests {
                 .iter()
                 .find(|&(id, _)| id == pushed)
                 .map(|(_, held)| held),
-            Some(&intent(start, 3))
+            Some(&intent(3))
         );
         assert_eq!(queue.clone(), queue);
     }
