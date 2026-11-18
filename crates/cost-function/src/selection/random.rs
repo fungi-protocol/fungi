@@ -70,9 +70,9 @@ fn worth<'a>(coins: impl Iterator<Item = &'a Utxo>, feerate: FeeRate) -> SignedA
     })
 }
 
-/// Why a [`RandomSelector`] could not fund a request.
+/// Why coin selection could not fund a request.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum RandomSelectionError {
+pub enum RandomSelectionError {
     /// The coins on offer don't cover the deficit.
     NoCombinationCovers,
 }

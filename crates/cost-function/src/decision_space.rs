@@ -34,7 +34,6 @@ mod tests {
     use crate::intent::{FixedPaymentInstructions, Intent, Outcome, PayoffCurve};
     use crate::queue::InMemoryQueue;
     use bitcoin::{Amount, ScriptBuf};
-    use std::time::Instant;
 
     fn intent(sats: u64) -> Intent {
         Intent::new(
@@ -42,7 +41,7 @@ mod tests {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
                 amount: Amount::from_sat(sats),
             }),
-            PayoffCurve::new(Instant::now(), vec![]),
+            PayoffCurve::new(0, vec![]).unwrap(),
         )
     }
 

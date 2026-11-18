@@ -31,6 +31,9 @@
                 buildPhaseCargoCommand = "cargo mutants --manifest-path ${pkgs.lib.escapeShellArg "./${cargoWorkspace.cargoManifestPath}"} --workspace --in-place --test-tool nextest";
                 installPhase = "mkdir -p $out";
               }
+              // pkgs.lib.optionalAttrs (cargoWorkspace.manifestPath == "Cargo.toml") {
+                BITCOIND = pkgs.lib.getExe' pkgs.bitcoind "bitcoind";
+              }
             )
           );
     };

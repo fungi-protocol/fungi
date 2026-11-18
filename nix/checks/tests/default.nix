@@ -30,6 +30,9 @@
               unzip -tqq "$out/nextest-run.zip"
             '';
           }
+          // pkgs.lib.optionalAttrs (cargoWorkspace.manifestPath == "Cargo.toml") {
+            BITCOIND = pkgs.lib.getExe' pkgs.bitcoind "bitcoind";
+          }
         );
       # nextest does not run doctests; cargo test --doc does.
       mkDocTest =
