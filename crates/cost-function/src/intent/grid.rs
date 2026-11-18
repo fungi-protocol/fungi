@@ -27,4 +27,12 @@ impl ScheduleGrid {
             (nanos % 1_000_000_000) as u32,
         )
     }
+
+    /// The first decision jiffy at or after `at`, starting at the grid origin.
+    pub(super) fn ceil(self, at: Instant) -> Option<Instant> {
+        let at = at.max(self.origin);
+        let nanos = (at - self.origin).subsec_nanos();
+        let padding = nanos.next_multiple_of(Self::JIFFY.subsec_nanos()) - nanos;
+        at.checked_add(Duration::from_nanos(padding.into()))
+    }
 }
