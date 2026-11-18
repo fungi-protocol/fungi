@@ -522,6 +522,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
+name = "concurrent-psbt"
+version = "0.1.0"
+source = "git+https://github.com/fungi-protocol/concurrent-psbt/?rev=7bf09f4e6b89b38a14504a0a67f03a7c93d590ca#7bf09f4e6b89b38a14504a0a67f03a7c93d590ca"
+dependencies = [
+ "bitcoin",
+ "pastey",
+ "psbt-v2",
+ "rand 0.9.5",
+]
+
+[[package]]
 name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1182,8 +1193,11 @@ name = "fungi-core"
 version = "0.0.0"
 dependencies = [
  "bitcoin",
+ "concurrent-psbt",
  "cost-function",
  "futures",
+ "psbt-v2",
+ "rand 0.9.5",
  "thiserror 2.0.20",
  "tokio",
 ]
@@ -1823,6 +1837,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
+name = "miniscript"
+version = "12.3.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06a2f93613888f7d069f00cb94f83dab82f01f78a50c9935814a2547fa30ceba"
+dependencies = [
+ "bech32",
+ "bitcoin",
+]
+
+[[package]]
 name = "ml-kem"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2054,6 +2078,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
+name = "pastey"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
+
+[[package]]
 name = "pem-rfc7468"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2257,6 +2287,16 @@ dependencies = [
  "rusty-fork",
  "tempfile",
  "unarray",
+]
+
+[[package]]
+name = "psbt-v2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e075616cae99e29d70960a6374c2757dff4dd6b646dd0398ce1012666231c7aa"
+dependencies = [
+ "bitcoin",
+ "miniscript",
 ]
 
 [[package]]

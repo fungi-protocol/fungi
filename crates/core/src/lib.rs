@@ -2,4 +2,5 @@
 
 pub mod driver;
 pub mod persist;
+pub mod strategy;
 pub mod wallet;
