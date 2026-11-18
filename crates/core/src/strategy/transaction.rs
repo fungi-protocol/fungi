@@ -19,7 +19,7 @@ pub struct Transaction {
 impl Transaction {
     pub(super) fn new(plan: Arc<Plan>) -> Self {
         Self {
-            path: Path::new(),
+            path: Path::new(&plan.candidate),
             plan,
             status: Status::Running,
             completed: BTreeSet::new(),

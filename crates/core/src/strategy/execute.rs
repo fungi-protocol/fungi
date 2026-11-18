@@ -1,6 +1,6 @@
 //! Wallet capabilities shared by transaction-specific executions.
 
-use super::{Error, ExecutionId, Request, Update, construction::Execution, error};
+use super::{Action, Error, ExecutionId, Request, Update, construction::Execution, error};
 use futures::lock::Mutex;
 use std::{
     collections::{BTreeMap, btree_map::Entry},
@@ -20,9 +20,14 @@ impl Executor {
         let execution = {
             let mut transactions = self.transactions.lock().unwrap();
             match transactions.entry(request.plan.execution_id) {
-                Entry::Vacant(entry) => entry
-                    .insert(Arc::new(Mutex::new(Execution::new(request.plan.clone()))))
-                    .clone(),
+                Entry::Vacant(entry) => {
+                    if request.action != Action::Start {
+                        return Err(error("transaction construction has not started"));
+                    }
+                    entry
+                        .insert(Arc::new(Mutex::new(Execution::new(request.plan.clone())?)))
+                        .clone()
+                }
                 Entry::Occupied(entry) => entry.get().clone(),
             }
         };
@@ -30,6 +35,6 @@ impl Executor {
         if !Arc::ptr_eq(&state.plan, &request.plan) {
             return Err(error("execution belongs to a different candidate"));
         }
-        state.start()
+        state.execute(&request.action)
     }
 }
