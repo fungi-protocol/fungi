@@ -7,7 +7,7 @@ use crate::{
     wallet::Snapshot,
 };
 use bitcoin::{
-    Amount, FeeRate,
+    Amount, FeeRate, Txid,
     hashes::{Hash, sha256},
 };
 use cost_function::{
@@ -19,7 +19,7 @@ use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
 mod construction;
 mod execute;
-pub use execute::{Executor, Signers};
+pub use execute::{Broadcaster, Executor, Signers};
 
 /// Local execution identity, independent of the shared construction-session UUID.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -47,6 +47,8 @@ pub enum Action {
     CloseOutputs,
     Sign(usize),
     Finalize,
+    Record,
+    Publish,
 }
 
 /// An action bound to the candidate evaluated by the decision process.
@@ -87,6 +89,7 @@ pub enum Update {
 
 #[derive(Clone)]
 pub enum Observation {
+    Confirmed(Txid),
     /// Stop this candidate when new information invalidates its assumptions.
     Invalidated(String),
 }
@@ -94,6 +97,8 @@ pub enum Observation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Status {
     Running,
+    AwaitingConfirmation,
+    Confirmed,
     Failed(Error),
 }
 
@@ -233,12 +238,20 @@ impl<C: ChangeCosts, R: RngCore> Machine for State<C, R> {
     fn completed(&mut self, id: OperationId, result: Self::Result) {
         if let Some(tx) = self.transactions.get_mut(&id.0) {
             tx.completed_operation(id, result);
+            if tx.completed().contains(&Action::Record) {
+                let payment = tx.payment().expect("recorded payment is finalized");
+                self.snapshot.recorded.insert(
+                    payment.transaction.compute_txid(),
+                    payment.transaction.clone(),
+                );
+            }
         }
     }
 
     fn observe(&mut self, input: Observation) {
-        if !self.planned {
-            let Observation::Invalidated(reason) = &input;
+        if !self.planned
+            && let Observation::Invalidated(reason) = &input
+        {
             self.planned = true;
             self.planning_errors.insert(
                 ExecutionId {
@@ -249,7 +262,18 @@ impl<C: ChangeCosts, R: RngCore> Machine for State<C, R> {
             );
         }
         for tx in self.transactions.values_mut() {
+            let was_confirmed = *tx.status() == Status::Confirmed;
             tx.observe(input.clone());
+            if !was_confirmed && *tx.status() == Status::Confirmed {
+                for id in tx
+                    .payment()
+                    .expect("confirmed transaction has a payment")
+                    .outputs
+                    .keys()
+                {
+                    self.pending.remove(*id);
+                }
+            }
         }
     }
 }

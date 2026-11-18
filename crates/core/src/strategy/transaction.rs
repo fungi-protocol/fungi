@@ -105,6 +105,9 @@ impl Transaction {
         };
         match result {
             Ok(()) => {
+                if action == Action::Publish && self.status == Status::Running {
+                    self.status = Status::AwaitingConfirmation;
+                }
                 self.completed.insert(action);
             }
             Err(err) => {
@@ -117,7 +120,19 @@ impl Transaction {
     }
 
     pub(super) fn observe(&mut self, input: Observation) {
-        let Observation::Invalidated(reason) = input;
-        self.status = Status::Failed(error(reason));
+        match input {
+            Observation::Confirmed(txid)
+                if self
+                    .payment
+                    .as_ref()
+                    .is_some_and(|p| p.transaction.compute_txid() == txid) =>
+            {
+                self.status = Status::Confirmed;
+            }
+            Observation::Invalidated(reason) if self.status != Status::Confirmed => {
+                self.status = Status::Failed(error(reason));
+            }
+            _ => {}
+        }
     }
 }

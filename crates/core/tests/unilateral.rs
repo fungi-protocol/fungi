@@ -1,4 +1,4 @@
-//! Deterministic signing and finalization exercise the driver.
+//! Deterministic signing and simulated chain observations exercise the driver.
 
 #[path = "support/scripted_driver.rs"]
 mod scripted_driver;
@@ -7,30 +7,68 @@ use scripted_driver::run as run_scripted;
 
 #[path = "support/signing.rs"]
 mod signing;
-use bitcoin::{Amount, FeeRate, OutPoint, ScriptBuf, TxOut, Txid, Weight, Witness, hashes::Hash};
+use bitcoin::{
+    Amount, FeeRate, OutPoint, ScriptBuf, Transaction, TxOut, Txid, Weight, Witness, hashes::Hash,
+};
 use cost_function::{
     intent::{FixedPaymentInstructions, Intent, Outcome, PayoffCurve, ScheduleGrid},
     queue::{InMemoryQueue, Queue},
 };
 use fungi_core::{
     driver::{Decision, Machine, Stopped, Wake},
-    strategy::{Action, Events, Executor, Observation, Request, Runtime, State, Status},
+    strategy::{
+        Action, Broadcaster, Events, Executor, Observation, Request, Runtime, State, Status,
+    },
     wallet::{Coin, Snapshot, dummy},
 };
 use rand::{SeedableRng, rngs::StdRng};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    sync::{Arc, Mutex},
     time::Instant,
 };
 
+type Inbox = Arc<Mutex<VecDeque<Observation>>>;
+struct Chain {
+    inbox: Inbox,
+    published: Vec<Transaction>,
+    fail: bool,
+    confirm: bool,
+}
+impl Broadcaster for Chain {
+    type Error = &'static str;
+    fn broadcast(
+        &mut self,
+        tx: &Transaction,
+    ) -> impl Future<Output = Result<(), Self::Error>> + use<> {
+        let result = (|| {
+            if self.fail {
+                return Err("scripted broadcast failure");
+            }
+            self.published.push(tx.clone());
+            if self.confirm {
+                self.inbox
+                    .lock()
+                    .unwrap()
+                    .push_back(Observation::Confirmed(tx.compute_txid()));
+            }
+            Ok(())
+        })();
+        std::future::ready(result)
+    }
+}
 struct Clock {
     now: Instant,
+    inbox: Inbox,
 }
 impl Events for Clock {
     fn now(&self) -> Instant {
         self.now
     }
     async fn wait(&mut self, deadline: Option<Instant>) -> Wake<Observation> {
+        if let Some(event) = self.inbox.lock().unwrap().pop_front() {
+            return Wake::Input(event);
+        }
         if let Some(at) = deadline {
             self.now = self.now.max(at);
             Wake::Timeout
@@ -39,7 +77,7 @@ impl Events for Clock {
         }
     }
 }
-type TestRuntime = Runtime<dummy::Change, signing::Signer, Clock>;
+type TestRuntime = Runtime<dummy::Change, signing::Signer, dummy::Recorder, Chain, Clock>;
 fn script(byte: u8) -> ScriptBuf {
     ScriptBuf::from_bytes([vec![0x51, 0x20], vec![byte; 32]].concat())
 }
@@ -122,12 +160,24 @@ fn fixture_without_signers(
         StdRng::seed_from_u64(0),
         grid,
     );
-    let executor = Executor::new(change, vec![]).unwrap();
+    let inbox = Inbox::default();
+    let executor = Executor::new(
+        change,
+        vec![],
+        dummy::Recorder::new([Ok(())]),
+        Chain {
+            inbox: inbox.clone(),
+            published: vec![],
+            fail: false,
+            confirm: true,
+        },
+    )
+    .unwrap();
     (
         state,
         Runtime {
             executor,
-            events: Clock { now },
+            events: Clock { now, inbox },
         },
     )
 }
@@ -389,6 +439,8 @@ async fn a_same_length_invalid_signature_cannot_be_finalized() {
             .payment()
             .is_none()
     );
+    assert!(io.executor.recorder.lock().await.requests().is_empty());
+    assert!(io.executor.broadcaster.lock().await.published.is_empty());
 }
 
 #[tokio::test]
@@ -579,10 +631,426 @@ async fn two_inputs_of_one_transaction_can_be_signed_concurrently() {
             .payment()
             .is_none()
     );
+    assert!(io.executor.recorder.lock().await.requests().is_empty());
     send.send(()).unwrap();
     let (id, future) = held.unwrap();
     state.completed(id, future.await);
     run_scripted(&mut state, &mut io, Request::id).await;
     let transaction = state.transactions().values().next().unwrap();
     assert_eq!(transaction.payment().unwrap().transaction.input.len(), 2);
+    assert_eq!(transaction.status(), &Status::Confirmed);
+    assert_eq!(io.executor.recorder.lock().await.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn confirmation_leaves_the_wallet_waiting_for_information() {
+    let (mut state, mut io) = fixture();
+    assert_eq!(
+        run_scripted(&mut state, &mut io, Request::id).await,
+        Stopped::Closed
+    );
+    assert_eq!(
+        *state.transactions().values().next().unwrap().status(),
+        Status::Confirmed
+    );
+    assert_eq!(state.pending().iter().count(), 0);
+    assert!(matches!(state.decide(io.events.now), Decision::Wait));
+}
+
+#[tokio::test]
+async fn constructs_signs_retains_publishes_and_observes_the_payment() {
+    let (mut state, mut io) = fixture();
+    let request = next_request(&mut state, io.events.now);
+    assert_eq!(
+        run_scripted(&mut state, &mut io, Request::id).await,
+        Stopped::Closed
+    );
+    assert_eq!(
+        *state.transactions().values().next().unwrap().status(),
+        Status::Confirmed
+    );
+    let payment = state
+        .transactions()
+        .values()
+        .next()
+        .unwrap()
+        .payment()
+        .unwrap();
+    assert_eq!(payment.outputs.len(), 2);
+    assert_ne!(payment.outputs[&0], payment.outputs[&1]);
+    for &position in payment.outputs.values() {
+        assert_eq!(
+            payment.transaction.output[position].value,
+            Amount::from_sat(10_000)
+        );
+    }
+    assert_eq!(io.executor.change.lock().await.requests(), 1);
+    assert_eq!(
+        io.executor
+            .signers
+            .get(&OutPoint::new(Txid::all_zeros(), 0))
+            .unwrap()
+            .lock()
+            .await
+            .requests()
+            .len(),
+        1
+    );
+    assert_eq!(
+        io.executor.recorder.lock().await.recorded(),
+        std::slice::from_ref(&payment.transaction)
+    );
+    assert_eq!(
+        io.executor.broadcaster.lock().await.published,
+        std::slice::from_ref(&payment.transaction)
+    );
+    assert_eq!(
+        state
+            .transactions()
+            .values()
+            .next()
+            .unwrap()
+            .completed()
+            .last(),
+        Some(&Action::Publish)
+    );
+    // Replay a completed operation: no new wallet operation or broadcast.
+    execute(&mut io, &request, Action::AllocateChange(0))
+        .await
+        .unwrap();
+    execute(&mut io, &request, Action::Record).await.unwrap();
+    execute(&mut io, &request, Action::Publish).await.unwrap();
+    assert_eq!(io.executor.recorder.lock().await.requests().len(), 1);
+    assert_eq!(io.executor.change.lock().await.requests(), 1);
+    assert_eq!(io.executor.broadcaster.lock().await.published.len(), 1);
+    assert_eq!(state.pending().iter().count(), 0);
+}
+
+#[tokio::test]
+async fn a_recording_failure_prevents_publication() {
+    let (mut state, mut io) = fixture();
+    *io.executor.recorder.lock().await =
+        dummy::Recorder::new([Err(dummy::Error::Scripted("record failed"))]);
+    assert_eq!(
+        run_scripted(&mut state, &mut io, Request::id).await,
+        Stopped::Closed
+    );
+    assert!(matches!(
+        state.transactions().values().next().unwrap().status(),
+        Status::Failed(_)
+    ));
+    assert!(io.executor.broadcaster.lock().await.published.is_empty());
+    assert!(
+        !state
+            .transactions()
+            .values()
+            .next()
+            .unwrap()
+            .completed()
+            .contains(&Action::Record)
+    );
+}
+
+#[tokio::test]
+async fn failed_broadcast_retains_the_transaction_without_fulfilling_the_intents() {
+    let (mut state, mut io) = fixture();
+    io.executor.broadcaster.lock().await.fail = true;
+    assert_eq!(
+        run_scripted(&mut state, &mut io, Request::id).await,
+        Stopped::Closed
+    );
+    assert!(matches!(
+        state.transactions().values().next().unwrap().status(),
+        Status::Failed(_)
+    ));
+    assert_eq!(io.executor.recorder.lock().await.recorded().len(), 1);
+    assert_eq!(state.pending().iter().count(), 2);
+    assert!(matches!(state.decide(io.events.now), Decision::Wait));
+    assert!(
+        !state
+            .transactions()
+            .values()
+            .next()
+            .unwrap()
+            .completed()
+            .contains(&Action::Publish)
+    );
+}
+
+#[tokio::test]
+async fn invalidated_candidate_has_no_effects() {
+    let (mut state, mut io) = fixture();
+    io.events
+        .inbox
+        .lock()
+        .unwrap()
+        .push_back(Observation::Invalidated("coin spent elsewhere".into()));
+    assert_eq!(
+        run_scripted(&mut state, &mut io, Request::id).await,
+        Stopped::Closed
+    );
+    assert!(matches!(
+        state.transactions().values().next().unwrap().status(),
+        Status::Failed(_)
+    ));
+    assert!(
+        state
+            .transactions()
+            .values()
+            .next()
+            .unwrap()
+            .completed()
+            .is_empty()
+    );
+    assert_eq!(io.executor.change.lock().await.requests(), 0);
+}
+
+#[tokio::test]
+async fn broadcast_acceptance_waits_for_a_matching_confirmation() {
+    let (mut state, mut io) = fixture();
+    io.executor.broadcaster.lock().await.confirm = false;
+    assert_eq!(
+        run_scripted(&mut state, &mut io, Request::id).await,
+        Stopped::Closed
+    );
+    assert_eq!(
+        *state.transactions().values().next().unwrap().status(),
+        Status::AwaitingConfirmation
+    );
+    assert_eq!(state.pending().iter().count(), 2);
+    io.events
+        .inbox
+        .lock()
+        .unwrap()
+        .push_back(Observation::Confirmed(Txid::all_zeros()));
+    assert_eq!(
+        run_scripted(&mut state, &mut io, Request::id).await,
+        Stopped::Closed
+    );
+    assert_eq!(
+        *state.transactions().values().next().unwrap().status(),
+        Status::AwaitingConfirmation
+    );
+    assert_eq!(state.pending().iter().count(), 2);
+    let txid = state
+        .transactions()
+        .values()
+        .next()
+        .unwrap()
+        .payment()
+        .unwrap()
+        .transaction
+        .compute_txid();
+    io.events
+        .inbox
+        .lock()
+        .unwrap()
+        .push_back(Observation::Confirmed(txid));
+    assert_eq!(
+        run_scripted(&mut state, &mut io, Request::id).await,
+        Stopped::Closed
+    );
+    assert_eq!(
+        *state.transactions().values().next().unwrap().status(),
+        Status::Confirmed
+    );
+    assert_eq!(io.executor.broadcaster.lock().await.published.len(), 1);
+    assert_eq!(state.pending().iter().count(), 0);
+}
+
+async fn pending_publication() -> (TestState, TestRuntime, Request) {
+    let (mut state, io) = fixture();
+    let request = pending_action(&mut state, &io, Action::Publish).await;
+    (state, io, request)
+}
+
+#[tokio::test]
+async fn confirmation_can_arrive_before_the_publication_result() {
+    let (mut state, io, request) = pending_publication().await;
+    let txid = state
+        .transactions()
+        .values()
+        .next()
+        .unwrap()
+        .payment()
+        .unwrap()
+        .transaction
+        .compute_txid();
+    state.observe(Observation::Confirmed(txid));
+    assert_eq!(
+        *state.transactions().values().next().unwrap().status(),
+        Status::Confirmed
+    );
+    assert_eq!(state.pending().iter().count(), 0);
+    // Even a failed RPC response cannot undo an observed chain confirmation.
+    let publication_error = fungi_core::strategy::Error("RPC disconnected".into());
+    state.completed(request.id(), Err(publication_error.clone()));
+    let tx = &state.transactions()[&request.id().0];
+    assert_eq!(tx.status(), &Status::Confirmed);
+    assert_eq!(
+        tx.operation_errors(),
+        &BTreeMap::from([(Action::Publish, publication_error)])
+    );
+    assert!(state.operations().next().is_none());
+    assert!(matches!(state.decide(io.events.now), Decision::Wait));
+}
+
+#[tokio::test]
+async fn a_late_publication_result_preserves_invalidation() {
+    let (mut state, io, request) = pending_publication().await;
+    state.observe(Observation::Invalidated("candidate superseded".into()));
+    assert_eq!(state.operations().count(), 1);
+    state.completed(request.id(), Ok(fungi_core::strategy::Update::Applied));
+    assert_eq!(
+        *state.transactions().values().next().unwrap().status(),
+        Status::Failed(fungi_core::strategy::Error("candidate superseded".into()))
+    );
+    assert!(
+        state
+            .transactions()
+            .values()
+            .next()
+            .unwrap()
+            .completed()
+            .contains(&Action::Publish)
+    );
+    assert_eq!(state.pending().iter().count(), 2);
+    assert!(matches!(state.decide(io.events.now), Decision::Wait));
+}
+
+#[tokio::test]
+async fn late_success_cannot_undo_confirmation() {
+    let (mut state, io, request) = pending_publication().await;
+    let txid = state
+        .transactions()
+        .values()
+        .next()
+        .unwrap()
+        .payment()
+        .unwrap()
+        .transaction
+        .compute_txid();
+    state.observe(Observation::Confirmed(txid));
+    state.completed(request.id(), Ok(fungi_core::strategy::Update::Applied));
+    assert_eq!(
+        *state.transactions().values().next().unwrap().status(),
+        Status::Confirmed
+    );
+    assert!(matches!(state.decide(io.events.now), Decision::Wait));
+    assert_eq!(state.pending().iter().count(), 0);
+}
+
+#[tokio::test]
+async fn a_stale_action_cannot_undo_confirmation() {
+    let (mut state, mut io) = fixture();
+    let request = next_request(&mut state, io.events.now);
+    run_scripted(&mut state, &mut io, Request::id).await;
+    state.apply(request);
+    assert_eq!(
+        *state.transactions().values().next().unwrap().status(),
+        Status::Confirmed
+    );
+    assert!(state.operations().next().is_none());
+}
+
+#[tokio::test]
+async fn a_late_failure_preserves_the_invalidation_reason() {
+    let (mut state, _, request) = pending_publication().await;
+    state.observe(Observation::Invalidated("candidate superseded".into()));
+    let publication_error = fungi_core::strategy::Error("RPC disconnected".into());
+    state.completed(request.id(), Err(publication_error.clone()));
+    let tx = &state.transactions()[&request.id().0];
+    assert_eq!(
+        tx.status(),
+        &Status::Failed(fungi_core::strategy::Error("candidate superseded".into()))
+    );
+    assert_eq!(
+        tx.operation_errors(),
+        &BTreeMap::from([(Action::Publish, publication_error)])
+    );
+    assert!(state.operations().next().is_none());
+}
+#[tokio::test]
+async fn publication_requires_recording() {
+    let (mut state, mut io) = fixture();
+    let request = next_request(&mut state, io.events.now);
+    execute(&mut io, &request, Action::Start).await.unwrap();
+    assert_eq!(
+        execute(&mut io, &request, Action::Record)
+            .await
+            .unwrap_err()
+            .0,
+        "transaction is not finalized"
+    );
+    assert_eq!(
+        execute(&mut io, &request, Action::Publish)
+            .await
+            .unwrap_err()
+            .0,
+        "transaction has not been retained"
+    );
+    assert!(io.executor.broadcaster.lock().await.published.is_empty());
+}
+
+#[test]
+fn invalidation_before_planning_keeps_the_intents_pending() {
+    let (mut state, io) = fixture();
+
+    state.observe(Observation::Invalidated("coin already spent".into()));
+
+    assert!(matches!(state.decide(io.events.now), Decision::Wait));
+    assert!(state.transactions().is_empty());
+    assert_eq!(state.pending().iter().count(), 2);
+    assert_eq!(
+        state.planning_errors().values().next().unwrap().0,
+        "coin already spent"
+    );
+}
+
+#[tokio::test]
+async fn confirmation_recovers_a_failed_broadcast() {
+    let (mut state, mut io) = fixture();
+    io.executor.broadcaster.lock().await.fail = true;
+    assert_eq!(
+        run_scripted(&mut state, &mut io, Request::id).await,
+        Stopped::Closed
+    );
+    let tx = state.transactions().values().next().unwrap();
+    assert!(matches!(tx.status(), Status::Failed(_)));
+    let txid = tx.payment().unwrap().transaction.compute_txid();
+    assert!(state.snapshot().recorded.contains_key(&txid));
+    assert_eq!(state.snapshot().coins.len(), 1);
+
+    state.observe(Observation::Confirmed(txid));
+    state.observe(Observation::Invalidated("outdated coin observation".into()));
+    assert_eq!(
+        state.transactions().values().next().unwrap().status(),
+        &Status::Confirmed
+    );
+    state.observe(Observation::Confirmed(txid));
+
+    assert_eq!(
+        state.transactions().values().next().unwrap().status(),
+        &Status::Confirmed
+    );
+    assert_eq!(state.pending().iter().count(), 0);
+    assert_eq!(state.snapshot().recorded.len(), 1);
+}
+
+#[tokio::test]
+async fn recording_completed_after_invalidation_still_retains_the_payment() {
+    let (mut state, io) = fixture();
+    let record = pending_action(&mut state, &io, Action::Record).await;
+    let tx = &state.transactions()[&record.id().0];
+    let txid = tx.payment().unwrap().transaction.compute_txid();
+
+    state.observe(Observation::Invalidated("coin spent elsewhere".into()));
+    let result = io.executor.execute(&record).await;
+    state.completed(record.id(), result);
+
+    let tx = &state.transactions()[&record.id().0];
+    assert!(matches!(tx.status(), Status::Failed(err) if err.0 == "coin spent elsewhere"));
+    assert!(state.snapshot().recorded.contains_key(&txid));
+    assert!(state.operations().next().is_none());
+    assert!(matches!(state.decide(io.events.now), Decision::Wait));
 }
