@@ -9,6 +9,7 @@ pub(super) struct Path(BTreeMap<Action, Vec<Action>>);
 impl Path {
     pub fn new(outcome: &Candidate<u64>) -> Self {
         let inputs: Vec<_> = (0..outcome.inputs().count()).map(Action::Input).collect();
+        let signatures: Vec<_> = (0..inputs.len()).map(Action::Sign).collect();
         let payments = outcome.payments().count();
         let outputs: Vec<_> = (0..payments + outcome.change().count())
             .map(Action::Output)
@@ -34,6 +35,16 @@ impl Path {
         actions.insert(
             Action::CloseOutputs,
             outputs.into_iter().chain([Action::CloseInputs]).collect(),
+        );
+        for sign in &signatures {
+            actions.insert(sign.clone(), vec![Action::CloseOutputs]);
+        }
+        actions.insert(
+            Action::Finalize,
+            signatures
+                .into_iter()
+                .chain([Action::CloseOutputs])
+                .collect(),
         );
         Self(actions)
     }
