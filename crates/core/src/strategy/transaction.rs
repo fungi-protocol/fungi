@@ -1,6 +1,8 @@
 //! The current execution path and results for one transaction.
 
-use super::{Action, Error, Observation, Plan, Request, Status, Update, error, path::Path};
+use super::{
+    Action, Error, Observation, Payment, Plan, Request, Status, Update, error, path::Path,
+};
 use cost_function::candidate::Candidate;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -11,6 +13,7 @@ pub struct Transaction {
     plan: Arc<Plan>,
     path: Path,
     status: Status,
+    payment: Option<Payment>,
     completed: BTreeSet<Action>,
     operation_errors: BTreeMap<Action, Error>,
     pending: BTreeMap<Action, Request>,
@@ -22,6 +25,7 @@ impl Transaction {
             path: Path::new(&plan.candidate),
             plan,
             status: Status::Running,
+            payment: None,
             completed: BTreeSet::new(),
             operation_errors: BTreeMap::new(),
             pending: BTreeMap::new(),
@@ -32,6 +36,9 @@ impl Transaction {
     }
     pub fn status(&self) -> &Status {
         &self.status
+    }
+    pub fn payment(&self) -> Option<&Payment> {
+        self.payment.as_ref()
     }
     pub fn completed(&self) -> &BTreeSet<Action> {
         &self.completed
@@ -80,15 +87,31 @@ impl Transaction {
         id: super::OperationId,
         result: Result<Update, Error>,
     ) {
-        if let Some(request) = self.pending.remove(&id.1) {
-            match result {
-                Ok(Update::Applied) => {
-                    self.completed.insert(request.action);
+        let Some(request) = self.pending.remove(&id.1) else {
+            return;
+        };
+        let action = request.action;
+        let result = match (&action, result) {
+            (Action::Finalize, Ok(Update::Finalized(payment))) => {
+                self.payment = Some(payment);
+                Ok(())
+            }
+            (Action::Finalize, Ok(Update::Applied)) => {
+                Err(error("finalization did not return a transaction"))
+            }
+            (_, Ok(Update::Finalized(_))) => Err(error("unexpected effect result")),
+            (_, Ok(Update::Applied)) => Ok(()),
+            (_, Err(err)) => Err(err),
+        };
+        match result {
+            Ok(()) => {
+                self.completed.insert(action);
+            }
+            Err(err) => {
+                if self.status == Status::Running {
+                    self.status = Status::Failed(err.clone());
                 }
-                Err(err) => {
-                    self.operation_errors.insert(request.action, err.clone());
-                    self.status = Status::Failed(err);
-                }
+                self.operation_errors.insert(action, err);
             }
         }
     }

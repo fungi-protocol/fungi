@@ -5,6 +5,9 @@ mod scripted_driver;
 
 use scripted_driver::run as run_scripted;
 
+#[path = "support/signing.rs"]
+mod signing;
+
 use bitcoin::{Amount, FeeRate, OutPoint, ScriptBuf, TxOut, Txid, Weight, hashes::Hash};
 use cost_function::{
     intent::{FixedPaymentInstructions, Intent, Outcome, PayoffCurve, ScheduleGrid},
@@ -49,7 +52,7 @@ fn fixture_with_start(
         funded,
         has_intent,
         start_slot,
-        script(1),
+        signing::script(OutPoint::new(Txid::all_zeros(), u32::from(wallet))),
         script(3),
     )
 }
@@ -135,8 +138,21 @@ impl Events for Clock {
     }
 }
 
-fn executor() -> Executor<dummy::Change> {
-    Executor::new(dummy::Change::new(
+type TestExecutor = Executor<dummy::Change, signing::Signer>;
+
+fn executor_with_change(change: dummy::Change) -> TestExecutor {
+    Executor::new(
+        change,
+        vec![signing::Signer::new(
+            OutPoint::new(Txid::all_zeros(), 1),
+            [Ok(())],
+        )],
+    )
+    .unwrap()
+}
+
+fn executor() -> TestExecutor {
+    executor_with_change(dummy::Change::new(
         script(3),
         Weight::from_wu(70),
         [Ok(script(4)), Ok(script(5))],
@@ -216,6 +232,16 @@ async fn a_bound_execution_rejects_another_plan_but_accepts_its_replay() {
     );
     let reevaluated = scheduled(&mut state, now);
     io.execute(&reevaluated).await.unwrap();
+    assert_eq!(io.change.lock().await.requests(), 0);
+    assert!(
+        io.signers
+            .get(&OutPoint::new(Txid::all_zeros(), 1))
+            .unwrap()
+            .lock()
+            .await
+            .requests()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -243,6 +269,17 @@ async fn the_driver_starts_the_planned_transaction_at_readiness() {
     assert!(tx.completed().contains(&Action::Start));
     assert!(tx.pending().next().is_none());
     assert_eq!(state.pending().iter().count(), 1);
+    assert_eq!(
+        io.executor
+            .signers
+            .get(&OutPoint::new(Txid::all_zeros(), 1))
+            .unwrap()
+            .lock()
+            .await
+            .requests()
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -456,11 +493,7 @@ fn the_decision_will_not_dispatch_an_input_before_start() {
     assert!(state.operations().next().is_none());
 }
 
-async fn run_action(
-    io: &Executor<dummy::Change>,
-    start: &Request,
-    action: Action,
-) -> Result<Update, Error> {
+async fn run_action(io: &TestExecutor, start: &Request, action: Action) -> Result<Update, Error> {
     let mut request = start.clone();
     request.action = action;
     io.execute(&request).await
@@ -470,7 +503,7 @@ async fn run_action(
 async fn rejected_change_cannot_be_added_by_bypassing_the_decision_state() {
     let now = Instant::now();
     let start = scheduled(&mut fixture(now, 1, true, true), now);
-    let io = Executor::new(dummy::Change::new(
+    let io = executor_with_change(dummy::Change::new(
         script(3),
         Weight::from_wu(70),
         [Ok(ScriptBuf::new())],
@@ -501,8 +534,16 @@ async fn concrete_change_scripts_do_not_change_candidate_cost_or_schedule() {
     let now = Instant::now();
     let mut observed = Vec::new();
     for byte in [5, 6] {
-        let mut state = fixture_with_scripts(now, 1, true, true, 0, script(1), script(byte));
-        let executor = Executor::new(dummy::Change::new(
+        let mut state = fixture_with_scripts(
+            now,
+            1,
+            true,
+            true,
+            0,
+            signing::script(OutPoint::new(Txid::all_zeros(), 1)),
+            script(byte),
+        );
+        let executor = executor_with_change(dummy::Change::new(
             script(byte),
             Weight::from_wu(70),
             [Ok(script(byte + 10))],
@@ -531,6 +572,14 @@ async fn concrete_change_scripts_do_not_change_candidate_cost_or_schedule() {
             "the allocated script must pass frozen output and accounting validation"
         );
         assert_eq!(io.executor.change.lock().await.requests(), 1);
+        assert!(
+            tx.payment()
+                .unwrap()
+                .transaction
+                .output
+                .iter()
+                .any(|output| output.script_pubkey == script(byte + 10))
+        );
         observed.push((cost, scheduled.at));
     }
     assert_eq!(observed[0], observed[1]);
@@ -609,7 +658,7 @@ async fn an_allocation_error_prevents_output_freezing() {
     let now = Instant::now();
     let mut state = fixture(now, 1, true, true);
     let id = scheduled(&mut state, now).id().0;
-    let executor = Executor::new(dummy::Change::new(
+    let executor = executor_with_change(dummy::Change::new(
         script(3),
         Weight::from_wu(70),
         [Err(dummy::Error::Scripted("change source failed"))],
@@ -628,4 +677,95 @@ async fn an_allocation_error_prevents_output_freezing() {
     assert!(matches!(tx.status(), Status::Failed(err) if err.0 == "change source failed"));
     assert!(!tx.completed().contains(&Action::CloseOutputs));
     assert!(tx.pending().next().is_none());
+}
+
+#[tokio::test]
+async fn a_busy_signer_does_not_block_another_inputs_signer() {
+    use bitcoin::{Psbt, psbt};
+    use fungi_core::wallet::InputSigner;
+    use futures::channel::oneshot;
+    struct Signer {
+        outpoint: OutPoint,
+        ready: Option<oneshot::Receiver<()>>,
+    }
+    impl InputSigner for Signer {
+        type Error = std::io::Error;
+        fn outpoint(&self) -> OutPoint {
+            self.outpoint
+        }
+        fn sign(
+            &mut self,
+            psbt: &Psbt,
+        ) -> impl Future<Output = Result<psbt::Input, Self::Error>> + Send + use<> {
+            let ready = self.ready.take();
+            let signed = signing::sign(psbt, self.outpoint);
+            async move {
+                if let Some(ready) = ready {
+                    ready.await.unwrap();
+                }
+                Ok(signed)
+            }
+        }
+    }
+    let (sender, receiver) = oneshot::channel();
+    let now = Instant::now();
+    let mut first = scheduled(&mut fixture(now, 1, true, true), now);
+    let mut second = scheduled(&mut fixture(now, 2, true, true), now);
+    let io = Executor::new(
+        dummy::Change::new(
+            script(3),
+            Weight::from_wu(70),
+            [Ok(script(4)), Ok(script(5))],
+        ),
+        vec![
+            Signer {
+                outpoint: OutPoint::new(Txid::all_zeros(), 1),
+                ready: Some(receiver),
+            },
+            Signer {
+                outpoint: OutPoint::new(Txid::all_zeros(), 2),
+                ready: None,
+            },
+        ],
+    )
+    .unwrap();
+    for request in [&mut first, &mut second] {
+        for action in [
+            Action::Start,
+            Action::Input(0),
+            Action::CloseInputs,
+            Action::Output(0),
+            Action::AllocateChange(0),
+            Action::Output(1),
+            Action::CloseOutputs,
+        ] {
+            request.action = action;
+            io.execute(request).await.unwrap();
+        }
+        request.action = Action::Sign(0);
+    }
+    let first_sign = io.execute(&first);
+    futures::pin_mut!(first_sign);
+    assert!(futures::poll!(&mut first_sign).is_pending());
+    let second_sign = io.execute(&second);
+    futures::pin_mut!(second_sign);
+    assert!(matches!(
+        futures::poll!(&mut second_sign),
+        std::task::Poll::Ready(Ok(_))
+    ));
+    sender.send(()).unwrap();
+    first_sign.await.unwrap();
+}
+
+#[test]
+fn duplicate_signer_capabilities_are_rejected() {
+    let coin = OutPoint::new(Txid::all_zeros(), 0);
+    let result = Executor::new(
+        dummy::Change::new(script(3), Weight::from_wu(70), []),
+        vec![
+            signing::Signer::new(coin, []),
+            signing::Signer::new(coin, []),
+        ],
+    );
+    assert!(matches!(result, Err(err) if err.0.contains("duplicate signer")));
 }

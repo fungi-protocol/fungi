@@ -7,7 +7,7 @@ use crate::{
     wallet::Snapshot,
 };
 use bitcoin::{
-    FeeRate,
+    Amount, FeeRate,
     hashes::{Hash, sha256},
 };
 use cost_function::{
@@ -19,7 +19,7 @@ use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
 mod construction;
 mod execute;
-pub use execute::Executor;
+pub use execute::{Executor, Signers};
 
 /// Local execution identity, independent of the shared construction-session UUID.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -32,6 +32,7 @@ struct Plan {
     execution_id: ExecutionId,
     candidate: Candidate<u64>,
     snapshot: Snapshot,
+    feerate: FeeRate,
     /// Shared construction-session UUID. The local tactic derives it from the execution identity.
     session_id: [u8; 16],
 }
@@ -44,6 +45,8 @@ pub enum Action {
     AllocateChange(usize),
     Output(usize),
     CloseOutputs,
+    Sign(usize),
+    Finalize,
 }
 
 /// An action bound to the candidate evaluated by the decision process.
@@ -69,9 +72,17 @@ fn error(value: impl std::fmt::Display) -> Error {
     Error(value.to_string())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Payment {
+    pub transaction: bitcoin::Transaction,
+    pub outputs: BTreeMap<u64, usize>,
+    pub fee: Amount,
+}
+
 #[derive(Clone, Debug)]
 pub enum Update {
     Applied,
+    Finalized(Payment),
 }
 
 #[derive(Clone)]
@@ -87,6 +98,7 @@ pub enum Status {
 }
 
 mod path;
+mod signing;
 mod transaction;
 mod validate;
 pub use transaction::Transaction;
@@ -166,6 +178,7 @@ impl<C: ChangeCosts, R: RngCore> State<C, R> {
                         execution_id,
                         candidate,
                         snapshot: self.snapshot.clone(),
+                        feerate: self.feerate,
                         session_id,
                     })),
                 );

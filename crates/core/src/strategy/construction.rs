@@ -1,8 +1,8 @@
 //! Construction state and effect receipts for one transaction.
 
-use super::{Action, Error, Plan, Update, error, validate};
+use super::{Action, Error, Payment, Plan, Update, error, signing, validate};
 use crate::wallet::{Coin, Snapshot};
-use bitcoin::{Amount, Psbt, ScriptBuf, Sequence, TxOut, absolute, transaction};
+use bitcoin::{Amount, OutPoint, Psbt, ScriptBuf, Sequence, TxOut, absolute, psbt, transaction};
 use concurrent_psbt::{
     global::{
         PSBT_GLOBAL_SORT_KEY_DERIVATION_SUBTYPE, PSBT_GLOBAL_TX_UNORDERED_SUBTYPE,
@@ -22,7 +22,22 @@ type Outputs = Constructor<OutputsModifiable, Seeded<ExplicitKeysForbidden>>;
 
 enum Construction {
     Active(psbt_v2::v2::Psbt),
-    Frozen,
+    Frozen(Frozen),
+}
+
+struct Frozen {
+    psbt: Psbt,
+    outputs: BTreeMap<u64, usize>,
+    fee: Amount,
+}
+
+impl Construction {
+    fn frozen(&mut self) -> Result<&mut Frozen, Error> {
+        match self {
+            Self::Frozen(frozen) => Ok(frozen),
+            Self::Active(_) => Err(error("transaction has not been frozen and validated")),
+        }
+    }
 }
 
 pub(super) enum Effect {
@@ -30,6 +45,12 @@ pub(super) enum Effect {
     AllocateChange {
         index: usize,
         priced: OutputWithoutScriptpubkey,
+    },
+    Sign {
+        index: usize,
+        position: usize,
+        outpoint: OutPoint,
+        psbt: Psbt,
     },
 }
 
@@ -175,8 +196,58 @@ impl Execution {
                 for (to, from) in psbt.inputs.iter_mut().zip(&ordered.inputs) {
                     to.witness_utxo = from.witness_utxo.clone();
                 }
-                self.validate(&psbt)?;
-                self.construction = Construction::Frozen;
+                let mut outputs = BTreeMap::new();
+                for (index, output) in ordered.outputs.iter().enumerate() {
+                    let output = Output::try_from(output.clone()).map_err(error)?;
+                    if let Some(intent) = payment_id(output.unique_id().as_bytes())? {
+                        outputs.insert(intent, index);
+                    }
+                }
+                let fee = self.validate(&psbt)?;
+                self.construction = Construction::Frozen(Frozen { psbt, outputs, fee });
+            }
+            Action::Sign(index) => {
+                let outpoint = self
+                    .plan
+                    .candidate
+                    .inputs()
+                    .nth(index)
+                    .ok_or_else(|| error("unknown input"))?
+                    .outpoint();
+                let psbt = &self.construction.frozen()?.psbt;
+                let position = psbt
+                    .unsigned_tx
+                    .input
+                    .iter()
+                    .position(|input| input.previous_output == outpoint)
+                    .expect("freezing verified the selected inputs");
+                return Ok(Effect::Sign {
+                    index,
+                    position,
+                    outpoint,
+                    psbt: psbt.clone(),
+                });
+            }
+            Action::Finalize => {
+                if self
+                    .plan
+                    .candidate
+                    .inputs()
+                    .enumerate()
+                    .any(|(i, _)| !self.results.contains_key(&Action::Sign(i)))
+                {
+                    return Err(error("signatures are incomplete"));
+                }
+                let Frozen { psbt, outputs, fee } = self.construction.frozen()?;
+                let transaction = psbt.clone().extract_tx().map_err(error)?;
+                signing::validate_feerate(*fee, transaction.weight(), self.plan.feerate)?;
+                let result = Update::Finalized(Payment {
+                    transaction,
+                    outputs: outputs.clone(),
+                    fee: *fee,
+                });
+                self.results.insert(Action::Finalize, result.clone());
+                return Ok(Effect::Complete(result));
             }
         }
         let result = Update::Applied;
@@ -198,10 +269,23 @@ impl Execution {
         Ok(Update::Applied)
     }
 
+    pub(super) fn complete_sign(
+        &mut self,
+        index: usize,
+        position: usize,
+        signed: psbt::Input,
+    ) -> Result<Update, Error> {
+        let snapshot = &self.plan.snapshot;
+        let psbt = &mut self.construction.frozen()?.psbt;
+        signing::apply(psbt, snapshot, position, signed)?;
+        self.results.insert(Action::Sign(index), Update::Applied);
+        Ok(Update::Applied)
+    }
+
     fn active(&self) -> Result<&psbt_v2::v2::Psbt, Error> {
         match &self.construction {
             Construction::Active(psbt) => Ok(psbt),
-            Construction::Frozen => Err(error("transaction is frozen")),
+            Construction::Frozen(_) => Err(error("transaction is frozen")),
         }
     }
 
@@ -275,6 +359,28 @@ impl Execution {
     }
 }
 
+fn payment_id(bytes: &[u8]) -> Result<Option<u64>, Error> {
+    let Ok([tag, id @ ..]) = <[u8; 9]>::try_from(bytes) else {
+        return Err(error("unexpected contribution identity"));
+    };
+    Ok((tag == 0).then(|| u64::from_be_bytes(id)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::payment_id;
+
+    #[test]
+    fn output_identity_distinguishes_intent_and_change() {
+        assert_eq!(payment_id(&[0, 0, 0, 0, 0, 0, 0, 1, 2]).unwrap(), Some(258));
+        assert_eq!(payment_id(&[1, 0, 0, 0, 0, 0, 0, 1, 2]).unwrap(), None);
+        assert_eq!(
+            payment_id(&[0; 8]).unwrap_err().0,
+            "unexpected contribution identity"
+        );
+    }
+}
+
 #[cfg(test)]
 mod prevout_tests {
     use super::*;
@@ -328,6 +434,7 @@ mod prevout_tests {
             },
             candidate,
             snapshot,
+            feerate,
             session_id: [1; 16],
         }))
         .unwrap();

@@ -1,7 +1,10 @@
-//! Composition of execution capabilities with the driver's clock.
+//! Composition of execution capabilities with the driver's input channels and clock.
 
 use super::{Error, Executor, Observation, Request, State, Update};
-use crate::driver::{Environment, Wake};
+use crate::{
+    driver::{Environment, Wake},
+    wallet::{ChangeSource, InputSigner},
+};
 use std::time::Instant;
 
 /// Time and observations for one driver run.
@@ -13,17 +16,18 @@ pub trait Events {
     fn wait(&mut self, deadline: Option<Instant>) -> impl Future<Output = Wake<Observation>>;
 }
 
-pub struct Runtime<C, E> {
-    pub executor: Executor<C>,
+pub struct Runtime<C, S, E> {
+    pub executor: Executor<C, S>,
     pub events: E,
 }
 
 impl<
-    C: crate::wallet::ChangeSource,
+    C: ChangeSource,
+    S: InputSigner,
     E: Events,
     P: cost_function::change::ChangeCosts,
     G: rand::RngCore,
-> Environment<State<P, G>> for Runtime<C, E>
+> Environment<State<P, G>> for Runtime<C, S, E>
 {
     fn now(&self) -> Instant {
         self.events.now()
@@ -31,7 +35,7 @@ impl<
     fn execute(
         &mut self,
         operation: Request,
-    ) -> impl Future<Output = Result<Update, Error>> + use<C, E, P, G> {
+    ) -> impl Future<Output = Result<Update, Error>> + use<C, S, E, P, G> {
         let executor = self.executor.clone();
         async move { executor.execute(&operation).await }
     }
