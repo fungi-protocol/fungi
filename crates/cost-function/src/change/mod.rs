@@ -32,16 +32,28 @@ pub trait ChangeCosts {
     fn dust(&self) -> Amount;
 }
 
+impl<T: ChangeCosts + ?Sized> ChangeCosts for &T {
+    fn output_weight(&self) -> Weight {
+        (**self).output_weight()
+    }
+    fn satisfaction_weight(&self) -> Weight {
+        (**self).satisfaction_weight()
+    }
+    fn dust(&self) -> Amount {
+        (**self).dust()
+    }
+}
+
 /// A change output, with everything but its scriptpubkey.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct OutputWithoutScriptpubkey {
-    pub(crate) value: Amount,
+pub struct OutputWithoutScriptpubkey {
+    pub value: Amount,
     /// Weight the output adds to the transaction.
-    pub(crate) weight: Weight,
+    pub weight: Weight,
     /// Weight of the scriptSig and witness that will spend it.
-    pub(crate) satisfaction_weight: Weight,
+    pub satisfaction_weight: Weight,
     /// Smallest value relay policy accepts for it.
-    pub(crate) dust: Amount,
+    pub dust: Amount,
 }
 
 impl KnowsWeight for OutputWithoutScriptpubkey {
