@@ -13,13 +13,17 @@ pub trait Events {
     fn wait(&mut self, deadline: Option<Instant>) -> impl Future<Output = Wake<Observation>>;
 }
 
-pub struct Runtime<E> {
-    pub executor: Executor,
+pub struct Runtime<C, E> {
+    pub executor: Executor<C>,
     pub events: E,
 }
 
-impl<E: Events, P: cost_function::change::ChangeCosts, G: rand::RngCore> Environment<State<P, G>>
-    for Runtime<E>
+impl<
+    C: crate::wallet::ChangeSource,
+    E: Events,
+    P: cost_function::change::ChangeCosts,
+    G: rand::RngCore,
+> Environment<State<P, G>> for Runtime<C, E>
 {
     fn now(&self) -> Instant {
         self.events.now()
@@ -27,7 +31,7 @@ impl<E: Events, P: cost_function::change::ChangeCosts, G: rand::RngCore> Environ
     fn execute(
         &mut self,
         operation: Request,
-    ) -> impl Future<Output = Result<Update, Error>> + use<E, P, G> {
+    ) -> impl Future<Output = Result<Update, Error>> + use<C, E, P, G> {
         let executor = self.executor.clone();
         async move { executor.execute(&operation).await }
     }

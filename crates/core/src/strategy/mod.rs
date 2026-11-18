@@ -41,6 +41,9 @@ pub enum Action {
     Start,
     Input(usize),
     CloseInputs,
+    AllocateChange(usize),
+    Output(usize),
+    CloseOutputs,
 }
 
 /// An action bound to the candidate evaluated by the decision process.
@@ -85,6 +88,7 @@ pub enum Status {
 
 mod path;
 mod transaction;
+mod validate;
 pub use transaction::Transaction;
 
 /// Wallet observations, one initial outcome, and its transaction executions.

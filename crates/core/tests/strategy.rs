@@ -13,7 +13,9 @@ use cost_function::{
 };
 use fungi_core::{
     driver::{Decision, Machine, Scheduled, Stopped, Wake},
-    strategy::{Action, Events, Executor, Observation, Request, Runtime, State, Status, Update},
+    strategy::{
+        Action, Error, Events, Executor, Observation, Request, Runtime, State, Status, Update,
+    },
     wallet::{Coin, Snapshot, dummy},
 };
 use rand::{SeedableRng, rngs::StdRng};
@@ -133,8 +135,12 @@ impl Events for Clock {
     }
 }
 
-fn executor() -> Executor {
-    Executor::default()
+fn executor() -> Executor<dummy::Change> {
+    Executor::new(dummy::Change::new(
+        script(3),
+        Weight::from_wu(70),
+        [Ok(script(4)), Ok(script(5))],
+    ))
 }
 
 #[test]
@@ -448,4 +454,178 @@ fn the_decision_will_not_dispatch_an_input_before_start() {
         Status::Failed(_)
     ));
     assert!(state.operations().next().is_none());
+}
+
+async fn run_action(
+    io: &Executor<dummy::Change>,
+    start: &Request,
+    action: Action,
+) -> Result<Update, Error> {
+    let mut request = start.clone();
+    request.action = action;
+    io.execute(&request).await
+}
+
+#[tokio::test]
+async fn rejected_change_cannot_be_added_by_bypassing_the_decision_state() {
+    let now = Instant::now();
+    let start = scheduled(&mut fixture(now, 1, true, true), now);
+    let io = Executor::new(dummy::Change::new(
+        script(3),
+        Weight::from_wu(70),
+        [Ok(ScriptBuf::new())],
+    ));
+    for action in [Action::Start, Action::Input(0), Action::CloseInputs] {
+        run_action(&io, &start, action).await.unwrap();
+    }
+    let first = run_action(&io, &start, Action::AllocateChange(0))
+        .await
+        .unwrap_err();
+    assert_eq!(first.0, "allocated change differs from its priced template");
+    assert_eq!(
+        run_action(&io, &start, Action::Output(1))
+            .await
+            .unwrap_err()
+            .0,
+        "change allocation has not succeeded"
+    );
+    let replay = run_action(&io, &start, Action::AllocateChange(0))
+        .await
+        .unwrap_err();
+    assert_eq!(first, replay);
+    assert_eq!(io.change.lock().await.requests(), 1);
+}
+
+#[tokio::test]
+async fn concrete_change_scripts_do_not_change_candidate_cost_or_schedule() {
+    let now = Instant::now();
+    let mut observed = Vec::new();
+    for byte in [5, 6] {
+        let mut state = fixture_with_scripts(now, 1, true, true, 0, script(1), script(byte));
+        let executor = Executor::new(dummy::Change::new(
+            script(byte),
+            Weight::from_wu(70),
+            [Ok(script(byte + 10))],
+        ));
+        let mut io = Runtime {
+            executor,
+            events: Clock(now, None),
+        };
+        let scheduled = schedule(state.decide(now)).expect("expected a funded candidate");
+        assert_eq!(io.executor.change.lock().await.requests(), 0);
+        let id = scheduled.action.id().0;
+        let cost = state.transactions()[&id]
+            .candidate()
+            .objective_cost()
+            .unwrap();
+
+        assert_eq!(
+            run_scripted(&mut state, &mut io, Request::id).await,
+            Stopped::Closed
+        );
+
+        let tx = &state.transactions()[&id];
+        assert_eq!(tx.status(), &Status::Running);
+        assert!(
+            tx.completed().contains(&Action::CloseOutputs),
+            "the allocated script must pass frozen output and accounting validation"
+        );
+        assert_eq!(io.executor.change.lock().await.requests(), 1);
+        observed.push((cost, scheduled.at));
+    }
+    assert_eq!(observed[0], observed[1]);
+}
+
+#[tokio::test]
+async fn outputs_require_closed_inputs_and_all_contributions_before_freezing() {
+    let now = Instant::now();
+    let start = scheduled(&mut fixture(now, 1, true, true), now);
+    let io = executor();
+    run_action(&io, &start, Action::Start).await.unwrap();
+    for action in [Action::Output(0), Action::AllocateChange(0)] {
+        assert_eq!(
+            run_action(&io, &start, action).await.unwrap_err().0,
+            "outputs are not modifiable"
+        );
+    }
+    for action in [Action::Input(0), Action::CloseInputs, Action::Output(0)] {
+        run_action(&io, &start, action).await.unwrap();
+    }
+    assert_eq!(
+        run_action(&io, &start, Action::CloseOutputs)
+            .await
+            .unwrap_err()
+            .0,
+        "output contributions are incomplete"
+    );
+    assert_eq!(
+        run_action(&io, &start, Action::AllocateChange(1))
+            .await
+            .unwrap_err()
+            .0,
+        "unknown change"
+    );
+    for action in [
+        Action::AllocateChange(0),
+        Action::Output(1),
+        Action::CloseOutputs,
+    ] {
+        run_action(&io, &start, action).await.unwrap();
+    }
+    assert_eq!(
+        run_action(&io, &start, Action::AllocateChange(1))
+            .await
+            .unwrap_err()
+            .0,
+        "transaction is frozen"
+    );
+}
+
+#[tokio::test]
+async fn completed_effects_belong_to_their_transaction() {
+    let now = Instant::now();
+    let first = scheduled(&mut fixture(now, 1, true, true), now);
+    let second = scheduled(&mut fixture(now, 2, true, true), now);
+    let io = executor();
+    for request in [&first, &second] {
+        for action in [
+            Action::Start,
+            Action::Input(0),
+            Action::CloseInputs,
+            Action::AllocateChange(0),
+        ] {
+            run_action(&io, request, action).await.unwrap();
+        }
+    }
+    assert_eq!(io.change.lock().await.requests(), 2);
+    run_action(&io, &first, Action::AllocateChange(0))
+        .await
+        .unwrap();
+    assert_eq!(io.change.lock().await.requests(), 2);
+}
+
+#[tokio::test]
+async fn an_allocation_error_prevents_output_freezing() {
+    let now = Instant::now();
+    let mut state = fixture(now, 1, true, true);
+    let id = scheduled(&mut state, now).id().0;
+    let executor = Executor::new(dummy::Change::new(
+        script(3),
+        Weight::from_wu(70),
+        [Err(dummy::Error::Scripted("change source failed"))],
+    ));
+    let mut io = Runtime {
+        executor,
+        events: Clock(now, None),
+    };
+
+    assert_eq!(
+        run_scripted(&mut state, &mut io, Request::id).await,
+        Stopped::Closed
+    );
+
+    let tx = &state.transactions()[&id];
+    assert!(matches!(tx.status(), Status::Failed(err) if err.0 == "change source failed"));
+    assert!(!tx.completed().contains(&Action::CloseOutputs));
+    assert!(tx.pending().next().is_none());
 }
