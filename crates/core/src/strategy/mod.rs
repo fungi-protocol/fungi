@@ -31,6 +31,7 @@ pub struct ExecutionId {
 struct Plan {
     execution_id: ExecutionId,
     candidate: Candidate<u64>,
+    snapshot: Snapshot,
     /// Shared construction-session UUID. The local tactic derives it from the execution identity.
     session_id: [u8; 16],
 }
@@ -38,6 +39,8 @@ struct Plan {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Action {
     Start,
+    Input(usize),
+    CloseInputs,
 }
 
 /// An action bound to the candidate evaluated by the decision process.
@@ -158,6 +161,7 @@ impl<C: ChangeCosts, R: RngCore> State<C, R> {
                     Transaction::new(Arc::new(Plan {
                         execution_id,
                         candidate,
+                        snapshot: self.snapshot.clone(),
                         session_id,
                     })),
                 );

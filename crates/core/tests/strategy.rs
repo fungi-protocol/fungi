@@ -41,10 +41,30 @@ fn fixture_with_start(
     has_intent: bool,
     start_slot: u64,
 ) -> Wallet {
+    fixture_with_scripts(
+        now,
+        wallet,
+        funded,
+        has_intent,
+        start_slot,
+        script(1),
+        script(3),
+    )
+}
+
+fn fixture_with_scripts(
+    now: Instant,
+    wallet: u8,
+    funded: bool,
+    has_intent: bool,
+    start_slot: u64,
+    coin_script: ScriptBuf,
+    change_template: ScriptBuf,
+) -> Wallet {
     let coin = Coin {
         txout: TxOut {
             value: Amount::from_sat(50_000),
-            script_pubkey: script(1),
+            script_pubkey: coin_script,
         },
         satisfaction_weight: Weight::from_wu(70),
     };
@@ -73,7 +93,7 @@ fn fixture_with_start(
         snapshot,
         FeeRate::from_sat_per_vb(2).unwrap(),
         [wallet; 16],
-        dummy::Change::new(script(3), Weight::from_wu(70), []),
+        dummy::Change::new(change_template, Weight::from_wu(70), []),
         StdRng::seed_from_u64(0),
         grid,
     )
@@ -330,6 +350,102 @@ fn the_decision_rejects_a_different_plan_for_the_same_execution() {
     assert!(matches!(
         state.transactions()[&start.id().0].status(),
         Status::Failed(err) if err.0 == "action prerequisites are not satisfied"
+    ));
+    assert!(state.operations().next().is_none());
+}
+
+#[tokio::test]
+async fn a_non_start_request_cannot_bind_an_execution() {
+    let now = Instant::now();
+    let mut request = scheduled(&mut fixture(now, 1, true, true), now);
+    request.action = Action::Input(0);
+    let io = executor();
+    assert_eq!(
+        io.execute(&request).await.unwrap_err().0,
+        "transaction construction has not started"
+    );
+    let other = scheduled(&mut fixture(now, 1, true, true), now);
+    io.execute(&other).await.unwrap();
+}
+
+#[tokio::test]
+async fn inputs_must_be_contributed_before_the_executor_can_close_them() {
+    let now = Instant::now();
+    let mut request = scheduled(&mut fixture(now, 1, true, true), now);
+    let io = executor();
+    io.execute(&request).await.unwrap();
+    request.action = Action::CloseInputs;
+    assert_eq!(
+        io.execute(&request).await.unwrap_err().0,
+        "input contributions are incomplete"
+    );
+    request.action = Action::Input(1);
+    assert_eq!(io.execute(&request).await.unwrap_err().0, "unknown input");
+    request.action = Action::Input(0);
+    io.execute(&request).await.unwrap();
+    request.action = Action::CloseInputs;
+    io.execute(&request).await.unwrap();
+}
+
+#[tokio::test]
+async fn the_driver_contributes_and_closes_the_candidate_inputs() {
+    let now = Instant::now();
+    let mut state = fixture(now, 1, true, true);
+    let id = scheduled(&mut state, now).id().0;
+    let mut io = Runtime {
+        executor: executor(),
+        events: Clock(now, None),
+    };
+
+    assert_eq!(
+        run_scripted(&mut state, &mut io, Request::id).await,
+        Stopped::Closed
+    );
+
+    let tx = &state.transactions()[&id];
+    assert_eq!(tx.status(), &Status::Running);
+    assert!(tx.completed().contains(&Action::Input(0)));
+    assert!(tx.completed().contains(&Action::CloseInputs));
+    assert!(tx.pending().next().is_none());
+}
+
+#[tokio::test]
+async fn an_unsupported_prevout_cannot_be_contributed() {
+    let now = Instant::now();
+    let mut state = fixture_with_scripts(now, 1, true, true, 0, ScriptBuf::new(), script(3));
+    let id = scheduled(&mut state, now).id().0;
+    let mut io = Runtime {
+        executor: executor(),
+        events: Clock(now, None),
+    };
+
+    assert_eq!(
+        run_scripted(&mut state, &mut io, Request::id).await,
+        Stopped::Closed
+    );
+
+    let tx = &state.transactions()[&id];
+    assert!(
+        matches!(tx.status(), Status::Failed(err) if err.0 == "PoC signer path only supports P2TR key spends")
+    );
+    assert_eq!(
+        tx.completed().iter().cloned().collect::<Vec<_>>(),
+        [Action::Start]
+    );
+}
+
+#[test]
+fn the_decision_will_not_dispatch_an_input_before_start() {
+    let now = Instant::now();
+    let mut state = fixture(now, 1, true, true);
+    let mut premature = scheduled(&mut state, now);
+    premature.action = Action::Input(0);
+
+    state.apply(premature.clone());
+
+    assert!(matches!(
+        state.transactions()[&premature.id().0].status(),
+        Status::Failed(_)
     ));
     assert!(state.operations().next().is_none());
 }
