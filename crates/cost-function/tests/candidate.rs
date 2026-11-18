@@ -6,7 +6,6 @@ use cost_function::{
     wallet::{Utxo, UtxoSnapshot, WalletStateSnapshot},
 };
 use rand::{SeedableRng, rngs::StdRng};
-use std::time::{Duration, Instant};
 
 struct Coins(Vec<Utxo>);
 impl UtxoSnapshot for Coins {
@@ -29,13 +28,12 @@ impl ChangeCosts for Change {
 
 #[test]
 fn a_funded_candidate_retains_equal_payment_intents_and_exposes_cost() {
-    let start = Instant::now();
     let intent = Intent::new(
         Outcome::OutputCreation(FixedPaymentInstructions {
             script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             amount: Amount::from_sat(1_000),
         }),
-        PayoffCurve::new(start, [(Duration::from_secs(10), Amount::from_sat(10_000))]),
+        PayoffCurve::new(0, [(100_000, Amount::from_sat(10_000))]).unwrap(),
     );
     let mut queue = InMemoryQueue::new([]);
     let first = queue.push(intent.clone());

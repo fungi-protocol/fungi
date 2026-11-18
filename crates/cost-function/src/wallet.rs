@@ -187,7 +187,6 @@ mod tests {
     use super::*;
     use bitcoin::{ScriptBuf, Txid, hashes::Hash};
     use rand::{SeedableRng, rngs::StdRng};
-    use std::time::Instant;
 
     fn utxo(vout: u32, sats: u64) -> Utxo {
         Utxo::new(
@@ -197,13 +196,13 @@ mod tests {
         )
     }
 
-    fn intent(start: Instant, sats: u64) -> Intent {
+    fn intent(sats: u64) -> Intent {
         Intent::new(
             Outcome::OutputCreation(FixedPaymentInstructions {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
                 amount: Amount::from_sat(sats),
             }),
-            PayoffCurve::new(start, []),
+            PayoffCurve::new(0, []).unwrap(),
         )
     }
 
@@ -218,8 +217,7 @@ mod tests {
         utxos: impl IntoIterator<Item = Utxo>,
         intents: &[u64],
     ) -> Result<Option<UnSequencedActions>, FundingError> {
-        let start = Instant::now();
-        let queue = InMemoryQueue::new(intents.iter().map(|&sats| intent(start, sats)));
+        let queue = InMemoryQueue::new(intents.iter().map(|&sats| intent(sats)));
 
         WalletStateSnapshot::new(DummyUtxoSnapshot(utxos.into_iter().collect()), queue)
             .funded_candidate(

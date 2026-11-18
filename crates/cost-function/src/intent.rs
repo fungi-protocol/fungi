@@ -1,6 +1,11 @@
 //! Defines what the user wants, and how much they care.
 
-use std::time::{Duration, Instant};
+use std::{ops::Range, time::Instant};
+
+mod amount;
+pub use amount::FractionalAmount;
+mod grid;
+pub use grid::ScheduleGrid;
 
 use bitcoin::{Amount, ScriptBuf, TxOut};
 
@@ -30,60 +35,65 @@ pub enum Outcome {
 /// one before it the curve changes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PayoffCurve {
-    start: Instant,
-    breakpoints: Vec<(Duration, Amount)>,
+    start_slot: u64,
+    end_slot: u64,
+    breakpoints: Vec<(u64, Amount)>,
 }
 
 impl PayoffCurve {
-    /// A curve worth nothing at `start`, each duration afterwards has some amount associated with it.
-    /// At start `start` the payoff is [`Amount::ZERO`]. Each breakpoint is specified in terms of
-    /// a [`Duration`] from the previous point, and a payoff `Amount` at that point. After the last
-    /// breakpoint the payoff curve is continued with a constant function with the same value as
-    /// the last breakpoint.
-    pub fn new(start: Instant, breakpoints: impl IntoIterator<Item = (Duration, Amount)>) -> Self {
-        PayoffCurve {
-            start,
-            breakpoints: breakpoints.into_iter().collect(),
+    /// Construct a curve on coarse schedule slots, with gaps relative to the previous point.
+    /// The curve starts at zero and holds its last value indefinitely. At a zero-slot step,
+    /// all entries apply in order and the last value wins. Slot overflow returns `None`.
+    pub fn new(
+        start_slot: u64,
+        breakpoints: impl IntoIterator<Item = (u64, Amount)>,
+    ) -> Option<Self> {
+        let mut end_slot = start_slot;
+        let mut points = Vec::new();
+        for (gap, worth) in breakpoints {
+            end_slot = end_slot.checked_add(gap)?;
+            points.push((gap, worth));
         }
-    }
-
-    /// The straight runs between the curve's breakpoints, in order.
-    ///
-    /// Before the first breakpoint the curve is worth nothing, and after the last it
-    /// holds that line's end forever. Neither run is bounded, so neither is yielded
-    /// here.
-    pub fn lines(&self) -> impl Iterator<Item = Line> + '_ {
-        let mut point = Point {
-            at: self.start,
-            worth: Amount::ZERO,
-        };
-
-        self.breakpoints.iter().map(move |&(gap, worth)| {
-            let next = Point {
-                at: point.at + gap,
-                worth,
-            };
-            let line = Line(point, next);
-
-            point = next;
-
-            line
+        Some(Self {
+            start_slot,
+            end_slot,
+            breakpoints: points,
         })
     }
 
-    /// What the intent is worth at `at`.
-    pub fn payoff(&self, at: Instant) -> Amount {
+    /// Place the curve's bounded segments on the shared grid in time order.
+    /// Returns `None` if a breakpoint lies beyond the clock's representable range.
+    pub fn lines(&self, grid: ScheduleGrid) -> Option<impl Iterator<Item = Line> + '_> {
+        let mut point = Point {
+            at: grid.at_slot(self.start_slot)?,
+            worth: Amount::ZERO,
+        };
+        grid.at_slot(self.end_slot)?;
+        Some(self.breakpoints.iter().map(move |&(gap, worth)| {
+            let next = Point {
+                at: point.at + ScheduleGrid::slot_duration(gap),
+                worth,
+            };
+            let line = Line(point, next);
+            point = next;
+            line
+        }))
+    }
+
+    /// Approximate payoff at `at` on the shared grid.
+    pub fn payoff(&self, at: Instant, grid: ScheduleGrid) -> Option<FractionalAmount> {
+        let lines = self.lines(grid)?;
+        if at < grid.at_slot(self.start_slot)? {
+            return Some(Amount::ZERO.into());
+        }
         let mut worth = Amount::ZERO;
-
-        for line in self.lines() {
-            if at <= line.1.at {
-                return line.interpolate(at);
+        for line in lines {
+            if at < line.1.at {
+                return Some(line.interpolate(at));
             }
-
             worth = line.1.worth;
         }
-
-        worth
+        Some(worth.into())
     }
 }
 
@@ -91,9 +101,9 @@ impl PayoffCurve {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Point {
     /// When the curve is worth this.
-    at: Instant,
+    pub at: Instant,
     /// What it is worth then.
-    worth: Amount,
+    pub worth: Amount,
 }
 
 /// A straight run of a curve, from one point to the next.
@@ -106,22 +116,29 @@ impl Line {
         if a.at <= b.at { Line(a, b) } else { Line(b, a) }
     }
 
+    /// The half-open interval over which this segment supplies the curve.
+    pub fn range(&self) -> Range<Instant> {
+        self.0.at..self.1.at
+    }
+
+    /// The segment's start and end points.
+    pub fn points(&self) -> (Point, Point) {
+        (self.0, self.1)
+    }
+
     /// Where the line sits at `at`, which holds at whichever end `at` lies beyond.
-    pub fn interpolate(&self, at: Instant) -> Amount {
+    pub fn interpolate(&self, at: Instant) -> FractionalAmount {
         let Line(start, end) = *self;
 
         // Clamp `at` to the span of the line.
         let at = at.clamp(start.at, end.at);
 
-        let span = end.at.saturating_duration_since(start.at).as_nanos() as i128;
-        if span == 0 {
-            return end.worth;
+        let span = end.at.saturating_duration_since(start.at).as_secs_f64();
+        if span == 0.0 {
+            return end.worth.into();
         }
-
-        let elapsed = at.saturating_duration_since(start.at).as_nanos() as i128;
-        let climb = i128::from(end.worth.to_sat()) - i128::from(start.worth.to_sat());
-
-        Amount::from_sat((i128::from(start.worth.to_sat()) + climb * elapsed / span) as u64)
+        let elapsed = at.saturating_duration_since(start.at).as_secs_f64();
+        FractionalAmount::interpolate(start.worth, end.worth, elapsed / span)
     }
 }
 
@@ -166,14 +183,15 @@ mod tests {
 
     /// A curve rising to a peak and falling back to nothing: a payment the user gives up
     /// on once the deadline is past.
-    fn single_peaked(start: Instant) -> PayoffCurve {
+    fn single_peaked() -> PayoffCurve {
         PayoffCurve::new(
-            start,
+            0,
             vec![
-                (Duration::from_secs(1800), Amount::from_sat(100_000)),
-                (Duration::from_secs(1800), Amount::ZERO),
+                (18_000_000, Amount::from_sat(100_000)),
+                (18_000_000, Amount::ZERO),
             ],
         )
+        .unwrap()
     }
 
     #[test]
@@ -188,7 +206,7 @@ mod tests {
     /// needs no breakpoints to say.
     #[test]
     fn a_curve_may_declare_nothing_at_all() {
-        let curve = PayoffCurve::new(Instant::now(), vec![]);
+        let curve = PayoffCurve::new(0, vec![]).unwrap();
 
         assert!(curve.breakpoints.is_empty());
     }
@@ -196,19 +214,38 @@ mod tests {
     #[test]
     fn payoff_climbs_and_falls_in_a_straight_line_between_breakpoints() {
         let start = Instant::now();
-        let curve = single_peaked(start);
+        let curve = single_peaked();
 
-        assert_eq!(curve.payoff(start), Amount::ZERO);
         assert_eq!(
-            curve.payoff(start + Duration::from_secs(900)),
+            curve
+                .payoff(start, ScheduleGrid::new(start))
+                .unwrap()
+                .round()
+                .unwrap(),
+            Amount::ZERO
+        );
+        assert_eq!(
+            curve
+                .payoff(start + Duration::from_secs(900), ScheduleGrid::new(start))
+                .unwrap()
+                .round()
+                .unwrap(),
             Amount::from_sat(50_000)
         );
         assert_eq!(
-            curve.payoff(start + Duration::from_secs(1800)),
+            curve
+                .payoff(start + Duration::from_secs(1800), ScheduleGrid::new(start))
+                .unwrap()
+                .round()
+                .unwrap(),
             Amount::from_sat(100_000)
         );
         assert_eq!(
-            curve.payoff(start + Duration::from_secs(2700)),
+            curve
+                .payoff(start + Duration::from_secs(2700), ScheduleGrid::new(start))
+                .unwrap()
+                .round()
+                .unwrap(),
             Amount::from_sat(50_000)
         );
     }
@@ -217,11 +254,22 @@ mod tests {
     #[test]
     fn payoff_outside_the_curve_holds_the_nearer_end() {
         let start = Instant::now();
-        let curve = single_peaked(start);
+        let curve = single_peaked();
 
-        assert_eq!(curve.payoff(start - Duration::from_secs(600)), Amount::ZERO);
         assert_eq!(
-            curve.payoff(start + Duration::from_secs(7200)),
+            curve
+                .payoff(start - Duration::from_secs(600), ScheduleGrid::new(start))
+                .unwrap()
+                .round()
+                .unwrap(),
+            Amount::ZERO
+        );
+        assert_eq!(
+            curve
+                .payoff(start + Duration::from_secs(7200), ScheduleGrid::new(start))
+                .unwrap()
+                .round()
+                .unwrap(),
             Amount::ZERO
         );
     }
@@ -230,9 +278,16 @@ mod tests {
     #[test]
     fn a_curve_without_breakpoints_is_worth_nothing() {
         let start = Instant::now();
-        let curve = PayoffCurve::new(start, vec![]);
+        let curve = PayoffCurve::new(0, vec![]).unwrap();
 
-        assert_eq!(curve.payoff(start + Duration::from_secs(600)), Amount::ZERO);
+        assert_eq!(
+            curve
+                .payoff(start + Duration::from_secs(600), ScheduleGrid::new(start))
+                .unwrap()
+                .round()
+                .unwrap(),
+            Amount::ZERO
+        );
     }
 
     /// A cap the user wants from the outset, rather than a line climbing towards one.
@@ -240,16 +295,25 @@ mod tests {
     fn a_breakpoint_no_duration_after_the_start_steps_straight_to_its_worth() {
         let start = Instant::now();
         let curve = PayoffCurve::new(
-            start,
-            vec![
-                (Duration::ZERO, Amount::from_sat(100)),
-                (Duration::from_secs(60), Amount::from_sat(100)),
-            ],
-        );
+            0,
+            vec![(0, Amount::from_sat(100)), (600_000, Amount::from_sat(100))],
+        )
+        .unwrap();
 
-        assert_eq!(curve.payoff(start), Amount::from_sat(100));
         assert_eq!(
-            curve.payoff(start + Duration::from_secs(30)),
+            curve
+                .payoff(start, ScheduleGrid::new(start))
+                .unwrap()
+                .round()
+                .unwrap(),
+            Amount::from_sat(100)
+        );
+        assert_eq!(
+            curve
+                .payoff(start + Duration::from_secs(30), ScheduleGrid::new(start))
+                .unwrap()
+                .round()
+                .unwrap(),
             Amount::from_sat(100)
         );
     }
@@ -261,12 +325,16 @@ mod tests {
         let peak = start + Duration::from_secs(1800);
         let over = peak + Duration::from_secs(1800);
 
-        let lines: Vec<Line> = single_peaked(start).lines().collect();
+        let endpoints: Vec<_> = single_peaked()
+            .lines(ScheduleGrid::new(start))
+            .unwrap()
+            .map(|line| line.points())
+            .collect();
 
         assert_eq!(
-            lines,
+            endpoints,
             [
-                Line(
+                (
                     Point {
                         at: start,
                         worth: Amount::ZERO
@@ -276,7 +344,7 @@ mod tests {
                         worth: Amount::from_sat(100_000)
                     },
                 ),
-                Line(
+                (
                     Point {
                         at: peak,
                         worth: Amount::from_sat(100_000)
@@ -293,7 +361,14 @@ mod tests {
     /// The flat ends run forever, so they are not lines the curve can hand out.
     #[test]
     fn a_curve_without_breakpoints_has_no_lines() {
-        assert_eq!(PayoffCurve::new(Instant::now(), vec![]).lines().count(), 0);
+        assert_eq!(
+            PayoffCurve::new(0, vec![])
+                .unwrap()
+                .lines(ScheduleGrid::new(Instant::now()))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     /// Which end of a line is named first says nothing about the curve it came from.
@@ -311,11 +386,11 @@ mod tests {
         let halfway = start + Duration::from_secs(30);
 
         assert_eq!(
-            Line::new(early, late).interpolate(halfway),
+            Line::new(early, late).interpolate(halfway).round().unwrap(),
             Amount::from_sat(50)
         );
         assert_eq!(
-            Line::new(late, early).interpolate(halfway),
+            Line::new(late, early).interpolate(halfway).round().unwrap(),
             Amount::from_sat(50)
         );
     }
@@ -337,37 +412,128 @@ mod tests {
         );
 
         assert_eq!(
-            line.interpolate(start - Duration::from_secs(60)),
+            line.interpolate(start - Duration::from_secs(60))
+                .round()
+                .unwrap(),
             Amount::from_sat(100)
         );
         assert_eq!(
-            line.interpolate(start + Duration::from_secs(600)),
+            line.interpolate(start + Duration::from_secs(600))
+                .round()
+                .unwrap(),
             Amount::from_sat(200)
         );
     }
 
     #[test]
     fn breakpoints_are_spaced_from_the_one_before_them() {
-        let start = Instant::now();
-        let curve = single_peaked(start);
+        let curve = single_peaked();
 
         assert_eq!(
             curve.breakpoints,
             [
-                (Duration::from_secs(1800), Amount::from_sat(100_000)),
-                (Duration::from_secs(1800), Amount::ZERO),
+                (18_000_000, Amount::from_sat(100_000)),
+                (18_000_000, Amount::ZERO),
             ]
         );
         assert_eq!(curve.clone(), curve);
     }
 
     #[test]
+    fn authored_slots_are_checked_and_placed_on_the_shared_grid() {
+        assert!(PayoffCurve::new(u64::MAX, [(1, Amount::ZERO)]).is_none());
+        let curve = PayoffCurve::new(1, [(2, Amount::from_sat(1))]).unwrap();
+        let origin = Instant::now();
+        for grid in [
+            ScheduleGrid::new(origin),
+            ScheduleGrid::new(origin + ScheduleGrid::JIFFY),
+        ] {
+            let line = curve.lines(grid).unwrap().next().unwrap();
+            assert_eq!(
+                line.range(),
+                grid.at_slot(1).unwrap()..grid.at_slot(3).unwrap()
+            );
+        }
+    }
+
+    #[test]
     fn an_intent_keeps_its_outcome_and_payoff_curve() {
-        let start = Instant::now();
-        let intent = Intent::new(Outcome::OutputCreation(request()), single_peaked(start));
+        let intent = Intent::new(Outcome::OutputCreation(request()), single_peaked());
 
         assert_eq!(intent.inner, Outcome::OutputCreation(request()));
-        assert_eq!(intent.payoff_curve, single_peaked(start));
+        assert_eq!(intent.payoff_curve, single_peaked());
         assert_eq!(intent.clone(), intent);
+    }
+}
+
+#[cfg(test)]
+mod comparison_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn nearby_slopes_change_order_once_without_satoshi_plateaus() {
+        let start = Instant::now();
+        let a = PayoffCurve::new(0, [(1, Amount::from_sat(21))]).unwrap();
+        let b = PayoffCurve::new(0, [(0, Amount::from_sat(1)), (1, Amount::from_sat(20))]).unwrap();
+        assert!(
+            a.payoff(start + Duration::from_micros(45), ScheduleGrid::new(start))
+                .unwrap()
+                < b.payoff(start + Duration::from_micros(45), ScheduleGrid::new(start))
+                    .unwrap()
+        );
+        assert_eq!(
+            a.payoff(start + Duration::from_micros(50), ScheduleGrid::new(start))
+                .unwrap(),
+            b.payoff(start + Duration::from_micros(50), ScheduleGrid::new(start))
+                .unwrap()
+        );
+        assert!(
+            a.payoff(start + Duration::from_micros(55), ScheduleGrid::new(start))
+                .unwrap()
+                > b.payoff(start + Duration::from_micros(55), ScheduleGrid::new(start))
+                    .unwrap()
+        );
+    }
+
+    #[test]
+    fn all_steps_at_a_boundary_have_taken_effect() {
+        let start = Instant::now();
+        let at = start + ScheduleGrid::AUTHORED_STEP;
+        let curve = PayoffCurve::new(
+            0,
+            [
+                (1, Amount::ZERO),
+                (0, Amount::from_sat(50)),
+                (0, Amount::from_sat(100)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            curve.payoff(at, ScheduleGrid::new(start)).unwrap().as_sat(),
+            100.0
+        );
+
+        let last_step = curve
+            .lines(ScheduleGrid::new(start))
+            .unwrap()
+            .last()
+            .unwrap();
+        assert_eq!(last_step.range(), at..at);
+        assert_eq!(last_step.interpolate(at).as_sat(), 100.0);
+    }
+}
+
+#[cfg(test)]
+mod future_step_test {
+    use super::*;
+    #[test]
+    fn a_future_initial_step_is_zero_before_its_start() {
+        let now = Instant::now();
+        let curve = PayoffCurve::new(10_000, [(0, Amount::from_sat(100))]).unwrap();
+        assert_eq!(
+            curve.payoff(now, ScheduleGrid::new(now)).unwrap().as_sat(),
+            0.0
+        );
     }
 }
