@@ -129,7 +129,9 @@ impl Transaction {
             {
                 self.status = Status::Confirmed;
             }
-            Observation::Invalidated(reason) if self.status != Status::Confirmed => {
+            Observation::Invalidated(reason) | Observation::TransactionInvalidated(_, reason)
+                if self.status != Status::Confirmed =>
+            {
                 self.status = Status::Failed(error(reason));
             }
             _ => {}

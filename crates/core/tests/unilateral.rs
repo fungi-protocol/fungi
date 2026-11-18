@@ -140,7 +140,11 @@ fn fixture_without_signers(
             },
         );
     }
-    let change = dummy::Change::new(template.clone(), Weight::from_wu(70), [Ok(script(3))]);
+    let change = dummy::Change::new(
+        template.clone(),
+        Weight::from_wu(70),
+        [Ok(script(3)), Ok(script(5))],
+    );
     let grid = ScheduleGrid::new(now);
     let intent = Intent::new(
         Outcome::OutputCreation(FixedPaymentInstructions {
@@ -164,7 +168,7 @@ fn fixture_without_signers(
     let executor = Executor::new(
         change,
         vec![],
-        dummy::Recorder::new([Ok(())]),
+        dummy::Recorder::new([Ok(()), Ok(())]),
         Chain {
             inbox: inbox.clone(),
             published: vec![],
@@ -1053,4 +1057,81 @@ async fn recording_completed_after_invalidation_still_retains_the_payment() {
     assert!(state.snapshot().recorded.contains_key(&txid));
     assert!(state.operations().next().is_none());
     assert!(matches!(state.decide(io.events.now), Decision::Wait));
+}
+
+#[tokio::test]
+async fn confirming_one_batch_keeps_the_other_intents_pending() {
+    let (mut state, mut io) = split_batches();
+    io.executor.broadcaster.lock().await.confirm = false;
+    run_scripted(&mut state, &mut io, Request::id).await;
+    assert_eq!(state.transactions().len(), 2);
+    assert_eq!(state.pending().iter().count(), 2);
+    assert_eq!(state.snapshot().coins.len(), 2);
+    assert_eq!(state.snapshot().recorded.len(), 2);
+    let first = state.transactions().values().next().unwrap();
+    let first_id = *first.payment().unwrap().outputs.keys().next().unwrap();
+    state.observe(Observation::Confirmed(
+        first.payment().unwrap().transaction.compute_txid(),
+    ));
+    let remaining: Vec<_> = state.pending().iter().map(|(id, _)| id).collect();
+    assert_eq!(remaining.len(), 1);
+    assert_ne!(remaining[0], first_id);
+    assert_eq!(io.executor.broadcaster.lock().await.published.len(), 2);
+}
+
+#[tokio::test]
+async fn independent_batches_progress_while_one_signer_waits() {
+    use futures::channel::oneshot;
+    let (mut state, mut io) = split_batches();
+    let (send, recv) = oneshot::channel();
+    io.executor
+        .signers
+        .get(&OutPoint::new(Txid::all_zeros(), 0))
+        .unwrap()
+        .lock()
+        .await
+        .delay = Some(recv);
+    // Drive actual strategy transitions while one real executor future is held.
+    let mut held = None;
+    let mut requests = BTreeSet::new();
+    while let Decision::Schedule(scheduled) = state.decide(io.events.now) {
+        let request = scheduled.action;
+        state.apply(request.clone());
+        let executor = io.executor.clone();
+        let id = request.id();
+        assert!(
+            requests.insert(id.clone()),
+            "repeated scripted request {id:?}"
+        );
+        let future = async move { executor.execute(&request).await };
+        let mut future = Box::pin(future);
+        match futures::poll!(&mut future) {
+            std::task::Poll::Pending => {
+                assert!(held.is_none(), "only one signer is held");
+                held = Some((id, future));
+            }
+            std::task::Poll::Ready(result) => state.completed(id, result),
+        }
+    }
+    assert_eq!(state.operations().count(), 1);
+    assert_eq!(io.executor.broadcaster.lock().await.published.len(), 1);
+    // Observation/re-evaluation must retain the pending operation.
+    state.observe(Observation::Confirmed(Txid::all_zeros()));
+    assert!(matches!(state.decide(io.events.now), Decision::Wait));
+    assert_eq!(state.operations().count(), 1);
+    send.send(()).unwrap();
+    let (id, future) = held.unwrap();
+    state.completed(id, future.await);
+    run_scripted(&mut state, &mut io, Request::id).await;
+    assert_eq!(io.executor.broadcaster.lock().await.published.len(), 2);
+    for outpoint in state.snapshot().coins.keys() {
+        let signer = io.executor.signers.get(outpoint).unwrap();
+        assert_eq!(signer.lock().await.requests().len(), 1);
+    }
+    assert!(state.operations().next().is_none());
+}
+
+fn split_batches() -> (TestState, TestRuntime) {
+    let (state, runtime) = fixture_with_funding(true, 10_000);
+    (state.with_batches(vec![vec![0], vec![1]]).unwrap(), runtime)
 }
