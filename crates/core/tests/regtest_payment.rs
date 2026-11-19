@@ -22,6 +22,7 @@ use fungi_core::{
 use fungi_regtest::corepc_node;
 use rand::{SeedableRng, rngs::StdRng};
 use std::{
+    collections::VecDeque,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -89,6 +90,8 @@ impl Chain {
 struct Clock {
     now: Instant,
     observation: Option<Observation>,
+    /// Observations delivered at fixed instants, before a later deadline.
+    arrivals: VecDeque<(Instant, Observation)>,
 }
 impl Events for Clock {
     fn now(&self) -> Instant {
@@ -97,6 +100,12 @@ impl Events for Clock {
     async fn wait(&mut self, deadline: Option<Instant>) -> Wake<Observation> {
         if let Some(input) = self.observation.take() {
             return Wake::Input(input);
+        }
+        if let Some(&(at, _)) = self.arrivals.front()
+            && deadline.is_none_or(|deadline| at <= deadline)
+        {
+            self.now = self.now.max(at);
+            return Wake::Input(self.arrivals.pop_front().unwrap().1);
         }
         match deadline {
             Some(at) => {
@@ -165,6 +174,7 @@ async fn armins_candidate_is_signed_by_bdk_and_confirmed_on_regtest()
         events: Clock {
             now,
             observation: None,
+            arrivals: VecDeque::new(),
         },
     };
     let mut source = adapter.reporting_to(runtime.executor.signers.clone());
@@ -274,6 +284,98 @@ async fn armins_candidate_is_signed_by_bdk_and_confirmed_on_regtest()
         "confirmed {}: payment={amount}, change={change}, fee={}, objective_cost={objective_cost}",
         payment.transaction.compute_txid(),
         payment.fee
+    );
+    Ok(())
+}
+
+/// A payment whose payoff rises to 100,000 sats over ten minutes.
+fn rising_payment(script_pubkey: bitcoin::ScriptBuf, amount: Amount) -> Intent {
+    let ten_minutes = 600 * (1_000_000 / ScheduleGrid::AUTHORED_STEP.as_micros() as u64);
+    Intent::new(
+        Outcome::OutputCreation(FixedPaymentInstructions {
+            script_pubkey,
+            amount,
+        }),
+        PayoffCurve::new(0, [(ten_minutes, Amount::from_sat(100_000))]).unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn intents_arriving_at_different_times_share_a_transaction_on_regtest()
+-> Result<(), Box<dyn std::error::Error>> {
+    let node = fungi_regtest::start()?;
+    let adapter = bdk::Adapter::new();
+    let height = fund(&node, &adapter)?;
+    let now = Instant::now();
+    let amount = Amount::from_sat(25_000);
+    let first = node.client.new_address()?.script_pubkey();
+    let second = node.client.new_address()?.script_pubkey();
+    let arrival = now + Duration::from_secs(10);
+    let chain = Chain {
+        node: Arc::new(node),
+        wallet: adapter.clone(),
+        height,
+    };
+    let mut runtime = Runtime {
+        executor: Executor::new(adapter.clone(), vec![], adapter.clone(), chain).unwrap(),
+        events: Clock {
+            now,
+            observation: None,
+            arrivals: VecDeque::from([(
+                arrival,
+                Observation::Intent(rising_payment(second.clone(), amount)),
+            )]),
+        },
+    };
+    let snapshot = adapter
+        .reporting_to(runtime.executor.signers.clone())
+        .snapshot()
+        .await?;
+    let mut state = State::new(
+        InMemoryQueue::new([rising_payment(first.clone(), amount)]),
+        snapshot,
+        FeeRate::from_sat_per_vb(2).unwrap(),
+        [7; 16],
+        adapter.clone(),
+        StdRng::seed_from_u64(0),
+        ScheduleGrid::new(now),
+    );
+    assert_eq!(
+        run_scripted(&mut state, &mut runtime, Request::id).await,
+        Stopped::Closed
+    );
+    assert!(runtime.events.now() > arrival);
+    let (id, tx) = state.transactions().iter().next().unwrap();
+    assert_eq!(state.transactions().len(), 1);
+    // The candidate for the first intent alone was replaced before it started.
+    assert_eq!(id.sequence, 1);
+    assert_eq!(*tx.status(), Status::AwaitingConfirmation);
+    let transaction = tx.payment().unwrap().transaction.clone();
+    let confirmation = runtime
+        .executor
+        .broadcaster
+        .lock()
+        .await
+        .mine_confirmation(&transaction);
+    runtime.events.observation = Some(confirmation);
+    assert_eq!(
+        run_scripted(&mut state, &mut runtime, Request::id).await,
+        Stopped::Closed
+    );
+
+    assert_eq!(state.pending().iter().count(), 0);
+    let completed = state.transactions().values().next().unwrap();
+    assert_eq!(*completed.status(), Status::Confirmed);
+    let payment = completed.payment().unwrap();
+    for (intent, destination) in [(0, &first), (1, &second)] {
+        let paid = &payment.transaction.output[payment.outputs[&intent]];
+        assert_eq!(&paid.script_pubkey, destination);
+        assert_eq!(paid.value, amount);
+    }
+    assert_eq!(payment.transaction.input.len(), 1);
+    assert_eq!(
+        adapter.inner.lock().unwrap().wallet.balance().confirmed,
+        Amount::from_sat(100_000) - amount - amount - payment.fee
     );
     Ok(())
 }
