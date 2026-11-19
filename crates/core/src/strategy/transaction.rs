@@ -44,6 +44,14 @@ impl Transaction {
         &self.completed
     }
 
+    /// Start has been dispatched, so the execution is bound to this plan.
+    /// A Start that returned an error was dispatched too.
+    pub(super) fn started(&self) -> bool {
+        self.completed.contains(&Action::Start)
+            || self.pending.contains_key(&Action::Start)
+            || self.operation_errors.contains_key(&Action::Start)
+    }
+
     /// Errors returned by dispatched operations, including late completions.
     pub fn operation_errors(&self) -> &BTreeMap<Action, Error> {
         &self.operation_errors

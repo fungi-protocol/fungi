@@ -1,6 +1,8 @@
 //! Wallet strategy and execution state.
 //!
-//! The current tactic funds one initial outcome consisting of disjoint transaction batches.
+//! The current tactic funds the intents outside started outcomes as one outcome of
+//! disjoint transaction batches, and funds them again on new information. An outcome
+//! has started once any of its transactions has started.
 
 use crate::{
     driver::{Decision, Machine},
@@ -13,7 +15,7 @@ use bitcoin::{
 use cost_function::{
     candidate::Candidate,
     change::ChangeCosts,
-    intent::ScheduleGrid,
+    intent::{Intent, ScheduleGrid},
     queue::{InMemoryQueue, Queue},
     wallet::WalletStateSnapshot,
 };
@@ -100,6 +102,11 @@ pub enum Observation {
     /// Stop this candidate when new information invalidates its assumptions.
     Invalidated(String),
     TransactionInvalidated(ExecutionId, String),
+    /// The user adds an intent. It joins every intent outside started outcomes.
+    Intent(Intent),
+    /// The wallet reports its coins. Recorded transactions are kept.
+    Snapshot(Snapshot),
+    FeeRate(FeeRate),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -116,7 +123,7 @@ mod transaction;
 mod validate;
 pub use transaction::Transaction;
 
-/// Wallet observations, one initial outcome, and its transaction executions.
+/// State holds wallet observations, the outcome for unstarted intents and transaction executions.
 pub struct State<C, R> {
     pending: InMemoryQueue,
     snapshot: Snapshot,
@@ -125,8 +132,14 @@ pub struct State<C, R> {
     change: C,
     rng: R,
     grid: ScheduleGrid,
+    /// Each batch holds intents outside started outcomes. Batches are disjoint.
     batches: Vec<BTreeSet<u64>>,
-    planned: bool,
+    /// Each outcome holds the transactions funded by one evaluation.
+    outcomes: Vec<BTreeSet<ExecutionId>>,
+    /// This is set when information relevant to funding the unstarted batches arrives.
+    stale: bool,
+    evaluated: bool,
+    next_sequence: u64,
     transactions: BTreeMap<ExecutionId, Transaction>,
     planning_errors: BTreeMap<ExecutionId, Error>,
 }
@@ -152,7 +165,10 @@ impl<C: ChangeCosts, R: RngCore> State<C, R> {
             rng,
             grid,
             batches,
-            planned: false,
+            outcomes: Vec::new(),
+            stale: true,
+            evaluated: false,
+            next_sequence: 0,
             transactions: BTreeMap::new(),
             planning_errors: BTreeMap::new(),
         }
@@ -160,8 +176,11 @@ impl<C: ChangeCosts, R: RngCore> State<C, R> {
 
     /// Choose disjoint initial batches. The default is one batch.
     /// This configures the PoC tactic; it neither reserves coins nor removes intents.
+    /// An intent left out of every batch is not funded by the first evaluation.
+    /// An added intent replaces the batches with one batch of every intent outside
+    /// started outcomes. A new snapshot or feerate keeps the batches.
     pub fn with_batches(mut self, batches: Vec<Vec<u64>>) -> Result<Self, Error> {
-        if self.planned {
+        if self.evaluated {
             return Err(error("initial allocation has already been evaluated"));
         }
         let known: BTreeSet<_> = self.pending.iter().map(|(id, _)| id).collect();
@@ -198,24 +217,57 @@ impl<C: ChangeCosts, R: RngCore> State<C, R> {
         &self.planning_errors
     }
 
-    fn generate_outcome(&mut self) {
+    /// Fund each batch again, replacing the outcomes that have not started.
+    fn evaluate(&mut self) {
         // Clock ticks and unrelated completions must not redraw coins or identities.
-        self.planned = true;
-        // Allocation within this tactic is disjoint; wallet observations remain intact.
+        self.stale = false;
+        self.evaluated = true;
+        let transactions = &self.transactions;
+        self.outcomes
+            .retain(|outcome| outcome.iter().any(|id| transactions[id].started()));
+        let started: BTreeSet<_> = self.outcomes.iter().flatten().copied().collect();
+        self.transactions.retain(|id, _| started.contains(id));
+        self.planning_errors.clear();
+        // Started outcomes keep their intents. Only those without a failure keep
+        // their coins, so a failed attempt reserves no input.
         let mut available = self.snapshot.clone();
+        let mut bound = BTreeSet::new();
+        for outcome in &self.outcomes {
+            let outcome: Vec<_> = outcome.iter().map(|id| &self.transactions[id]).collect();
+            let failed = outcome
+                .iter()
+                .any(|tx| matches!(tx.status(), Status::Failed(_)));
+            for tx in outcome {
+                bound.extend(tx.candidate().payments().map(|(&id, _)| id));
+                if !failed {
+                    for coin in tx.candidate().inputs() {
+                        available.coins.remove(&coin.outpoint());
+                    }
+                }
+            }
+        }
+        let known: BTreeSet<_> = self.pending.iter().map(|(id, _)| id).collect();
+        for batch in &mut self.batches {
+            batch.retain(|id| known.contains(id) && !bound.contains(id));
+        }
+        self.batches.retain(|batch| !batch.is_empty());
+        // Allocation within this tactic is disjoint; wallet observations remain intact.
         let mut transactions = BTreeMap::new();
-        for (sequence, ids) in self.batches.iter().enumerate() {
+        for ids in &self.batches {
             let execution_id = ExecutionId {
                 wallet: self.wallet_id,
-                sequence: sequence as u64,
+                sequence: self.next_sequence,
             };
+            // Identities are not reused, even for a candidate that never started.
+            self.next_sequence += 1;
             let queue = Batch {
                 queue: &self.pending,
                 ids,
             };
             let observed = WalletStateSnapshot::new(available.clone(), queue);
             match observed.funded_candidate(self.feerate, &mut self.rng, &self.change) {
-                Ok(Some(candidate)) => {
+                Ok(candidate) => {
+                    let candidate = candidate.expect("a batch is not empty");
                     for coin in candidate.inputs() {
                         available.coins.remove(&coin.outpoint());
                     }
@@ -237,7 +289,6 @@ impl<C: ChangeCosts, R: RngCore> State<C, R> {
                         })),
                     );
                 }
-                Ok(None) => {}
                 Err(err) => {
                     self.planning_errors
                         .insert(execution_id, error(format!("candidate funding: {err:?}")));
@@ -245,8 +296,9 @@ impl<C: ChangeCosts, R: RngCore> State<C, R> {
             }
         }
         // A partial allocation is not the complete outcome whose value was requested.
-        if self.planning_errors.is_empty() {
-            self.transactions = transactions;
+        if self.planning_errors.is_empty() && !transactions.is_empty() {
+            self.outcomes.push(transactions.keys().copied().collect());
+            self.transactions.extend(transactions);
         }
     }
 }
@@ -257,7 +309,7 @@ struct Batch<'a> {
 }
 impl Queue for Batch<'_> {
     type Id = u64;
-    fn iter(&self) -> impl Iterator<Item = (u64, &cost_function::intent::Intent)> {
+    fn iter(&self) -> impl Iterator<Item = (u64, &Intent)> {
         self.queue.iter().filter(|(id, _)| self.ids.contains(id))
     }
 }
@@ -270,30 +322,37 @@ impl<C: ChangeCosts, R: RngCore> Machine for State<C, R> {
     type Result = Result<Update, Error>;
 
     fn decide(&mut self, now: Instant) -> Decision<Request> {
-        if !self.planned {
-            self.generate_outcome();
-        }
-        if self
-            .transactions
-            .values()
-            .any(|tx| matches!(tx.status(), Status::Failed(_)))
-        {
-            return Decision::Wait;
+        if self.stale {
+            self.evaluate();
         }
         // Zero estimated durations and additional action costs: all eligible
-        // actions inherit the selected complete outcome's curve. Dispatch is a
-        // separate policy; this PoC uses the earliest crossing with stable ties.
-        let Some(at) = Candidate::joint_ready_at(
-            self.transactions.values().map(Transaction::candidate),
-            now,
-            self.grid,
-        ) else {
-            return Decision::Wait;
-        };
-        self.transactions
-            .values()
-            .flat_map(Transaction::available)
-            .map(|action| crate::driver::Scheduled { at, action })
+        // actions inherit their outcome's curve. A failure stops its own outcome.
+        // Dispatch is a separate policy; this PoC uses the earliest crossing with
+        // stable ties.
+        let grid = self.grid;
+        self.outcomes
+            .iter()
+            .map(|outcome| {
+                outcome
+                    .iter()
+                    .map(|id| &self.transactions[id])
+                    .collect::<Vec<_>>()
+            })
+            .filter(|outcome| {
+                !outcome
+                    .iter()
+                    .any(|tx| matches!(tx.status(), Status::Failed(_)))
+            })
+            .filter_map(|outcome| {
+                let at =
+                    Candidate::joint_ready_at(outcome.iter().map(|tx| tx.candidate()), now, grid)?;
+                Some(outcome.into_iter().map(move |tx| (at, tx)))
+            })
+            .flatten()
+            .flat_map(|(at, tx)| {
+                tx.available()
+                    .map(move |action| crate::driver::Scheduled { at, action })
+            })
             .min_by_key(|scheduled| (scheduled.at, scheduled.action.id()))
             .map_or(Decision::Wait, Decision::Schedule)
     }
@@ -325,17 +384,42 @@ impl<C: ChangeCosts, R: RngCore> Machine for State<C, R> {
     }
 
     fn observe(&mut self, input: Observation) {
-        if !self.planned
-            && let Observation::Invalidated(reason) = &input
-        {
-            self.planned = true;
-            self.planning_errors.insert(
-                ExecutionId {
-                    wallet: self.wallet_id,
-                    sequence: 0,
-                },
-                error(reason),
-            );
+        match input {
+            Observation::Intent(intent) => {
+                self.pending.push(intent);
+                // Evaluation removes the intents of started outcomes.
+                self.batches = vec![self.pending.iter().map(|(id, _)| id).collect()];
+                self.stale = true;
+                return;
+            }
+            Observation::Snapshot(mut snapshot) => {
+                // Recorded transactions are kept. A repeated snapshot changes nothing.
+                snapshot.recorded.extend(self.snapshot.recorded.clone());
+                if snapshot != self.snapshot {
+                    self.snapshot = snapshot;
+                    self.stale = true;
+                }
+                return;
+            }
+            Observation::FeeRate(feerate) => {
+                if feerate != self.feerate {
+                    self.feerate = feerate;
+                    self.stale = true;
+                }
+                return;
+            }
+            Observation::Invalidated(ref reason) if self.stale && !self.evaluated => {
+                self.stale = false;
+                self.evaluated = true;
+                self.planning_errors.insert(
+                    ExecutionId {
+                        wallet: self.wallet_id,
+                        sequence: self.next_sequence,
+                    },
+                    error(reason),
+                );
+            }
+            _ => {}
         }
         for (id, tx) in &mut self.transactions {
             if let Observation::TransactionInvalidated(target, _) = &input

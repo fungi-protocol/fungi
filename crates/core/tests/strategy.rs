@@ -902,3 +902,234 @@ fn invalidation_identifies_which_batch_lost_its_assumptions() {
     assert!(matches!(state.decide(now), Decision::Wait));
     assert_eq!(state.pending().iter().count(), 2);
 }
+
+fn payment(ramp_seconds: u64) -> Intent {
+    Intent::new(
+        Outcome::OutputCreation(FixedPaymentInstructions {
+            script_pubkey: script(2),
+            amount: Amount::from_sat(10_000),
+        }),
+        PayoffCurve::new(
+            0,
+            [(ramp_seconds * SLOTS_PER_SECOND, Amount::from_sat(100_000))],
+        )
+        .unwrap(),
+    )
+}
+
+/// Each transaction's execution sequence with the intent IDs it pays.
+fn funded(state: &Wallet) -> Vec<(u64, Vec<u64>)> {
+    state
+        .transactions()
+        .iter()
+        .map(|(id, tx)| {
+            (
+                id.sequence,
+                tx.candidate().payments().map(|(&id, _)| id).collect(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn an_added_intent_joins_the_unstarted_candidate() {
+    let now = Instant::now();
+    let mut state = fixture(now, 1, true, true);
+    let first = schedule(state.decide(now)).unwrap();
+    state.observe(Observation::Intent(payment(60)));
+    assert_eq!(funded(&state), [(0, vec![0])]);
+
+    let second = schedule(state.decide(now)).unwrap();
+    assert_eq!(second.action.action, Action::Start);
+    assert_eq!(funded(&state), [(1, vec![0, 1])]);
+    assert_eq!(state.pending().iter().count(), 2);
+    // A second payment shares the transaction's fixed cost and adds payoff.
+    assert!(second.at < first.at);
+}
+
+#[test]
+fn an_added_intent_merges_the_unstarted_batches() {
+    let now = Instant::now();
+    let mut state = split_fixture(now, true)
+        .with_batches(vec![vec![0], vec![1]])
+        .unwrap();
+    let _decision = state.decide(now);
+    assert_eq!(funded(&state), [(0, vec![0]), (1, vec![1])]);
+    state.observe(Observation::Intent(payment(60)));
+    let _decision = state.decide(now);
+    assert_eq!(funded(&state), [(2, vec![0, 1, 2])]);
+}
+
+#[test]
+fn a_started_transaction_keeps_its_intents_and_coins() {
+    let now = Instant::now();
+    let mut state = split_fixture(now, true);
+    let start = schedule(state.decide(now)).unwrap().action;
+    state.apply(start.clone());
+    state.observe(Observation::Intent(payment(60)));
+    let next = schedule(state.decide(now)).unwrap();
+
+    assert_eq!(funded(&state), [(0, vec![0, 1]), (1, vec![2])]);
+    assert_eq!(next.action.id().0.sequence, 1);
+    assert_eq!(
+        state.operations().map(|(id, _)| id).collect::<Vec<_>>(),
+        [start.id()]
+    );
+    let inputs: Vec<_> = state
+        .transactions()
+        .values()
+        .map(|tx| {
+            tx.candidate()
+                .inputs()
+                .map(|coin| coin.outpoint())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(inputs.iter().map(Vec::len).collect::<Vec<_>>(), [1, 1]);
+    assert_ne!(inputs[0], inputs[1]);
+}
+
+#[test]
+fn a_new_snapshot_restores_an_unfunded_candidate() {
+    let now = Instant::now();
+    let mut state = fixture(now, 1, false, true);
+    assert!(matches!(state.decide(now), Decision::Wait));
+    assert_eq!(state.planning_errors().len(), 1);
+
+    let snapshot = fixture(now, 1, true, true).snapshot().clone();
+    state.observe(Observation::Snapshot(snapshot.clone()));
+    let request = scheduled(&mut state, now);
+    assert!(state.planning_errors().is_empty());
+    assert_eq!(request.id().0.sequence, 1);
+    assert_eq!(state.snapshot(), &snapshot);
+}
+
+#[test]
+fn a_feerate_change_funds_the_candidate_again() {
+    let now = Instant::now();
+    let mut state = fixture(now, 1, true, true);
+    let cost = |state: &Wallet, request: &Request| {
+        state.transactions()[&request.id().0]
+            .candidate()
+            .objective_cost()
+            .unwrap()
+    };
+    let first = scheduled(&mut state, now);
+    let before = cost(&state, &first);
+    state.observe(Observation::FeeRate(FeeRate::from_sat_per_vb(20).unwrap()));
+    let second = scheduled(&mut state, now);
+    assert_eq!(funded(&state), [(1, vec![0])]);
+    assert!(cost(&state, &second) > before);
+}
+
+#[test]
+fn new_information_replaces_an_invalidated_candidate() {
+    let now = Instant::now();
+    let mut state = fixture(now, 1, true, true);
+    let first = scheduled(&mut state, now);
+    state.observe(Observation::Invalidated("coin spent elsewhere".into()));
+    assert!(matches!(state.decide(now), Decision::Wait));
+
+    // The invalidated coin is gone and another coin is available.
+    let snapshot = fixture(now, 2, true, true).snapshot().clone();
+    state.observe(Observation::Snapshot(snapshot));
+    let second = scheduled(&mut state, now);
+    assert_ne!(first.id(), second.id());
+    assert_eq!(funded(&state), [(1, vec![0])]);
+}
+
+#[test]
+fn repeated_information_keeps_the_candidate() {
+    let now = Instant::now();
+    let mut state = fixture(now, 1, true, true);
+    let first = schedule(state.decide(now)).unwrap();
+    state.observe(Observation::Snapshot(state.snapshot().clone()));
+    state.observe(Observation::FeeRate(FeeRate::from_sat_per_vb(2).unwrap()));
+    let second = schedule(state.decide(now)).unwrap();
+    assert_eq!(
+        (second.at, second.action.id()),
+        (first.at, first.action.id())
+    );
+    assert_eq!(funded(&state), [(0, vec![0])]);
+}
+
+#[test]
+fn an_intent_left_out_of_the_batches_joins_the_pool() {
+    let now = Instant::now();
+    let mut state = split_fixture(now, true)
+        .with_batches(vec![vec![0]])
+        .unwrap();
+    let _decision = state.decide(now);
+    assert_eq!(funded(&state), [(0, vec![0])]);
+    state.observe(Observation::Intent(payment(60)));
+    let _decision = state.decide(now);
+    assert_eq!(funded(&state), [(1, vec![0, 1, 2])]);
+}
+
+/// Start the first transaction of the split fixture, then add an intent that
+/// another transaction funds.
+fn two_outcomes(now: Instant) -> (Wallet, Request) {
+    let mut state = split_fixture(now, true);
+    let start = schedule(state.decide(now)).unwrap().action;
+    state.apply(start.clone());
+    state.completed(start.id(), Ok(Update::Applied));
+    state.observe(Observation::Intent(payment(60)));
+    let _decision = state.decide(now);
+    assert_eq!(funded(&state), [(0, vec![0, 1]), (1, vec![2])]);
+    (state, start)
+}
+
+#[test]
+fn a_failure_stops_only_its_own_outcome() {
+    let now = Instant::now();
+    let (mut state, start) = two_outcomes(now);
+    state.observe(Observation::TransactionInvalidated(
+        start.id().0,
+        "coin spent elsewhere".into(),
+    ));
+    let next = schedule(state.decide(now)).unwrap();
+    assert_eq!(next.action.action, Action::Start);
+    assert_eq!(next.action.id().0.sequence, 1);
+}
+
+#[test]
+fn a_failed_outcome_keeps_its_intents_and_releases_its_coins() {
+    let now = Instant::now();
+    let mut state = fixture(now, 1, true, true);
+    let start = scheduled(&mut state, now);
+    state.apply(start.clone());
+    state.completed(start.id(), Ok(Update::Applied));
+    state.observe(Observation::TransactionInvalidated(
+        start.id().0,
+        "coin spent elsewhere".into(),
+    ));
+    state.observe(Observation::Intent(payment(60)));
+    let next = scheduled(&mut state, now);
+    assert_eq!(funded(&state), [(0, vec![0]), (1, vec![1])]);
+    let inputs = |id| {
+        state.transactions()[&id]
+            .candidate()
+            .inputs()
+            .map(|coin| coin.outpoint())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(inputs(next.id().0), inputs(start.id().0));
+}
+
+#[test]
+fn a_failed_start_keeps_its_attempt() {
+    let now = Instant::now();
+    let mut state = fixture(now, 1, true, true);
+    let start = scheduled(&mut state, now);
+    state.apply(start.clone());
+    let failure = Error("execution already bound".into());
+    state.completed(start.id(), Err(failure.clone()));
+    state.observe(Observation::Snapshot(
+        fixture(now, 2, true, true).snapshot().clone(),
+    ));
+    assert!(matches!(state.decide(now), Decision::Wait));
+    assert_eq!(funded(&state), [(0, vec![0])]);
+    let tx = &state.transactions()[&start.id().0];
+    assert_eq!(tx.operation_errors()[&Action::Start], failure);
+    assert_eq!(tx.status(), &Status::Failed(failure));
+}
