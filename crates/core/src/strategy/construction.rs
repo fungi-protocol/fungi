@@ -1,6 +1,13 @@
 //! Construction state and effect receipts for one transaction.
 
-use super::{Action, Error, Payment, Plan, Update, error, signing, validate};
+use super::{
+    Action, Error, Payment, Plan, Update, error,
+    session::{
+        FeeContribution, InputContribution, Message, OutputContribution, Payload, Progress,
+        WitnessContribution,
+    },
+    signing, validate,
+};
 use crate::wallet::{Coin, Snapshot};
 use bitcoin::{
     Amount, FeeRate, OutPoint, Psbt, ScriptBuf, Sequence, TxOut, Weight, absolute, psbt,
@@ -9,7 +16,7 @@ use bitcoin::{
 use concurrent_psbt::{
     global::{
         PSBT_GLOBAL_SORT_KEY_DERIVATION_SUBTYPE, PSBT_GLOBAL_TX_UNORDERED_SUBTYPE,
-        PSBT_GLOBAL_TX_UUID_SUBTYPE,
+        PSBT_GLOBAL_TX_UUID_SUBTYPE, SortSeed,
     },
     input::Input,
     output::{Output, UniqueId},
@@ -35,6 +42,7 @@ struct Frozen {
 pub(super) enum Effect {
     /// The action changes only the construction state.
     Local,
+    Send(Message),
     AllocateChange,
     Sign {
         outpoint: OutPoint,
@@ -44,7 +52,7 @@ pub(super) enum Effect {
     Publish(bitcoin::Transaction),
 }
 
-/// Construction state for one transaction. Only completed operations change it.
+/// Construction state for one transaction.
 pub(super) struct Execution {
     plan: Arc<Plan>,
     /// The PSBT under construction. It does not change once the transaction is frozen.
@@ -54,6 +62,9 @@ pub(super) struct Execution {
     scripts: BTreeMap<usize, ScriptBuf>,
     completed: BTreeSet<Action>,
     payment: Option<Payment>,
+    progress: Progress,
+    inputs_ready: Option<(usize, Message)>,
+    outputs_ready: Option<(usize, Message)>,
 }
 
 fn priced_prevout<'a>(snapshot: &'a Snapshot, coin: &Utxo) -> Result<&'a Coin, Error> {
@@ -101,11 +112,80 @@ impl Execution {
             scripts: BTreeMap::new(),
             completed: BTreeSet::new(),
             payment: None,
+            progress: Progress::initial(),
+            inputs_ready: None,
+            outputs_ready: None,
         }
     }
 
     pub(super) fn payment(&self) -> Option<&Payment> {
         self.payment.as_ref()
+    }
+
+    pub(super) fn progress(&self) -> &Progress {
+        &self.progress
+    }
+
+    pub(super) fn set_session_view(
+        &mut self,
+        progress: Progress,
+        inputs_ready: Option<(usize, Message)>,
+        outputs_ready: Option<(usize, Message)>,
+    ) {
+        self.progress = progress;
+        self.inputs_ready = inputs_ready;
+        self.outputs_ready = outputs_ready;
+    }
+
+    pub(super) fn pending_inputs_ready(&self) -> Option<usize> {
+        self.inputs_ready.as_ref().map(|(count, _)| *count)
+    }
+
+    pub(super) fn pending_outputs_ready(&self) -> Option<usize> {
+        self.outputs_ready.as_ref().map(|(count, _)| *count)
+    }
+
+    pub(super) fn all_inputs_signed(&self) -> bool {
+        self.frozen.as_ref().is_some_and(|frozen| {
+            frozen
+                .psbt
+                .inputs
+                .iter()
+                .all(|input| input.final_script_witness.is_some())
+        })
+    }
+
+    pub(super) fn frozen_txid(&self) -> Option<bitcoin::Txid> {
+        self.frozen
+            .as_ref()
+            .map(|frozen| frozen.psbt.unsigned_tx.compute_txid())
+    }
+
+    pub(super) fn apply_witness(&mut self, contrib: &WitnessContribution) -> Result<bool, Error> {
+        let Some(frozen) = self.frozen.as_mut() else {
+            return Ok(false);
+        };
+        let Some(position) = frozen
+            .psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .position(|input| input.previous_output == contrib.outpoint)
+        else {
+            return Ok(false);
+        };
+        if frozen.psbt.inputs[position].final_script_witness.as_ref() == Some(&contrib.witness) {
+            return Ok(false);
+        }
+        signing::apply(
+            &mut frozen.psbt,
+            position,
+            psbt::Input {
+                final_script_witness: Some(contrib.witness.clone()),
+                ..Default::default()
+            },
+        )?;
+        Ok(true)
     }
 
     /// Replacement fee liability incurred once this frozen transaction has been signed.
@@ -122,6 +202,64 @@ impl Execution {
     /// Return the IO the action requires. This does not change the construction state.
     pub(super) fn effect(&self, action: &Action) -> Effect {
         match *action {
+            Action::SendInput(index) => {
+                let config = self.session_config();
+                let coin = self.input(index);
+                let outpoint = coin.outpoint();
+                Effect::Send(Message {
+                    session_id: config.id,
+                    sender: config.side,
+                    payload: Payload::Input(InputContribution {
+                        outpoint,
+                        witness_utxo: self.plan.snapshot.coins[&outpoint].txout.clone(),
+                        sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    }),
+                })
+            }
+            Action::SendInputsReady(count) => {
+                let (expected, message) = self
+                    .inputs_ready
+                    .as_ref()
+                    .expect("the path dispatches the current input readiness");
+                assert_eq!(*expected, count);
+                Effect::Send(message.clone())
+            }
+            Action::SendOutput(index) => {
+                let config = self.session_config();
+                let (id, tx_out) = self.output(index);
+                Effect::Send(Message {
+                    session_id: config.id,
+                    sender: config.side,
+                    payload: Payload::Output(OutputContribution { id, tx_out }),
+                })
+            }
+            Action::SendFee => {
+                let config = self.session_config();
+                Effect::Send(Message {
+                    session_id: config.id,
+                    sender: config.side,
+                    payload: Payload::Fee(FeeContribution {
+                        id: self.plan.fee_id.clone(),
+                        amount: self.plan.local_fee(),
+                    }),
+                })
+            }
+            Action::SendOutputsReady(count) => {
+                let (expected, message) = self
+                    .outputs_ready
+                    .as_ref()
+                    .expect("the path dispatches the current output readiness");
+                assert_eq!(*expected, count);
+                Effect::Send(message.clone())
+            }
+            Action::SendWitness(index) => {
+                let config = self.session_config();
+                Effect::Send(Message {
+                    session_id: config.id,
+                    sender: config.side,
+                    payload: Payload::Witness(self.local_witness(index)),
+                })
+            }
             Action::AllocateChange(_) => Effect::AllocateChange,
             Action::Sign(index) => Effect::Sign {
                 outpoint: self.input(index).outpoint(),
@@ -156,7 +294,15 @@ impl Execution {
     /// Apply an action whose IO returned no value.
     fn construct(&mut self, action: &Action) -> Result<(), Error> {
         match *action {
-            Action::Start | Action::Record | Action::Publish => {}
+            Action::Start
+            | Action::Record
+            | Action::Publish
+            | Action::SendInput(_)
+            | Action::SendInputsReady(_)
+            | Action::SendOutput(_)
+            | Action::SendFee
+            | Action::SendOutputsReady(_)
+            | Action::SendWitness(_) => {}
             Action::AllocateChange(_) | Action::Sign(_) => {
                 return Err(error("unexpected effect result"));
             }
@@ -182,11 +328,24 @@ impl Execution {
                         .all(|i| self.completed.contains(&Action::Input(i))),
                     "the path closes inputs after every input contribution"
                 );
-                self.psbt = Inputs::try_from_psbt(self.active().clone())
-                    .map_err(error)?
-                    .no_more_inputs()
-                    .into_inner()
-                    .into_psbt();
+                let mut constructor =
+                    Inputs::try_from_psbt(self.active().clone()).map_err(error)?;
+                if self.plan.session.is_some() {
+                    let agreed = self
+                        .progress
+                        .inputs()
+                        .expect("the path closes inputs after session inputs finalize");
+                    for contrib in agreed {
+                        if !contrib.witness_utxo.script_pubkey.is_p2tr() {
+                            return Err(error("PoC signer path only supports P2TR key spends"));
+                        }
+                        let mut input = Input::new(&contrib.outpoint);
+                        input.set_witness_utxo(Some(contrib.witness_utxo.clone()));
+                        input.set_sequence(Some(contrib.sequence));
+                        constructor = constructor.input(input).map_err(error)?;
+                    }
+                }
+                self.psbt = constructor.no_more_inputs().into_inner().into_psbt();
             }
             Action::Output(index) => {
                 let constructor = self.outputs();
@@ -204,7 +363,28 @@ impl Execution {
                     (0..count).all(|i| self.completed.contains(&Action::Output(i))),
                     "the path closes outputs after every output contribution"
                 );
-                let ordered = self.outputs().no_more_outputs().into_ordered_psbt();
+                let mut constructor = self.outputs();
+                if self.plan.session.is_some() {
+                    let (agreed, _, entropy) = self
+                        .progress
+                        .outputs()
+                        .expect("the path closes outputs after session outputs finalize");
+                    for contrib in agreed {
+                        constructor = constructor
+                            .output(Output::new(
+                                contrib.id.clone(),
+                                contrib.tx_out.value,
+                                contrib.tx_out.script_pubkey.clone(),
+                            ))
+                            .map_err(error)?;
+                    }
+                    if let Some(seed) = entropy {
+                        constructor = constructor
+                            .try_set_seed(SortSeed::from(seed.to_vec()))
+                            .map_err(error)?;
+                    }
+                }
+                let ordered = constructor.no_more_outputs().into_ordered_psbt();
                 let tx = psbt_v2::v2::Signer::new(ordered.clone())
                     .map_err(error)?
                     .unsigned_tx();
@@ -225,11 +405,17 @@ impl Execution {
                 }
                 let fee = self.validate(&psbt)?;
                 self.frozen = Some(Frozen { psbt, outputs, fee });
+                if let Some(signatures) = self.progress.signatures().cloned() {
+                    for contrib in &signatures {
+                        self.apply_witness(contrib)?;
+                    }
+                }
             }
             Action::Finalize => {
                 assert!(
                     (0..self.plan.candidate.inputs().count())
-                        .all(|i| self.completed.contains(&Action::Sign(i))),
+                        .all(|i| self.completed.contains(&Action::Sign(i)))
+                        && self.all_inputs_signed(),
                     "the path finalizes after every signature"
                 );
                 let Frozen { psbt, outputs, fee } = self.frozen();
@@ -271,6 +457,29 @@ impl Execution {
             .position(|input| input.previous_output == outpoint)
             .expect("freezing verified the selected inputs");
         signing::apply(&mut frozen.psbt, position, signed)
+    }
+
+    fn local_witness(&self, index: usize) -> WitnessContribution {
+        let outpoint = self.input(index).outpoint();
+        let frozen = self.frozen();
+        let position = frozen
+            .psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .position(|input| input.previous_output == outpoint)
+            .expect("freezing verified the selected inputs");
+        let witness = frozen.psbt.inputs[position]
+            .final_script_witness
+            .clone()
+            .expect("the path sends a witness after signing");
+        WitnessContribution { outpoint, witness }
+    }
+
+    fn session_config(&self) -> super::session::Config {
+        self.plan
+            .session
+            .expect("session action requires a session plan")
     }
 
     fn input(&self, index: usize) -> &Utxo {
@@ -329,28 +538,44 @@ impl Execution {
     }
 
     fn validate(&self, psbt: &Psbt) -> Result<Amount, Error> {
-        let expected_outputs = self
-            .plan
-            .candidate
-            .payments()
-            .map(|(_, output)| output.clone())
-            .chain(
-                self.plan
-                    .candidate
-                    .change()
-                    .enumerate()
-                    .map(|(index, priced)| self.change_output(index, priced)),
-            )
+        let local_outputs: Vec<_> = (0..self.plan.output_ids.len())
+            .map(|index| self.output(index))
             .collect();
-        let expected_inputs = self
-            .plan
-            .candidate
-            .inputs()
-            .map(|coin| {
-                let outpoint = coin.outpoint();
-                (outpoint, &self.plan.snapshot.coins[&outpoint].txout)
-            })
-            .collect();
+        let (expected_outputs, expected_inputs, explicit_fees) = if self.plan.session.is_some() {
+            let agreed_inputs = self
+                .progress
+                .inputs()
+                .expect("session validation has agreed inputs");
+            let (agreed_outputs, agreed_fees, _) = self
+                .progress
+                .outputs()
+                .expect("session validation has agreed outputs");
+            if !agreed_fees.contains(&FeeContribution {
+                id: self.plan.fee_id.clone(),
+                amount: self.plan.local_fee(),
+            }) {
+                return Err(error("agreed fees omit or alter the local fee"));
+            }
+            let outputs = agreed_outputs.iter().map(|c| c.tx_out.clone()).collect();
+            let inputs = agreed_inputs
+                .iter()
+                .map(|c| (c.outpoint, &c.witness_utxo))
+                .collect();
+            let fees = agreed_fees.iter().map(|f| f.amount).collect::<Vec<_>>();
+            (outputs, inputs, Some(fees))
+        } else {
+            let outputs = local_outputs.into_iter().map(|(_, out)| out).collect();
+            let inputs = self
+                .plan
+                .candidate
+                .inputs()
+                .map(|coin| {
+                    let outpoint = coin.outpoint();
+                    (outpoint, &self.plan.snapshot.coins[&outpoint].txout)
+                })
+                .collect();
+            (outputs, inputs, None)
+        };
         validate::transaction(psbt, expected_outputs, expected_inputs)?;
         validate::accounting(
             psbt.inputs.iter().map(|input| {
@@ -361,6 +586,7 @@ impl Execution {
                     .value
             }),
             psbt.unsigned_tx.output.iter().map(|output| output.value),
+            explicit_fees.as_deref(),
             self.plan.candidate.inputs().map(|coin| coin.value()),
             self.plan.candidate.change().map(|change| change.value),
             self.plan
@@ -427,6 +653,7 @@ mod prevout_tests {
             candidate,
             snapshot,
             feerate,
+            None,
             [1; 16],
             &mut rng,
         )));

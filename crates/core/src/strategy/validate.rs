@@ -61,6 +61,7 @@ pub(super) fn transaction(
 pub(super) fn accounting(
     all_inputs: impl Iterator<Item = Amount>,
     all_outputs: impl Iterator<Item = Amount>,
+    explicit_fees: Option<&[Amount]>,
     local_inputs: impl Iterator<Item = Amount>,
     local_change: impl Iterator<Item = Amount>,
     local_payments: impl Iterator<Item = Amount>,
@@ -71,6 +72,12 @@ pub(super) fn accounting(
     let fee = total_spent
         .checked_sub(total_outputs)
         .ok_or_else(|| error("transaction is unfunded"))?;
+    if let Some(fees) = explicit_fees {
+        let agreed_fee = sum(fees.iter().copied(), "fee")?;
+        if fee != agreed_fee {
+            return Err(error("agreed outputs and fees do not balance inputs"));
+        }
+    }
     let local_spent = sum(local_inputs, "local input")?;
     let local_change_sum = sum(local_change, "change")?;
     let local_payments_sum = sum(local_payments, "payment")?;
@@ -216,6 +223,7 @@ mod tests {
                 accounting(
                     inputs.iter().copied().map(Amount::from_sat),
                     outputs.iter().copied().map(Amount::from_sat),
+                    None,
                     inputs.iter().copied().map(Amount::from_sat),
                     change.iter().copied().map(Amount::from_sat),
                     payments.iter().copied().map(Amount::from_sat),
@@ -255,6 +263,7 @@ mod tests {
             accounting(
                 [20_000, 15_000].into_iter().map(Amount::from_sat),
                 [12_000, 7_900, 14_920].into_iter().map(Amount::from_sat),
+                Some(&[Amount::from_sat(100), Amount::from_sat(80)]),
                 [20_000].into_iter().map(Amount::from_sat),
                 [7_900].into_iter().map(Amount::from_sat),
                 [12_000].into_iter().map(Amount::from_sat),
@@ -262,11 +271,26 @@ mod tests {
             ),
             Ok(Amount::from_sat(180))
         );
+        assert_eq!(
+            accounting(
+                [20_000, 15_000].into_iter().map(Amount::from_sat),
+                [12_000, 7_900, 14_920].into_iter().map(Amount::from_sat),
+                Some(&[Amount::from_sat(100), Amount::from_sat(79)]),
+                [20_000].into_iter().map(Amount::from_sat),
+                [7_900].into_iter().map(Amount::from_sat),
+                [12_000].into_iter().map(Amount::from_sat),
+                Some(SignedAmount::from_sat(12_100)),
+            )
+            .unwrap_err()
+            .0,
+            "agreed outputs and fees do not balance inputs"
+        );
         // Peer contributes 15,000 in and 15,050 out (consumes 50 sats of local fee): rejected.
         assert_eq!(
             accounting(
                 [20_000, 15_000].into_iter().map(Amount::from_sat),
                 [12_000, 7_900, 15_050].into_iter().map(Amount::from_sat),
+                None,
                 [20_000].into_iter().map(Amount::from_sat),
                 [7_900].into_iter().map(Amount::from_sat),
                 [12_000].into_iter().map(Amount::from_sat),
@@ -284,6 +308,7 @@ mod tests {
             accounting(
                 [Amount::from_sat(u64::MAX)].into_iter(),
                 std::iter::empty(),
+                None,
                 [Amount::from_sat(u64::MAX)].into_iter(),
                 std::iter::empty(),
                 std::iter::empty(),

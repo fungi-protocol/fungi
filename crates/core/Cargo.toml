@@ -7,6 +7,7 @@ version.workspace = true
 bitcoin = "=0.32.8"
 concurrent-psbt = { git = "https://github.com/fungi-protocol/concurrent-psbt/", rev = "7bf09f4e6b89b38a14504a0a67f03a7c93d590ca", default-features = false }
 cost-function = { path = "../cost-function" }
+fungi-transport = { path = "../transport" }
 futures = "0.3"
 psbt-v2 = "=0.3.0"
 rand = "=0.9.5"
@@ -15,7 +16,9 @@ thiserror = "2"
 [dev-dependencies]
 bdk_wallet = "=3.2.0"
 fungi-regtest = { path = "../regtest" }
-tokio = { version = "1", features = ["macros", "rt", "time"] }
+fungi-transport-testkit = { path = "../transport-testkit" }
+proptest = "=1.11.0"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }

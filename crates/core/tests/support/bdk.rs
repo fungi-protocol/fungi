@@ -31,9 +31,13 @@ pub struct Adapter {
 }
 impl Adapter {
     pub fn new() -> Self {
+        Self::with_seed([42; 32])
+    }
+
+    pub fn with_seed(seed: [u8; 32]) -> Self {
         let secp = Secp256k1::new();
         let network = Network::Regtest;
-        let master = Xpriv::new_master(network, &[42; 32]).unwrap();
+        let master = Xpriv::new_master(network, &seed).unwrap();
         let (external, mut keys) = format!("tr({master}/86'/1'/0'/0/*)")
             .into_wallet_descriptor(&secp, network.into())
             .unwrap();

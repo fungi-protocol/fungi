@@ -22,13 +22,15 @@ use cost_function::{
 };
 use rand::RngCore;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, btree_map::Entry},
+    num::NonZeroUsize,
     sync::Arc,
     time::Instant,
 };
 
 mod construction;
 mod execute;
+pub mod session;
 pub use execute::{Broadcaster, Executor, Signers};
 
 /// Local execution identity, independent of the shared construction-session UUID.
@@ -43,10 +45,14 @@ struct Plan {
     candidate: Candidate<u64>,
     snapshot: Snapshot,
     feerate: FeeRate,
-    /// Shared construction-session UUID. The local tactic derives it from the execution identity.
+    /// Collaborative construction-session configuration, or `None` when unilateral.
+    session: Option<session::Config>,
+    /// PSBTv2 `PSBT_GLOBAL_TX_UUID`: shared across session peers, or derived locally when unilateral.
     session_id: [u8; 16],
     /// Opaque contribution identities for local payment and change outputs, stable across retries.
     output_ids: Vec<UniqueId>,
+    /// Opaque contribution identity for this wallet's explicit fee contribution in a session.
+    fee_id: UniqueId,
     /// Wallet-private mapping from payment output contribution identity bytes to queue intent ID.
     payment_outputs: BTreeMap<Vec<u8>, u64>,
 }
@@ -57,6 +63,7 @@ impl Plan {
         candidate: Candidate<u64>,
         snapshot: Snapshot,
         feerate: FeeRate,
+        session: Option<session::Config>,
         session_id: [u8; 16],
         rng: &mut R,
     ) -> Self {
@@ -71,15 +78,34 @@ impl Plan {
             let id = random_output_id(rng, &output_ids);
             output_ids.push(id);
         }
+        let fee_id = random_output_id(rng, &output_ids);
         Self {
             execution_id,
             candidate,
             snapshot,
             feerate,
+            session,
             session_id,
             output_ids,
+            fee_id,
             payment_outputs,
         }
+    }
+
+    fn local_fee(&self) -> Amount {
+        let inputs = self
+            .candidate
+            .inputs()
+            .fold(Amount::ZERO, |sum, coin| sum + coin.value());
+        let payments = self
+            .candidate
+            .payments()
+            .fold(Amount::ZERO, |sum, (_, out)| sum + out.value);
+        let change = self
+            .candidate
+            .change()
+            .fold(Amount::ZERO, |sum, out| sum + out.value);
+        inputs - payments - change
     }
 }
 
@@ -111,11 +137,17 @@ mod tests {
 pub enum Action {
     Start,
     Input(usize),
+    SendInput(usize),
+    SendInputsReady(usize),
     CloseInputs,
     AllocateChange(usize),
     Output(usize),
+    SendOutput(usize),
+    SendFee,
+    SendOutputsReady(usize),
     CloseOutputs,
     Sign(usize),
+    SendWitness(usize),
     Finalize,
     Record,
     Publish,
@@ -191,6 +223,17 @@ pub enum Observation {
     /// The wallet reports its coins. Recorded transactions are kept.
     Snapshot(Snapshot),
     FeeRate(FeeRate),
+    /// Explicitly enter a collaborative construction session.
+    Session(session::Config),
+    /// Receive a flooded peer message from a session transport channel.
+    Peer(session::Message),
+    /// Apply an externally synchronized session progress view.
+    SessionProgress {
+        session_id: [u8; 16],
+        progress: session::Progress,
+    },
+    /// Observe a signed transaction broadcast on the Bitcoin network.
+    Broadcast(bitcoin::Transaction),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -207,6 +250,21 @@ mod transaction;
 mod validate;
 pub use transaction::Transaction;
 
+struct SessionEntry {
+    config: session::Config,
+    tracker: session::Tracker,
+    external_progress: Option<session::Progress>,
+    bound_execution: Option<ExecutionId>,
+}
+
+impl SessionEntry {
+    fn current_progress(&self) -> session::Progress {
+        self.external_progress
+            .clone()
+            .unwrap_or_else(|| self.tracker.progress())
+    }
+}
+
 /// State holds wallet observations, the outcome for unstarted intents and transaction executions.
 pub struct State<C, R> {
     pending: InMemoryQueue,
@@ -221,6 +279,8 @@ pub struct State<C, R> {
     explicit_batches: bool,
     /// Each outcome holds the transactions funded by one evaluation.
     outcomes: Vec<BTreeSet<ExecutionId>>,
+    sessions: BTreeMap<[u8; 16], SessionEntry>,
+    orphaned_messages: BTreeMap<[u8; 16], Vec<session::Message>>,
     /// This is set when information relevant to funding the unstarted batches arrives.
     stale: bool,
     evaluated: bool,
@@ -253,6 +313,8 @@ impl<C: ChangeCosts, R: RngCore> State<C, R> {
             batches,
             explicit_batches: false,
             outcomes: Vec::new(),
+            sessions: BTreeMap::new(),
+            orphaned_messages: BTreeMap::new(),
             stale: true,
             evaluated: false,
             next_sequence: 0,
@@ -293,6 +355,34 @@ impl<C: ChangeCosts, R: RngCore> State<C, R> {
         Ok(self)
     }
 
+    /// Explicitly enter a collaborative construction session before initial evaluation.
+    pub fn with_session(mut self, config: session::Config) -> Result<Self, Error> {
+        if self.evaluated {
+            return Err(error("initial allocation has already been evaluated"));
+        }
+        if self.sessions.contains_key(&config.id) {
+            return Err(error("duplicate session identity"));
+        }
+        let mut tracker = session::Tracker::new(config.id);
+        tracker.set_additional_entropy(config.additional_entropy);
+        self.sessions.insert(
+            config.id,
+            SessionEntry {
+                config,
+                tracker,
+                external_progress: None,
+                bound_execution: None,
+            },
+        );
+        Ok(self)
+    }
+
+    pub fn session_progress(&self, session_id: &[u8; 16]) -> Option<session::Progress> {
+        self.sessions
+            .get(session_id)
+            .map(SessionEntry::current_progress)
+    }
+
     pub fn pending(&self) -> &InMemoryQueue {
         &self.pending
     }
@@ -309,6 +399,46 @@ impl<C: ChangeCosts, R: RngCore> State<C, R> {
         &self.warnings
     }
 
+    fn requeue_excluded(&mut self, exec_id: ExecutionId) {
+        if self.explicit_batches {
+            let already_batched: BTreeSet<_> = self.batches.iter().flatten().copied().collect();
+            let ids: BTreeSet<_> = self.transactions[&exec_id]
+                .candidate()
+                .payments()
+                .map(|(&id, _)| id)
+                .filter(|id| !already_batched.contains(id))
+                .collect();
+            if !ids.is_empty() {
+                self.batches.push(ids);
+            }
+        } else {
+            self.batches = vec![self.pending.iter().map(|(id, _)| id).collect()];
+        }
+        self.stale = true;
+    }
+
+    fn refresh_session(&mut self, session_id: [u8; 16]) {
+        let entry = &self.sessions[&session_id];
+        let progress = entry.current_progress();
+        if let Some(exec_id) = entry.bound_execution {
+            let tx = self
+                .transactions
+                .get_mut(&exec_id)
+                .expect("bound session execution exists");
+            let was_excluded = tx.excluded();
+            if entry.external_progress.is_some() {
+                tx.set_progress(progress);
+            } else {
+                tx.sync_tracker(&entry.tracker);
+            }
+            if !was_excluded && tx.excluded() {
+                self.requeue_excluded(exec_id);
+            }
+        } else if progress.open != Some(session::Phase::Inputs) {
+            self.stale = true;
+        }
+    }
+
     /// Fund each batch again, replacing the outcomes that have not started.
     fn evaluate(&mut self) {
         // Clock ticks and unrelated completions must not redraw coins or identities.
@@ -319,11 +449,19 @@ impl<C: ChangeCosts, R: RngCore> State<C, R> {
             .retain(|outcome| outcome.iter().any(|id| transactions[id].started()));
         let started: BTreeSet<_> = self.outcomes.iter().flatten().copied().collect();
         self.transactions.retain(|id, _| started.contains(id));
+        for entry in self.sessions.values_mut() {
+            if entry
+                .bound_execution
+                .is_some_and(|id| !self.transactions.contains_key(&id))
+            {
+                entry.bound_execution = None;
+            }
+        }
         self.planning_errors.clear();
         self.warnings.clear();
-        // Started outcomes keep their intents. Active outcomes reserve their inputs;
-        // failed outcomes that already signed attach an RBF replacement liability to
-        // their coins instead of locking them or releasing them for free.
+        // Started outcomes keep their intents unless excluded by a closed session phase.
+        // Active outcomes reserve their inputs; failed outcomes that already signed attach
+        // an RBF replacement liability to their coins instead of locking or freeing them.
         let mut available = self.snapshot.clone();
         let mut liabilities = BTreeMap::<OutPoint, Amount>::new();
         let mut bound = BTreeSet::new();
@@ -333,7 +471,9 @@ impl<C: ChangeCosts, R: RngCore> State<C, R> {
                 .iter()
                 .any(|tx| matches!(tx.status(), Status::Failed(_)));
             for tx in outcome {
-                bound.extend(tx.candidate().payments().map(|(&id, _)| id));
+                if !tx.excluded() {
+                    bound.extend(tx.candidate().payments().map(|(&id, _)| id));
+                }
                 if !failed {
                     for coin in tx.candidate().inputs() {
                         available.coins.remove(&coin.outpoint());
@@ -351,8 +491,19 @@ impl<C: ChangeCosts, R: RngCore> State<C, R> {
             batch.retain(|id| known.contains(id) && !bound.contains(id));
         }
         self.batches.retain(|batch| !batch.is_empty());
+        let mut open_sessions: Vec<_> = self
+            .sessions
+            .values()
+            .filter(|entry| {
+                entry.bound_execution.is_none()
+                    && entry.current_progress().open == Some(session::Phase::Inputs)
+            })
+            .map(|entry| entry.config)
+            .collect();
+        open_sessions.reverse();
         // Allocation within this tactic is disjoint; wallet observations remain intact.
         let mut transactions = BTreeMap::new();
+        let mut session_bindings = Vec::new();
         for ids in &self.batches {
             let execution_id = ExecutionId {
                 wallet: self.wallet_id,
@@ -360,6 +511,9 @@ impl<C: ChangeCosts, R: RngCore> State<C, R> {
             };
             // Identities are not reused, even for a candidate that never started.
             self.next_sequence += 1;
+            let session_config = open_sessions.pop();
+            let participants =
+                session_config.map_or(NonZeroUsize::MIN, |config| config.participants());
             let priced = PricedSnapshot {
                 snapshot: &available,
                 liabilities: &liabilities,
@@ -371,8 +525,12 @@ impl<C: ChangeCosts, R: RngCore> State<C, R> {
                     ids,
                 },
             );
-            let funded = match observed.funded_candidate(self.feerate, &mut self.rng, &self.change)
-            {
+            let funded = match observed.funded_candidate_for_session(
+                self.feerate,
+                participants,
+                &mut self.rng,
+                &self.change,
+            ) {
                 Ok(candidate) => Ok(candidate.expect("a batch is not empty")),
                 Err(FundingError::NoCombinationCovers) => {
                     self.warnings
@@ -384,6 +542,7 @@ impl<C: ChangeCosts, R: RngCore> State<C, R> {
                             &self.pending,
                             ids,
                             self.feerate,
+                            participants,
                             &mut self.rng,
                             &self.change,
                         )
@@ -399,24 +558,38 @@ impl<C: ChangeCosts, R: RngCore> State<C, R> {
                     for coin in candidate.inputs() {
                         available.coins.remove(&coin.outpoint());
                     }
-                    let seed = [
-                        self.wallet_id.as_slice(),
-                        &execution_id.sequence.to_be_bytes(),
-                    ]
-                    .concat();
-                    let mut session_id = [0; 16];
-                    session_id.copy_from_slice(&sha256::Hash::hash(&seed).to_byte_array()[..16]);
-                    transactions.insert(
+                    let session_id = match session_config {
+                        Some(config) => config.id,
+                        None => {
+                            let seed = [
+                                self.wallet_id.as_slice(),
+                                &execution_id.sequence.to_be_bytes(),
+                            ]
+                            .concat();
+                            let mut id = [0; 16];
+                            id.copy_from_slice(&sha256::Hash::hash(&seed).to_byte_array()[..16]);
+                            id
+                        }
+                    };
+                    let mut tx = Transaction::new(Arc::new(Plan::new(
                         execution_id,
-                        Transaction::new(Arc::new(Plan::new(
-                            execution_id,
-                            candidate,
-                            self.snapshot.clone(),
-                            self.feerate,
-                            session_id,
-                            &mut self.rng,
-                        ))),
-                    );
+                        candidate,
+                        self.snapshot.clone(),
+                        self.feerate,
+                        session_config,
+                        session_id,
+                        &mut self.rng,
+                    )));
+                    if let Some(config) = session_config {
+                        let entry = &self.sessions[&config.id];
+                        if let Some(progress) = &entry.external_progress {
+                            tx.set_progress(progress.clone());
+                        } else {
+                            tx.sync_tracker(&entry.tracker);
+                        }
+                        session_bindings.push((config.id, execution_id));
+                    }
+                    transactions.insert(execution_id, tx);
                 }
                 Err(err) => {
                     self.planning_errors
@@ -426,6 +599,9 @@ impl<C: ChangeCosts, R: RngCore> State<C, R> {
         }
         // A partial allocation is not the complete outcome whose value was requested.
         if self.planning_errors.is_empty() && !transactions.is_empty() {
+            for (session_id, exec_id) in session_bindings {
+                self.sessions.get_mut(&session_id).unwrap().bound_execution = Some(exec_id);
+            }
             self.outcomes.push(transactions.keys().copied().collect());
             self.transactions.extend(transactions);
         }
@@ -452,12 +628,14 @@ impl UtxoSnapshot for PricedSnapshot<'_> {
     }
 }
 
+#[expect(clippy::too_many_arguments)]
 fn prioritize_subset<C: ChangeCosts, R: RngCore>(
     available: &Snapshot,
     liabilities: &BTreeMap<OutPoint, Amount>,
     pending: &InMemoryQueue,
     ids: &BTreeSet<u64>,
     feerate: FeeRate,
+    participants: NonZeroUsize,
     rng: &mut R,
     change: &C,
 ) -> Option<Candidate<u64>> {
@@ -476,7 +654,9 @@ fn prioritize_subset<C: ChangeCosts, R: RngCore>(
                 ids: &next,
             },
         );
-        if let Ok(Some(candidate)) = trial.funded_candidate(feerate, rng, change) {
+        if let Ok(Some(candidate)) =
+            trial.funded_candidate_for_session(feerate, participants, rng, change)
+        {
             chosen = next;
             funded = Some(candidate);
         }
@@ -553,13 +733,23 @@ impl<C: ChangeCosts, R: RngCore> Machine for State<C, R> {
 
     fn completed(&mut self, id: OperationId, result: Self::Result) {
         if let Some(tx) = self.transactions.get_mut(&id.0) {
-            tx.completed_operation(id, result);
+            let sent = tx.completed_operation(id, result);
             if tx.completed().contains(&Action::Record) {
                 let payment = tx.payment().expect("recorded payment is finalized");
                 self.snapshot.recorded.insert(
                     payment.transaction.compute_txid(),
                     payment.transaction.clone(),
                 );
+            }
+            if let Some(session_id) = tx.session_id()
+                && let Some(entry) = self.sessions.get_mut(&session_id)
+            {
+                if let Some(message) = sent {
+                    let _ = entry.tracker.record(&message);
+                }
+                if entry.external_progress.is_none() {
+                    tx.sync_tracker(&entry.tracker);
+                }
             }
         }
     }
@@ -587,6 +777,89 @@ impl<C: ChangeCosts, R: RngCore> Machine for State<C, R> {
                 if feerate != self.feerate {
                     self.feerate = feerate;
                     self.stale = true;
+                }
+                return;
+            }
+            Observation::Session(config) => {
+                if let Entry::Vacant(vacant) = self.sessions.entry(config.id) {
+                    let mut tracker = session::Tracker::new(config.id);
+                    tracker.set_additional_entropy(config.additional_entropy);
+                    for message in self
+                        .orphaned_messages
+                        .remove(&config.id)
+                        .into_iter()
+                        .flatten()
+                    {
+                        let _ = tracker.record(&message);
+                    }
+                    vacant.insert(SessionEntry {
+                        config,
+                        tracker,
+                        external_progress: None,
+                        bound_execution: None,
+                    });
+                    self.stale = true;
+                }
+                return;
+            }
+            Observation::Peer(message) => {
+                let session_id = message.session_id;
+                let Some(entry) = self.sessions.get_mut(&session_id) else {
+                    self.orphaned_messages
+                        .entry(session_id)
+                        .or_default()
+                        .push(message);
+                    return;
+                };
+                match entry.tracker.record(&message) {
+                    Ok(()) => {
+                        entry.external_progress = None;
+                        self.refresh_session(session_id);
+                    }
+                    Err(err) => {
+                        if let Some(exec_id) = entry.bound_execution {
+                            self.transactions
+                                .get_mut(&exec_id)
+                                .expect("bound session execution exists")
+                                .observe(Observation::TransactionInvalidated(exec_id, err.0));
+                        }
+                    }
+                }
+                return;
+            }
+            Observation::SessionProgress {
+                session_id,
+                progress,
+            } => {
+                if let Some(entry) = self.sessions.get_mut(&session_id) {
+                    if let Some((_, _, entropy)) = progress.outputs() {
+                        entry.tracker.set_additional_entropy(entropy);
+                    }
+                    entry.external_progress = Some(progress);
+                    self.refresh_session(session_id);
+                }
+                return;
+            }
+            Observation::Broadcast(broadcast_tx) => {
+                let mut refreshed = Vec::new();
+                for tx in self.transactions.values_mut() {
+                    let accepted = tx.observe_broadcast(&broadcast_tx);
+                    if !accepted.is_empty()
+                        && let Some(session_id) = tx.session_id()
+                        && let Some(entry) = self.sessions.get_mut(&session_id)
+                    {
+                        for contrib in accepted {
+                            let _ = entry.tracker.record(&session::Message {
+                                session_id,
+                                sender: entry.config.side,
+                                payload: session::Payload::Witness(contrib),
+                            });
+                        }
+                        refreshed.push(session_id);
+                    }
+                }
+                for session_id in refreshed {
+                    self.refresh_session(session_id);
                 }
                 return;
             }
