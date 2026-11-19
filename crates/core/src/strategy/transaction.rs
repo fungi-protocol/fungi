@@ -1,11 +1,12 @@
 //! The current execution path and results for one transaction.
 
 use super::{
-    Action, Error, Observation, Payment, Plan, Request, Status, Update, error, path::Path,
+    Action, Error, Observation, Operation, Payment, Plan, Request, Status, Update,
+    construction::Execution, error, path::Path,
 };
 use cost_function::candidate::Candidate;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, btree_map::Entry},
     sync::Arc,
 };
 
@@ -13,19 +14,19 @@ pub struct Transaction {
     plan: Arc<Plan>,
     path: Path,
     status: Status,
-    payment: Option<Payment>,
+    execution: Execution,
     completed: BTreeSet<Action>,
     operation_errors: BTreeMap<Action, Error>,
-    pending: BTreeMap<Action, Request>,
+    pending: BTreeMap<Action, Operation>,
 }
 
 impl Transaction {
     pub(super) fn new(plan: Arc<Plan>) -> Self {
         Self {
             path: Path::new(&plan.candidate),
+            execution: Execution::new(plan.clone()),
             plan,
             status: Status::Running,
-            payment: None,
             completed: BTreeSet::new(),
             operation_errors: BTreeMap::new(),
             pending: BTreeMap::new(),
@@ -38,7 +39,7 @@ impl Transaction {
         &self.status
     }
     pub fn payment(&self) -> Option<&Payment> {
-        self.payment.as_ref()
+        self.execution.payment()
     }
     pub fn completed(&self) -> &BTreeSet<Action> {
         &self.completed
@@ -81,12 +82,19 @@ impl Transaction {
             self.status = Status::Failed(error("action prerequisites are not satisfied"));
             return;
         }
-        self.pending
-            .entry(request.action.clone())
-            .or_insert(request);
+        if let Entry::Vacant(entry) = self.pending.entry(request.action.clone()) {
+            // The effect is fixed now; the construction state changes on completion.
+            let effect = self.execution.effect(&request.action);
+            entry.insert(Operation {
+                plan: request.plan,
+                action: request.action,
+                effect: Arc::new(effect),
+                receipt: Arc::default(),
+            });
+        }
     }
 
-    pub fn pending(&self) -> impl Iterator<Item = &Request> {
+    pub fn pending(&self) -> impl Iterator<Item = &Operation> {
         self.pending.values()
     }
 
@@ -95,22 +103,11 @@ impl Transaction {
         id: super::OperationId,
         result: Result<Update, Error>,
     ) {
-        let Some(request) = self.pending.remove(&id.1) else {
+        let Some(operation) = self.pending.remove(&id.1) else {
             return;
         };
-        let action = request.action;
-        let result = match (&action, result) {
-            (Action::Finalize, Ok(Update::Finalized(payment))) => {
-                self.payment = Some(payment);
-                Ok(())
-            }
-            (Action::Finalize, Ok(Update::Applied)) => {
-                Err(error("finalization did not return a transaction"))
-            }
-            (_, Ok(Update::Finalized(_))) => Err(error("unexpected effect result")),
-            (_, Ok(Update::Applied)) => Ok(()),
-            (_, Err(err)) => Err(err),
-        };
+        let action = operation.action;
+        let result = result.and_then(|update| self.execution.complete(&action, update));
         match result {
             Ok(()) => {
                 if action == Action::Publish && self.status == Status::Running {
@@ -131,8 +128,7 @@ impl Transaction {
         match input {
             Observation::Confirmed(txid)
                 if self
-                    .payment
-                    .as_ref()
+                    .payment()
                     .is_some_and(|p| p.transaction.compute_txid() == txid) =>
             {
                 self.status = Status::Confirmed;

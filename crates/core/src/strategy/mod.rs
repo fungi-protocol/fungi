@@ -75,6 +75,24 @@ impl Request {
     }
 }
 
+/// A dispatched action and the IO it requires.
+///
+/// The effect is fixed at dispatch. Clones share one receipt, so the IO runs
+/// at most once and every clone completes with the same result.
+#[derive(Clone)]
+pub struct Operation {
+    plan: Arc<Plan>,
+    action: Action,
+    effect: Arc<construction::Effect>,
+    receipt: Arc<futures::lock::Mutex<Option<Result<Update, Error>>>>,
+}
+
+impl Operation {
+    pub fn id(&self) -> OperationId {
+        (self.plan.execution_id, self.action.clone())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
 pub struct Error(pub String);
@@ -90,10 +108,15 @@ pub struct Payment {
     pub fee: Amount,
 }
 
-#[derive(Clone, Debug)]
+/// The result of an operation's IO. The wallet state applies it on completion.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Update {
+    /// The operation required no IO, or its IO returned no value.
     Applied,
-    Finalized(Payment),
+    /// The change source returned this script.
+    Change(bitcoin::ScriptBuf),
+    /// The signer returned this input.
+    Signed(Box<bitcoin::psbt::Input>),
 }
 
 #[derive(Clone)]
@@ -316,7 +339,7 @@ impl Queue for Batch<'_> {
 
 impl<C: ChangeCosts, R: RngCore> Machine for State<C, R> {
     type Action = Request;
-    type Operation = Request;
+    type Operation = Operation;
     type OperationId = OperationId;
     type Input = Observation;
     type Result = Result<Update, Error>;
@@ -363,7 +386,7 @@ impl<C: ChangeCosts, R: RngCore> Machine for State<C, R> {
         }
     }
 
-    fn operations(&self) -> impl Iterator<Item = (OperationId, Request)> {
+    fn operations(&self) -> impl Iterator<Item = (OperationId, Operation)> {
         self.transactions
             .values()
             .flat_map(|tx| tx.pending())

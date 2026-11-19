@@ -1,6 +1,6 @@
 //! Composition of execution capabilities with the driver's input channels and clock.
 
-use super::{Broadcaster, Error, Executor, Observation, Request, State, Update};
+use super::{Broadcaster, Error, Executor, Observation, Operation, State, Update};
 use crate::{
     driver::{Environment, Wake},
     wallet::{ChangeSource, InputSigner, TransactionRecorder},
@@ -36,7 +36,7 @@ impl<
     }
     fn execute(
         &mut self,
-        operation: Request,
+        operation: Operation,
     ) -> impl Future<Output = Result<Update, Error>> + use<C, S, R, B, E, P, G> {
         let executor = self.executor.clone();
         async move { executor.execute(&operation).await }

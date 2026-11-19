@@ -14,7 +14,7 @@ use cost_function::{
 };
 use fungi_core::{
     driver::{Decision, Machine, Stopped, Wake},
-    strategy::{Broadcaster, Events, Executor, Observation, Request, Runtime, State, Status},
+    strategy::{Broadcaster, Events, Executor, Observation, Operation, Runtime, State, Status},
     wallet::{Coin, Snapshot, dummy},
 };
 use rand::{SeedableRng, rngs::StdRng};
@@ -204,7 +204,7 @@ async fn a_later_intent_joins_the_scheduled_payment() {
     let mut io = runtime(now, [(arrival, Observation::Intent(payment(7)))]);
 
     assert_eq!(
-        scripted_driver::run(&mut state, &mut io, Request::id).await,
+        scripted_driver::run(&mut state, &mut io, Operation::id).await,
         Stopped::Closed
     );
 
@@ -241,7 +241,7 @@ async fn an_intent_after_confirmation_starts_another_transaction() {
     let mut io = runtime(now, [(later, Observation::Intent(payment(8)))]);
 
     assert_eq!(
-        scripted_driver::run(&mut state, &mut io, Request::id).await,
+        scripted_driver::run(&mut state, &mut io, Operation::id).await,
         Stopped::Closed
     );
 

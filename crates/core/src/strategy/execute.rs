@@ -1,10 +1,6 @@
 //! Wallet capabilities shared by transaction-specific executions.
 
-use super::{
-    Action, Error, ExecutionId, Request, Update,
-    construction::{Effect, Execution},
-    error,
-};
+use super::{Action, Error, ExecutionId, Operation, Plan, Update, construction::Effect, error};
 use crate::wallet::{ChangeSource, InputSigner, TransactionRecorder};
 use bitcoin::{OutPoint, Transaction};
 use futures::lock::Mutex;
@@ -21,7 +17,7 @@ pub trait Broadcaster {
     ) -> impl Future<Output = Result<(), Self::Error>> + use<Self>;
 }
 
-type Executions = BTreeMap<ExecutionId, Arc<Mutex<Execution>>>;
+type Plans = BTreeMap<ExecutionId, Arc<Plan>>;
 
 /// Per-coin signer capabilities shared by the wallet adapter and its executors.
 pub struct Signers<S>(std::sync::Mutex<BTreeMap<OutPoint, Arc<Mutex<S>>>>);
@@ -50,13 +46,14 @@ impl<S: InputSigner> Signers<S> {
     }
 }
 
-/// Capabilities are independent of candidates; a Start request binds an execution.
+/// Capabilities are independent of candidates; a Start operation binds an execution
+/// identity to its plan.
 pub struct Executor<C, S, R, B> {
     pub change: Arc<Mutex<C>>,
     pub signers: Arc<Signers<S>>,
     pub recorder: Arc<Mutex<R>>,
     pub broadcaster: Arc<Mutex<B>>,
-    transactions: Arc<std::sync::Mutex<Executions>>,
+    plans: Arc<std::sync::Mutex<Plans>>,
 }
 
 impl<C: ChangeSource, S: InputSigner, R: TransactionRecorder, B: Broadcaster> Executor<C, S, R, B> {
@@ -72,77 +69,67 @@ impl<C: ChangeSource, S: InputSigner, R: TransactionRecorder, B: Broadcaster> Ex
             signers: registered,
             recorder: Arc::new(Mutex::new(recorder)),
             broadcaster: Arc::new(Mutex::new(broadcaster)),
-            transactions: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            plans: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
         })
     }
 
-    pub async fn execute(&self, request: &Request) -> Result<Update, Error> {
-        let execution = {
-            let mut transactions = self.transactions.lock().unwrap();
-            match transactions.entry(request.plan.execution_id) {
-                Entry::Vacant(entry) => {
-                    if request.action != Action::Start {
-                        return Err(error("transaction construction has not started"));
-                    }
-                    entry
-                        .insert(Arc::new(Mutex::new(Execution::new(request.plan.clone())?)))
-                        .clone()
-                }
-                Entry::Occupied(entry) => entry.get().clone(),
-            }
-        };
-        let operation = {
-            let mut state = execution.lock().await;
-            if !Arc::ptr_eq(&state.plan, &request.plan) {
-                return Err(error("execution belongs to a different candidate"));
-            }
-            state
-                .locks
-                .entry(request.action.clone())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
-        // Replays of this operation share its receipt; independent operations
-        // release execution/capability state before awaiting external IO.
-        let _operation = operation.lock().await;
-        let effect = execution.lock().await.prepare(&request.action)?;
-        match effect {
-            Effect::Complete(update) => Ok(update),
-            Effect::AllocateChange { index, priced } => {
+    /// Perform the operation's IO. Clones of an operation share its receipt,
+    /// so the IO runs at most once.
+    pub async fn execute(&self, operation: &Operation) -> Result<Update, Error> {
+        let mut receipt = operation.receipt.lock().await;
+        if let Some(result) = &*receipt {
+            return result.clone();
+        }
+        let result = self.perform(operation).await;
+        *receipt = Some(result.clone());
+        result
+    }
+
+    async fn perform(&self, operation: &Operation) -> Result<Update, Error> {
+        self.bind(operation)?;
+        match operation.effect.as_ref() {
+            Effect::Local => Ok(Update::Applied),
+            Effect::AllocateChange => {
                 let io = self.change.lock().await.next_script();
-                let script = io.await.map_err(error)?;
-                execution
-                    .lock()
-                    .await
-                    .complete_change(index, &priced, script)
+                Ok(Update::Change(io.await.map_err(error)?))
             }
-            Effect::Sign {
-                index,
-                position,
-                outpoint,
-                psbt,
-            } => {
+            Effect::Sign { outpoint, psbt } => {
                 let signer = self
                     .signers
-                    .get(&outpoint)
+                    .get(outpoint)
                     .ok_or_else(|| error("no signer for input"))?;
-                let io = signer.lock().await.sign(&psbt);
-                let signed = io.await.map_err(error)?;
-                execution
-                    .lock()
-                    .await
-                    .complete_sign(index, position, signed)
+                let io = signer.lock().await.sign(psbt);
+                Ok(Update::Signed(Box::new(io.await.map_err(error)?)))
             }
             Effect::Record(transaction) => {
-                let io = self.recorder.lock().await.record(&transaction);
+                let io = self.recorder.lock().await.record(transaction);
                 io.await.map_err(error)?;
-                Ok(execution.lock().await.applied(Action::Record))
+                Ok(Update::Applied)
             }
             Effect::Publish(transaction) => {
-                let io = self.broadcaster.lock().await.broadcast(&transaction);
+                let io = self.broadcaster.lock().await.broadcast(transaction);
                 io.await.map_err(error)?;
-                Ok(execution.lock().await.applied(Action::Publish))
+                Ok(Update::Applied)
             }
+        }
+    }
+
+    /// Start binds the execution identity to its plan. Every other operation
+    /// must belong to the bound plan.
+    fn bind(&self, operation: &Operation) -> Result<(), Error> {
+        match self
+            .plans
+            .lock()
+            .unwrap()
+            .entry(operation.plan.execution_id)
+        {
+            Entry::Vacant(entry) if operation.action == Action::Start => {
+                entry.insert(operation.plan.clone());
+                Ok(())
+            }
+            Entry::Vacant(_) => Err(error("transaction construction has not started")),
+            Entry::Occupied(entry) if Arc::ptr_eq(entry.get(), &operation.plan) => Ok(()),
+            Entry::Occupied(_) => Err(error("execution belongs to a different candidate")),
         }
     }
 }
@@ -154,7 +141,7 @@ impl<C, S, R, B> Clone for Executor<C, S, R, B> {
             signers: self.signers.clone(),
             recorder: self.recorder.clone(),
             broadcaster: self.broadcaster.clone(),
-            transactions: self.transactions.clone(),
+            plans: self.plans.clone(),
         }
     }
 }

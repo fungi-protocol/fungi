@@ -16,7 +16,7 @@ use cost_function::{
 };
 use fungi_core::{
     driver::{Stopped, Wake},
-    strategy::{Broadcaster, Events, Executor, Observation, Request, Runtime, State, Status},
+    strategy::{Broadcaster, Events, Executor, Observation, Operation, Runtime, State, Status},
     wallet::{InputSigner, SnapshotSource, TransactionRecorder},
 };
 use fungi_regtest::corepc_node;
@@ -190,7 +190,7 @@ async fn armins_candidate_is_signed_by_bdk_and_confirmed_on_regtest()
         grid,
     );
     assert_eq!(
-        run_scripted(&mut state, &mut runtime, Request::id).await,
+        run_scripted(&mut state, &mut runtime, Operation::id).await,
         Stopped::Closed
     );
     assert_eq!(runtime.events.now(), payable_at);
@@ -216,7 +216,7 @@ async fn armins_candidate_is_signed_by_bdk_and_confirmed_on_regtest()
         .mine_confirmation(&transaction);
     runtime.events.observation = Some(confirmation);
     assert_eq!(
-        run_scripted(&mut state, &mut runtime, Request::id).await,
+        run_scripted(&mut state, &mut runtime, Operation::id).await,
         Stopped::Closed
     );
     assert_eq!(state.pending().iter().count(), 0);
@@ -341,7 +341,7 @@ async fn intents_arriving_at_different_times_share_a_transaction_on_regtest()
         ScheduleGrid::new(now),
     );
     assert_eq!(
-        run_scripted(&mut state, &mut runtime, Request::id).await,
+        run_scripted(&mut state, &mut runtime, Operation::id).await,
         Stopped::Closed
     );
     assert!(runtime.events.now() > arrival);
@@ -359,7 +359,7 @@ async fn intents_arriving_at_different_times_share_a_transaction_on_regtest()
         .mine_confirmation(&transaction);
     runtime.events.observation = Some(confirmation);
     assert_eq!(
-        run_scripted(&mut state, &mut runtime, Request::id).await,
+        run_scripted(&mut state, &mut runtime, Operation::id).await,
         Stopped::Closed
     );
 

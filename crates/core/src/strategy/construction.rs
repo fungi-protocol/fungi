@@ -14,16 +14,13 @@ use concurrent_psbt::{
     sorter::{BothModifiable, ExplicitKeysForbidden, OutputsModifiable, Seeded},
 };
 use cost_function::{change::OutputWithoutScriptpubkey, wallet::Utxo};
-use futures::lock::Mutex;
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 type Inputs = Constructor<BothModifiable, Seeded<ExplicitKeysForbidden>>;
 type Outputs = Constructor<OutputsModifiable, Seeded<ExplicitKeysForbidden>>;
-
-enum Construction {
-    Active(psbt_v2::v2::Psbt),
-    Frozen(Frozen),
-}
 
 struct Frozen {
     psbt: Psbt,
@@ -31,24 +28,12 @@ struct Frozen {
     fee: Amount,
 }
 
-impl Construction {
-    fn frozen(&mut self) -> Result<&mut Frozen, Error> {
-        match self {
-            Self::Frozen(frozen) => Ok(frozen),
-            Self::Active(_) => Err(error("transaction has not been frozen and validated")),
-        }
-    }
-}
-
+/// The IO an operation requires, fixed when it is dispatched.
 pub(super) enum Effect {
-    Complete(Update),
-    AllocateChange {
-        index: usize,
-        priced: OutputWithoutScriptpubkey,
-    },
+    /// The action changes only the construction state.
+    Local,
+    AllocateChange,
     Sign {
-        index: usize,
-        position: usize,
         outpoint: OutPoint,
         psbt: Psbt,
     },
@@ -56,12 +41,16 @@ pub(super) enum Effect {
     Publish(bitcoin::Transaction),
 }
 
+/// Construction state for one transaction. Only completed operations change it.
 pub(super) struct Execution {
-    pub(super) plan: Arc<Plan>,
-    construction: Construction,
+    plan: Arc<Plan>,
+    /// The PSBT under construction. It does not change once the transaction is frozen.
+    psbt: psbt_v2::v2::Psbt,
+    frozen: Option<Frozen>,
+    /// Each change script is kept once allocated, even if validation rejects it.
     scripts: BTreeMap<usize, ScriptBuf>,
-    results: BTreeMap<Action, Update>,
-    pub(super) locks: BTreeMap<Action, Arc<Mutex<()>>>,
+    completed: BTreeSet<Action>,
+    payment: Option<Payment>,
 }
 
 fn priced_prevout<'a>(snapshot: &'a Snapshot, coin: &Utxo) -> Result<&'a Coin, Error> {
@@ -77,7 +66,7 @@ fn priced_prevout<'a>(snapshot: &'a Snapshot, coin: &Utxo) -> Result<&'a Coin, E
 }
 
 impl Execution {
-    pub(super) fn new(plan: Arc<Plan>) -> Result<Self, Error> {
+    pub(super) fn new(plan: Arc<Plan>) -> Self {
         // These transaction fields and derived-key ordering are PoC policy choices.
         let mut initial = psbt_v2::v2::Creator::new()
             .transaction_version(transaction::Version::TWO)
@@ -98,29 +87,64 @@ impl Execution {
                 value,
             );
         }
-        Inputs::try_from_psbt(initial.clone()).map_err(error)?;
-        Ok(Self {
+        Inputs::try_from_psbt(initial.clone()).expect("the initial PSBT accepts inputs");
+        Self {
             plan,
-            construction: Construction::Active(initial),
+            psbt: initial,
+            frozen: None,
             scripts: BTreeMap::new(),
-            locks: BTreeMap::new(),
-            results: BTreeMap::new(),
-        })
+            completed: BTreeSet::new(),
+            payment: None,
+        }
     }
 
-    pub(super) fn prepare(&mut self, action: &Action) -> Result<Effect, Error> {
-        if let Some(result) = self.results.get(action) {
-            return Ok(Effect::Complete(result.clone()));
-        }
+    pub(super) fn payment(&self) -> Option<&Payment> {
+        self.payment.as_ref()
+    }
+
+    /// Return the IO the action requires. This does not change the construction state.
+    pub(super) fn effect(&self, action: &Action) -> Effect {
         match *action {
-            Action::Start => {}
+            Action::AllocateChange(_) => Effect::AllocateChange,
+            Action::Sign(index) => Effect::Sign {
+                outpoint: self.input(index).outpoint(),
+                psbt: self.frozen().psbt.clone(),
+            },
+            Action::Record => Effect::Record(self.finalized_transaction().clone()),
+            Action::Publish => {
+                assert!(
+                    self.completed.contains(&Action::Record),
+                    "the path publishes only a recorded transaction"
+                );
+                Effect::Publish(self.finalized_transaction().clone())
+            }
+            _ => Effect::Local,
+        }
+    }
+
+    /// Apply the result of the action's IO. Only this changes the construction state.
+    pub(super) fn complete(&mut self, action: &Action, update: Update) -> Result<(), Error> {
+        match (action, update) {
+            (&Action::AllocateChange(index), Update::Change(script)) => {
+                self.allocate_change(index, script)?;
+            }
+            (&Action::Sign(index), Update::Signed(signed)) => self.sign(index, *signed)?,
+            (action, Update::Applied) => self.construct(action)?,
+            _ => return Err(error("unexpected effect result")),
+        }
+        self.completed.insert(action.clone());
+        Ok(())
+    }
+
+    /// Apply an action whose IO returned no value.
+    fn construct(&mut self, action: &Action) -> Result<(), Error> {
+        match *action {
+            Action::Start | Action::Record | Action::Publish => {}
+            Action::AllocateChange(_) | Action::Sign(_) => {
+                return Err(error("unexpected effect result"));
+            }
             Action::Input(index) => {
-                let coin = self
-                    .plan
-                    .candidate
-                    .inputs()
-                    .nth(index)
-                    .ok_or_else(|| error("unknown input"))?;
+                let coin = self.input(index);
                 let prevout = priced_prevout(&self.plan.snapshot, coin)?;
                 if !prevout.txout.script_pubkey.is_p2tr() {
                     return Err(error("PoC signer path only supports P2TR key spends"));
@@ -128,72 +152,47 @@ impl Execution {
                 let mut input = Input::new(&coin.outpoint());
                 input.set_witness_utxo(Some(prevout.txout.clone()));
                 input.set_sequence(Some(Sequence::ENABLE_RBF_NO_LOCKTIME));
-                self.construction = Construction::Active(
-                    Inputs::try_from_psbt(self.active()?.clone())
-                        .map_err(error)?
-                        .input(input)
-                        .map_err(error)?
-                        .into_inner()
-                        .into_psbt(),
-                );
+                self.psbt = Inputs::try_from_psbt(self.active().clone())
+                    .map_err(error)?
+                    .input(input)
+                    .map_err(error)?
+                    .into_inner()
+                    .into_psbt();
             }
             Action::CloseInputs => {
-                if self
-                    .plan
-                    .candidate
-                    .inputs()
-                    .enumerate()
-                    .any(|(i, _)| !self.results.contains_key(&Action::Input(i)))
-                {
-                    return Err(error("input contributions are incomplete"));
-                }
-                self.construction = Construction::Active(
-                    Inputs::try_from_psbt(self.active()?.clone())
-                        .map_err(error)?
-                        .no_more_inputs()
-                        .into_inner()
-                        .into_psbt(),
+                assert!(
+                    (0..self.plan.candidate.inputs().count())
+                        .all(|i| self.completed.contains(&Action::Input(i))),
+                    "the path closes inputs after every input contribution"
                 );
-            }
-            Action::AllocateChange(index) => {
-                self.outputs()?;
-                let priced = self
-                    .plan
-                    .candidate
-                    .change()
-                    .nth(index)
-                    .ok_or_else(|| error("unknown change"))?
-                    .clone();
-                if let Some(script) = self.scripts.get(&index) {
-                    return self
-                        .complete_change(index, &priced, script.clone())
-                        .map(Effect::Complete);
-                }
-                return Ok(Effect::AllocateChange { index, priced });
+                self.psbt = Inputs::try_from_psbt(self.active().clone())
+                    .map_err(error)?
+                    .no_more_inputs()
+                    .into_inner()
+                    .into_psbt();
             }
             Action::Output(index) => {
-                let constructor = self.outputs()?;
+                let constructor = self.outputs();
                 let (id, output) = self.output(index)?;
-                self.construction = Construction::Active(
-                    constructor
-                        .output(Output::new(id, output.value, output.script_pubkey))
-                        .map_err(error)?
-                        .into_inner()
-                        .into_psbt(),
-                );
+                self.psbt = constructor
+                    .output(Output::new(id, output.value, output.script_pubkey))
+                    .map_err(error)?
+                    .into_inner()
+                    .into_psbt();
             }
             Action::CloseOutputs => {
                 let count =
                     self.plan.candidate.payments().count() + self.plan.candidate.change().count();
-                if (0..count).any(|i| !self.results.contains_key(&Action::Output(i))) {
-                    return Err(error("output contributions are incomplete"));
-                }
-                let ordered = self.outputs()?.no_more_outputs().into_ordered_psbt();
+                assert!(
+                    (0..count).all(|i| self.completed.contains(&Action::Output(i))),
+                    "the path closes outputs after every output contribution"
+                );
+                let ordered = self.outputs().no_more_outputs().into_ordered_psbt();
                 let tx = psbt_v2::v2::Signer::new(ordered.clone())
                     .map_err(error)?
                     .unsigned_tx();
                 let mut psbt = Psbt::from_unsigned_tx(tx).map_err(error)?;
-                // This bridge only handles the metadata this executor constructs.
+                // This bridge only handles the metadata this wallet constructs.
                 // External/general PSBT conversion must preserve additional fields.
                 for (to, from) in psbt.inputs.iter_mut().zip(&ordered.inputs) {
                     to.witness_utxo = from.witness_utxo.clone();
@@ -206,113 +205,80 @@ impl Execution {
                     }
                 }
                 let fee = self.validate(&psbt)?;
-                self.construction = Construction::Frozen(Frozen { psbt, outputs, fee });
-            }
-            Action::Sign(index) => {
-                let outpoint = self
-                    .plan
-                    .candidate
-                    .inputs()
-                    .nth(index)
-                    .ok_or_else(|| error("unknown input"))?
-                    .outpoint();
-                let psbt = &self.construction.frozen()?.psbt;
-                let position = psbt
-                    .unsigned_tx
-                    .input
-                    .iter()
-                    .position(|input| input.previous_output == outpoint)
-                    .expect("freezing verified the selected inputs");
-                return Ok(Effect::Sign {
-                    index,
-                    position,
-                    outpoint,
-                    psbt: psbt.clone(),
-                });
+                self.frozen = Some(Frozen { psbt, outputs, fee });
             }
             Action::Finalize => {
-                if self
-                    .plan
-                    .candidate
-                    .inputs()
-                    .enumerate()
-                    .any(|(i, _)| !self.results.contains_key(&Action::Sign(i)))
-                {
-                    return Err(error("signatures are incomplete"));
-                }
-                let Frozen { psbt, outputs, fee } = self.construction.frozen()?;
+                assert!(
+                    (0..self.plan.candidate.inputs().count())
+                        .all(|i| self.completed.contains(&Action::Sign(i))),
+                    "the path finalizes after every signature"
+                );
+                let Frozen { psbt, outputs, fee } = self.frozen();
                 let transaction = psbt.clone().extract_tx().map_err(error)?;
                 signing::validate_feerate(*fee, transaction.weight(), self.plan.feerate)?;
-                let result = Update::Finalized(Payment {
+                self.payment = Some(Payment {
                     transaction,
                     outputs: outputs.clone(),
                     fee: *fee,
                 });
-                self.results.insert(Action::Finalize, result.clone());
-                return Ok(Effect::Complete(result));
-            }
-            Action::Record => {
-                return Ok(Effect::Record(self.finalized_transaction()?.clone()));
-            }
-            Action::Publish => {
-                if !self.results.contains_key(&Action::Record) {
-                    return Err(error("transaction has not been retained"));
-                }
-                return Ok(Effect::Publish(self.finalized_transaction()?.clone()));
             }
         }
-        Ok(Effect::Complete(self.applied(action.clone())))
+        Ok(())
     }
 
-    pub(super) fn complete_change(
-        &mut self,
-        index: usize,
-        priced: &OutputWithoutScriptpubkey,
-        script: ScriptBuf,
-    ) -> Result<Update, Error> {
-        // Retain the allocation even if validation fails.
+    fn allocate_change(&mut self, index: usize, script: ScriptBuf) -> Result<(), Error> {
+        let priced = self
+            .plan
+            .candidate
+            .change()
+            .nth(index)
+            .expect("the path allocates priced change")
+            .clone();
         self.scripts.entry(index).or_insert(script);
-        validate::change(&self.change_output(index, priced), priced)?;
-        self.results
-            .insert(Action::AllocateChange(index), Update::Applied);
-        Ok(Update::Applied)
+        validate::change(&self.change_output(index, &priced), &priced)
     }
 
-    pub(super) fn complete_sign(
-        &mut self,
-        index: usize,
-        position: usize,
-        signed: psbt::Input,
-    ) -> Result<Update, Error> {
-        let snapshot = &self.plan.snapshot;
-        let psbt = &mut self.construction.frozen()?.psbt;
-        signing::apply(psbt, snapshot, position, signed)?;
-        self.results.insert(Action::Sign(index), Update::Applied);
-        Ok(Update::Applied)
+    fn sign(&mut self, index: usize, signed: psbt::Input) -> Result<(), Error> {
+        let outpoint = self.input(index).outpoint();
+        let frozen = self
+            .frozen
+            .as_mut()
+            .expect("the path signs a frozen transaction");
+        let position = frozen
+            .psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .position(|input| input.previous_output == outpoint)
+            .expect("freezing verified the selected inputs");
+        signing::apply(&mut frozen.psbt, &self.plan.snapshot, position, signed)
     }
 
-    pub(super) fn applied(&mut self, action: Action) -> Update {
-        self.results.insert(action, Update::Applied);
-        Update::Applied
+    fn input(&self, index: usize) -> &Utxo {
+        let mut inputs = self.plan.candidate.inputs();
+        inputs.nth(index).expect("the path uses candidate inputs")
     }
 
-    fn finalized_transaction(&self) -> Result<&bitcoin::Transaction, Error> {
-        match self.results.get(&Action::Finalize) {
-            Some(Update::Finalized(payment)) => Ok(&payment.transaction),
-            _ => Err(error("transaction is not finalized")),
-        }
+    fn frozen(&self) -> &Frozen {
+        let frozen = self.frozen.as_ref();
+        frozen.expect("the path uses a frozen transaction")
     }
 
-    fn active(&self) -> Result<&psbt_v2::v2::Psbt, Error> {
-        match &self.construction {
-            Construction::Active(psbt) => Ok(psbt),
-            Construction::Frozen(_) => Err(error("transaction is frozen")),
-        }
+    fn finalized_transaction(&self) -> &bitcoin::Transaction {
+        let payment = self.payment.as_ref();
+        &payment
+            .expect("the path uses a finalized transaction")
+            .transaction
     }
 
-    fn outputs(&self) -> Result<Outputs, Error> {
-        Outputs::try_from_psbt(self.active()?.clone())
-            .map_err(|_| error("outputs are not modifiable"))
+    fn active(&self) -> &psbt_v2::v2::Psbt {
+        assert!(self.frozen.is_none(), "the path constructs before freezing");
+        &self.psbt
+    }
+
+    fn outputs(&self) -> Outputs {
+        let psbt = self.active().clone();
+        Outputs::try_from_psbt(psbt).expect("the path adds outputs after closing inputs")
     }
 
     fn output(&self, index: usize) -> Result<(UniqueId, TxOut), Error> {
@@ -322,9 +288,10 @@ impl Execution {
                 (0, id, output.clone())
             } else {
                 let change = index - payments;
-                if !self.results.contains_key(&Action::AllocateChange(change)) {
-                    return Err(error("change allocation has not succeeded"));
-                }
+                assert!(
+                    self.completed.contains(&Action::AllocateChange(change)),
+                    "the path adds change after its allocation"
+                );
                 let priced = self
                     .plan
                     .candidate
@@ -457,16 +424,19 @@ mod prevout_tests {
             snapshot,
             feerate,
             session_id: [1; 16],
-        }))
-        .unwrap();
+        }));
         for action in [Action::Input(0), Action::CloseInputs, Action::Output(0)] {
-            execution.prepare(&action).unwrap();
+            execution.complete(&action, Update::Applied).unwrap();
         }
-        let mut psbt = execution.active().unwrap().clone();
-        psbt.inputs[0].witness_utxo.as_mut().unwrap().value += Amount::ONE_SAT;
-        execution.construction = Construction::Active(psbt);
+        execution.psbt.inputs[0]
+            .witness_utxo
+            .as_mut()
+            .unwrap()
+            .value += Amount::ONE_SAT;
 
-        let error = execution.prepare(&Action::CloseOutputs).err().unwrap();
+        let error = execution
+            .complete(&Action::CloseOutputs, Update::Applied)
+            .unwrap_err();
         assert_eq!(error.0, "unexpected input data");
     }
 

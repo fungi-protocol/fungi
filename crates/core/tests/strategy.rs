@@ -19,8 +19,8 @@ use cost_function::{
 use fungi_core::{
     driver::{Decision, Machine, Scheduled, Stopped, Wake},
     strategy::{
-        Action, Broadcaster, Error, Events, Executor, Observation, Request, Runtime, State, Status,
-        Update,
+        Action, Broadcaster, Error, Events, Executor, Observation, Operation, Request, Runtime,
+        State, Status, Update,
     },
     wallet::{Coin, Snapshot, dummy},
 };
@@ -230,21 +230,48 @@ fn an_unfunded_intent_remains_pending_without_ending_the_wallet() {
     ));
 }
 
+/// Dispatch the request and return its operation.
+fn dispatch(state: &mut Wallet, request: Request) -> Operation {
+    let id = request.id();
+    state.apply(request);
+    state
+        .operations()
+        .find(|(operation, _)| *operation == id)
+        .expect("the request was dispatched")
+        .1
+}
+
+/// Dispatch one action of the candidate, execute it and complete it.
+/// Panics if the action fails.
+async fn run_action(state: &mut Wallet, io: &TestExecutor, start: &Request, action: Action) {
+    let mut request = start.clone();
+    request.action = action.clone();
+    let operation = dispatch(state, request);
+    let result = io.execute(&operation).await;
+    state.completed(operation.id(), result);
+    let errors = state.transactions()[&start.id().0].operation_errors();
+    assert_eq!(errors.get(&action), None);
+}
+
 #[tokio::test]
 async fn a_bound_execution_rejects_another_plan_but_accepts_its_replay() {
     let now = Instant::now();
     let mut state = fixture(now, 1, true, true);
-    let first = scheduled(&mut state, now);
+    let start = scheduled(&mut state, now);
+    let first = dispatch(&mut state, start.clone());
     let io = executor();
     io.execute(&first).await.unwrap();
-    let other = scheduled(&mut fixture(now, 1, true, true), now);
+    let mut other_state = fixture(now, 1, true, true);
+    let other = scheduled(&mut other_state, now);
     assert_eq!(first.id(), other.id());
+    let other = dispatch(&mut other_state, other);
     assert_eq!(
         io.execute(&other).await.unwrap_err().0,
         "execution belongs to a different candidate"
     );
-    let reevaluated = scheduled(&mut state, now);
-    io.execute(&reevaluated).await.unwrap();
+    assert_eq!(io.execute(&first).await, Ok(Update::Applied));
+    state.completed(first.id(), Ok(Update::Applied));
+    run_action(&mut state, &io, &start, Action::Input(0)).await;
     assert_eq!(io.change.lock().await.requests(), 0);
     assert!(
         io.signers
@@ -272,7 +299,7 @@ async fn the_driver_starts_the_planned_transaction_at_readiness() {
     };
 
     assert_eq!(
-        run_scripted(&mut state, &mut io, Request::id).await,
+        run_scripted(&mut state, &mut io, Operation::id).await,
         Stopped::Closed
     );
 
@@ -329,17 +356,21 @@ fn only_this_plans_pending_request_accepts_a_completion() {
 async fn a_failed_start_stops_the_candidates_actions() {
     let now = Instant::now();
     let mut state = fixture(now, 1, true, true);
-    let unrelated = scheduled(&mut fixture(now, 1, true, true), now);
+    let mut unrelated_state = fixture(now, 1, true, true);
+    let unrelated = scheduled(&mut unrelated_state, now);
     let start = scheduled(&mut state, now);
     let executor = executor();
-    executor.execute(&unrelated).await.unwrap();
+    executor
+        .execute(&dispatch(&mut unrelated_state, unrelated))
+        .await
+        .unwrap();
     let mut io = Runtime {
         executor,
         events: Clock(now),
     };
 
     assert_eq!(
-        run_scripted(&mut state, &mut io, Request::id).await,
+        run_scripted(&mut state, &mut io, Operation::id).await,
         Stopped::Closed
     );
 
@@ -375,34 +406,40 @@ fn the_decision_rejects_a_different_plan_for_the_same_execution() {
 #[tokio::test]
 async fn a_non_start_request_cannot_bind_an_execution() {
     let now = Instant::now();
-    let mut request = scheduled(&mut fixture(now, 1, true, true), now);
-    request.action = Action::Input(0);
+    let mut state = fixture(now, 1, true, true);
+    let start = scheduled(&mut state, now);
+    run_action(&mut state, &executor(), &start, Action::Start).await;
+    let mut input = start.clone();
+    input.action = Action::Input(0);
+    let input = dispatch(&mut state, input);
     let io = executor();
     assert_eq!(
-        io.execute(&request).await.unwrap_err().0,
+        io.execute(&input).await.unwrap_err().0,
         "transaction construction has not started"
     );
-    let other = scheduled(&mut fixture(now, 1, true, true), now);
-    io.execute(&other).await.unwrap();
+    let mut other = fixture(now, 1, true, true);
+    let other_start = scheduled(&mut other, now);
+    io.execute(&dispatch(&mut other, other_start))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
-async fn inputs_must_be_contributed_before_the_executor_can_close_them() {
+async fn closing_inputs_waits_for_the_input_receipt() {
     let now = Instant::now();
-    let mut request = scheduled(&mut fixture(now, 1, true, true), now);
+    let mut state = fixture(now, 1, true, true);
+    let start = scheduled(&mut state, now);
     let io = executor();
-    io.execute(&request).await.unwrap();
-    request.action = Action::CloseInputs;
-    assert_eq!(
-        io.execute(&request).await.unwrap_err().0,
-        "input contributions are incomplete"
-    );
-    request.action = Action::Input(1);
-    assert_eq!(io.execute(&request).await.unwrap_err().0, "unknown input");
-    request.action = Action::Input(0);
-    io.execute(&request).await.unwrap();
-    request.action = Action::CloseInputs;
-    io.execute(&request).await.unwrap();
+    run_action(&mut state, &io, &start, Action::Start).await;
+    let mut input = start.clone();
+    input.action = Action::Input(0);
+    let input = dispatch(&mut state, input);
+    // A dispatched contribution does not enable closing before its receipt.
+    assert!(matches!(state.decide(now), Decision::Wait));
+    let result = io.execute(&input).await;
+    state.completed(input.id(), result);
+    let next = schedule(state.decide(now)).unwrap();
+    assert_eq!(next.action.action, Action::CloseInputs);
 }
 
 #[tokio::test]
@@ -416,7 +453,7 @@ async fn the_driver_contributes_and_closes_the_candidate_inputs() {
     };
 
     assert_eq!(
-        run_scripted(&mut state, &mut io, Request::id).await,
+        run_scripted(&mut state, &mut io, Operation::id).await,
         Stopped::Closed
     );
 
@@ -438,7 +475,7 @@ async fn an_unsupported_prevout_cannot_be_contributed() {
     };
 
     assert_eq!(
-        run_scripted(&mut state, &mut io, Request::id).await,
+        run_scripted(&mut state, &mut io, Operation::id).await,
         Stopped::Closed
     );
 
@@ -468,40 +505,40 @@ fn the_decision_will_not_dispatch_an_input_before_start() {
     assert!(state.operations().next().is_none());
 }
 
-async fn run_action(io: &TestExecutor, start: &Request, action: Action) -> Result<Update, Error> {
-    let mut request = start.clone();
-    request.action = action;
-    io.execute(&request).await
-}
-
 #[tokio::test]
-async fn rejected_change_cannot_be_added_by_bypassing_the_decision_state() {
+async fn rejected_change_is_not_added_and_its_allocation_runs_once() {
     let now = Instant::now();
-    let start = scheduled(&mut fixture(now, 1, true, true), now);
+    let mut state = fixture(now, 1, true, true);
+    let start = scheduled(&mut state, now);
     let io = executor_with_change(dummy::Change::new(
         script(3),
         Weight::from_wu(70),
         [Ok(ScriptBuf::new())],
     ));
     for action in [Action::Start, Action::Input(0), Action::CloseInputs] {
-        run_action(&io, &start, action).await.unwrap();
+        run_action(&mut state, &io, &start, action).await;
     }
-    let first = run_action(&io, &start, Action::AllocateChange(0))
-        .await
-        .unwrap_err();
-    assert_eq!(first.0, "allocated change differs from its priced template");
-    assert_eq!(
-        run_action(&io, &start, Action::Output(1))
-            .await
-            .unwrap_err()
-            .0,
-        "change allocation has not succeeded"
-    );
-    let replay = run_action(&io, &start, Action::AllocateChange(0))
-        .await
-        .unwrap_err();
-    assert_eq!(first, replay);
+    let mut allocate = start.clone();
+    allocate.action = Action::AllocateChange(0);
+    let allocate = dispatch(&mut state, allocate);
+    let result = io.execute(&allocate).await;
+    assert_eq!(io.execute(&allocate.clone()).await, result);
     assert_eq!(io.change.lock().await.requests(), 1);
+    state.completed(allocate.id(), result);
+
+    let rejected = Error("allocated change differs from its priced template".into());
+    let tx = &state.transactions()[&start.id().0];
+    assert_eq!(tx.status(), &Status::Failed(rejected.clone()));
+    assert_eq!(tx.operation_errors()[&Action::AllocateChange(0)], rejected);
+    let mut output = start.clone();
+    output.action = Action::Output(1);
+    state.apply(output);
+    assert!(state.operations().next().is_none());
+    assert!(
+        !state.transactions()[&start.id().0]
+            .completed()
+            .contains(&Action::Output(1))
+    );
 }
 
 #[tokio::test]
@@ -536,7 +573,7 @@ async fn concrete_change_scripts_do_not_change_candidate_cost_or_schedule() {
             .unwrap();
 
         assert_eq!(
-            run_scripted(&mut state, &mut io, Request::id).await,
+            run_scripted(&mut state, &mut io, Operation::id).await,
             Stopped::Closed
         );
 
@@ -561,71 +598,54 @@ async fn concrete_change_scripts_do_not_change_candidate_cost_or_schedule() {
 }
 
 #[tokio::test]
-async fn outputs_require_closed_inputs_and_all_contributions_before_freezing() {
+async fn completed_effects_belong_to_their_transaction() {
     let now = Instant::now();
-    let start = scheduled(&mut fixture(now, 1, true, true), now);
     let io = executor();
-    run_action(&io, &start, Action::Start).await.unwrap();
-    for action in [Action::Output(0), Action::AllocateChange(0)] {
-        assert_eq!(
-            run_action(&io, &start, action).await.unwrap_err().0,
-            "outputs are not modifiable"
-        );
+    let mut allocations = Vec::new();
+    for wallet in [1, 2] {
+        let mut state = fixture(now, wallet, true, true);
+        let start = scheduled(&mut state, now);
+        for action in [Action::Start, Action::Input(0), Action::CloseInputs] {
+            run_action(&mut state, &io, &start, action).await;
+        }
+        let mut allocate = start.clone();
+        allocate.action = Action::AllocateChange(0);
+        let allocate = dispatch(&mut state, allocate);
+        assert!(matches!(io.execute(&allocate).await, Ok(Update::Change(_))));
+        allocations.push(allocate);
     }
-    for action in [Action::Input(0), Action::CloseInputs, Action::Output(0)] {
-        run_action(&io, &start, action).await.unwrap();
-    }
-    assert_eq!(
-        run_action(&io, &start, Action::CloseOutputs)
-            .await
-            .unwrap_err()
-            .0,
-        "output contributions are incomplete"
-    );
-    assert_eq!(
-        run_action(&io, &start, Action::AllocateChange(1))
-            .await
-            .unwrap_err()
-            .0,
-        "unknown change"
-    );
-    for action in [
-        Action::AllocateChange(0),
-        Action::Output(1),
-        Action::CloseOutputs,
-    ] {
-        run_action(&io, &start, action).await.unwrap();
-    }
-    assert_eq!(
-        run_action(&io, &start, Action::AllocateChange(1))
-            .await
-            .unwrap_err()
-            .0,
-        "transaction is frozen"
-    );
+    assert_eq!(io.change.lock().await.requests(), 2);
+    io.execute(&allocations[0]).await.unwrap();
+    assert_eq!(io.change.lock().await.requests(), 2);
 }
 
 #[tokio::test]
-async fn completed_effects_belong_to_their_transaction() {
+async fn mismatched_effect_results_fail_the_operation() {
     let now = Instant::now();
-    let first = scheduled(&mut fixture(now, 1, true, true), now);
-    let second = scheduled(&mut fixture(now, 2, true, true), now);
+    let unexpected = Error("unexpected effect result".into());
+    let mut state = fixture(now, 1, true, true);
+    let request = scheduled(&mut state, now);
+    let start = dispatch(&mut state, request);
+    state.completed(start.id(), Ok(Update::Change(script(4))));
+    let tx = &state.transactions()[&start.id().0];
+    assert_eq!(tx.operation_errors()[&Action::Start], unexpected);
+
+    let mut state = fixture(now, 1, true, true);
+    let start = scheduled(&mut state, now);
     let io = executor();
-    for request in [&first, &second] {
-        for action in [
-            Action::Start,
-            Action::Input(0),
-            Action::CloseInputs,
-            Action::AllocateChange(0),
-        ] {
-            run_action(&io, request, action).await.unwrap();
-        }
+    for action in [Action::Start, Action::Input(0), Action::CloseInputs] {
+        run_action(&mut state, &io, &start, action).await;
     }
-    assert_eq!(io.change.lock().await.requests(), 2);
-    run_action(&io, &first, Action::AllocateChange(0))
-        .await
-        .unwrap();
-    assert_eq!(io.change.lock().await.requests(), 2);
+    let mut allocate = start.clone();
+    allocate.action = Action::AllocateChange(0);
+    let allocate = dispatch(&mut state, allocate);
+    state.completed(allocate.id(), Ok(Update::Applied));
+    let tx = &state.transactions()[&start.id().0];
+    assert_eq!(
+        tx.operation_errors()[&Action::AllocateChange(0)],
+        unexpected
+    );
+    assert_eq!(io.change.lock().await.requests(), 0);
 }
 
 #[tokio::test]
@@ -644,7 +664,7 @@ async fn an_allocation_error_prevents_output_freezing() {
     };
 
     assert_eq!(
-        run_scripted(&mut state, &mut io, Request::id).await,
+        run_scripted(&mut state, &mut io, Operation::id).await,
         Stopped::Closed
     );
 
@@ -684,8 +704,6 @@ async fn a_busy_signer_does_not_block_another_inputs_signer() {
     }
     let (sender, receiver) = oneshot::channel();
     let now = Instant::now();
-    let mut first = scheduled(&mut fixture(now, 1, true, true), now);
-    let mut second = scheduled(&mut fixture(now, 2, true, true), now);
     let io = Executor::new(
         dummy::Change::new(
             script(3),
@@ -706,7 +724,10 @@ async fn a_busy_signer_does_not_block_another_inputs_signer() {
         AcceptBroadcast,
     )
     .unwrap();
-    for request in [&mut first, &mut second] {
+    let mut signs = Vec::new();
+    for wallet in [1, 2] {
+        let mut state = fixture(now, wallet, true, true);
+        let mut request = scheduled(&mut state, now);
         for action in [
             Action::Start,
             Action::Input(0),
@@ -717,10 +738,14 @@ async fn a_busy_signer_does_not_block_another_inputs_signer() {
             Action::CloseOutputs,
         ] {
             request.action = action;
-            io.execute(request).await.unwrap();
+            let operation = dispatch(&mut state, request.clone());
+            let result = io.execute(&operation).await;
+            state.completed(operation.id(), result);
         }
         request.action = Action::Sign(0);
+        signs.push(dispatch(&mut state, request));
     }
+    let [first, second] = <[_; 2]>::try_from(signs).ok().unwrap();
     let first_sign = io.execute(&first);
     futures::pin_mut!(first_sign);
     assert!(futures::poll!(&mut first_sign).is_pending());

@@ -17,7 +17,8 @@ use cost_function::{
 use fungi_core::{
     driver::{Decision, Machine, Stopped, Wake},
     strategy::{
-        Action, Broadcaster, Events, Executor, Observation, Request, Runtime, State, Status,
+        Action, Broadcaster, Events, Executor, Observation, Operation, Request, Runtime, State,
+        Status,
     },
     wallet::{Coin, Snapshot, dummy},
 };
@@ -197,17 +198,19 @@ fn next_request(state: &mut TestState, now: Instant) -> Request {
     scheduled_request(state, now).expect("expected an action")
 }
 
-async fn execute(
-    io: &mut TestRuntime,
-    request: &Request,
-    action: Action,
-) -> Result<fungi_core::strategy::Update, fungi_core::strategy::Error> {
-    let mut request = request.clone();
-    request.action = action;
-    io.executor.execute(&request).await
+fn dispatch(state: &mut TestState, request: Request) -> Operation {
+    let id = request.id();
+    state.apply(request);
+    state
+        .operations()
+        .find(|(operation, _)| *operation == id)
+        .expect("the request was dispatched")
+        .1
 }
 
-async fn pending_action(state: &mut TestState, io: &TestRuntime, action: Action) -> Request {
+/// Execute and complete scheduled operations until the action is dispatched.
+/// Returns the dispatched operation without executing it.
+async fn pending_action(state: &mut TestState, io: &TestRuntime, action: Action) -> Operation {
     let mut requests = BTreeSet::new();
     loop {
         let request = next_request(state, io.events.now);
@@ -216,13 +219,29 @@ async fn pending_action(state: &mut TestState, io: &TestRuntime, action: Action)
             requests.insert(id.clone()),
             "repeated scripted request {id:?}"
         );
-        state.apply(request.clone());
-        if request.action == action {
-            return request;
+        let operation = dispatch(state, request);
+        if id.1 == action {
+            return operation;
         }
-        let result = io.executor.execute(&request).await;
+        let result = io.executor.execute(&operation).await;
         state.completed(id, result);
     }
+}
+
+/// Run every scheduled operation and return clones of those that completed.
+async fn run_retaining(state: &mut TestState, io: &mut TestRuntime) -> Vec<Operation> {
+    let mut operations = vec![];
+    while let Some(request) = scheduled_request(state, io.events.now) {
+        let operation = dispatch(state, request);
+        let result = io.executor.execute(&operation).await;
+        state.completed(operation.id(), result);
+        operations.push(operation);
+        let observations: Vec<_> = io.events.inbox.lock().unwrap().drain(..).collect();
+        for observation in observations {
+            state.observe(observation);
+        }
+    }
+    operations
 }
 
 #[tokio::test]
@@ -251,46 +270,9 @@ async fn a_late_signature_failure_preserves_the_first_failure() {
 }
 
 #[tokio::test]
-async fn only_finalization_can_complete_with_a_payment() {
-    let (mut state, io) = fixture();
-    let finalize = pending_action(&mut state, &io, Action::Finalize).await;
-    let payment = io.executor.execute(&finalize).await.unwrap();
-    assert!(matches!(
-        payment,
-        fungi_core::strategy::Update::Finalized(_)
-    ));
-
-    state.completed(finalize.id(), Ok(fungi_core::strategy::Update::Applied));
-    let tx = &state.transactions()[&finalize.id().0];
-    let error = fungi_core::strategy::Error("finalization did not return a transaction".into());
-    assert_eq!(tx.status(), &Status::Failed(error.clone()));
-    assert_eq!(
-        tx.operation_errors(),
-        &BTreeMap::from([(Action::Finalize, error)])
-    );
-    assert!(tx.payment().is_none());
-
-    let (mut state, io) = fixture();
-    let start = pending_action(&mut state, &io, Action::Start).await;
-    state.completed(start.id(), Ok(payment));
-    let tx = &state.transactions()[&start.id().0];
-    let error = fungi_core::strategy::Error("unexpected effect result".into());
-    assert_eq!(tx.status(), &Status::Failed(error.clone()));
-    assert_eq!(
-        tx.operation_errors(),
-        &BTreeMap::from([(Action::Start, error)])
-    );
-    assert!(tx.payment().is_none());
-}
-
-#[tokio::test]
 async fn constructs_and_finalizes_a_verified_payment() {
     let (mut state, mut io) = fixture();
-    let request = next_request(&mut state, io.events.now);
-    assert_eq!(
-        run_scripted(&mut state, &mut io, Request::id).await,
-        Stopped::Closed
-    );
+    let operations = run_retaining(&mut state, &mut io).await;
     let payment = state
         .transactions()
         .values()
@@ -329,12 +311,13 @@ async fn constructs_and_finalizes_a_verified_payment() {
     );
     drop(signer);
 
-    // Replaying the action returns the same receipt without requesting another signature.
-    execute(&mut io, &request, Action::Sign(0)).await.unwrap();
-    let result = execute(&mut io, &request, Action::Finalize).await.unwrap();
-    assert!(
-        matches!(result, fungi_core::strategy::Update::Finalized(replay) if replay == *payment)
-    );
+    // Replaying an operation returns its receipt without requesting another signature.
+    let sign = operations
+        .iter()
+        .find(|operation| operation.id().1 == Action::Sign(0))
+        .unwrap();
+    let signed = io.executor.execute(sign).await.unwrap();
+    assert!(matches!(signed, fungi_core::strategy::Update::Signed(_)));
     assert_eq!(
         io.executor
             .signers
@@ -350,44 +333,6 @@ async fn constructs_and_finalizes_a_verified_payment() {
 }
 
 #[tokio::test]
-async fn signing_and_finalization_require_their_predecessors() {
-    let (mut state, mut io) = fixture();
-    let request = next_request(&mut state, io.events.now);
-    execute(&mut io, &request, Action::Start).await.unwrap();
-    assert_eq!(
-        execute(&mut io, &request, Action::Sign(0))
-            .await
-            .unwrap_err()
-            .0,
-        "transaction has not been frozen and validated"
-    );
-    assert_eq!(
-        execute(&mut io, &request, Action::Finalize)
-            .await
-            .unwrap_err()
-            .0,
-        "signatures are incomplete"
-    );
-    assert_eq!(
-        execute(&mut io, &request, Action::Sign(1))
-            .await
-            .unwrap_err()
-            .0,
-        "unknown input"
-    );
-    assert!(
-        io.executor
-            .signers
-            .get(&OutPoint::new(Txid::all_zeros(), 0))
-            .unwrap()
-            .lock()
-            .await
-            .requests()
-            .is_empty()
-    );
-}
-
-#[tokio::test]
 async fn a_signing_failure_is_not_payment_completion() {
     let (mut state, mut io) = fixture();
     *io.executor
@@ -400,7 +345,7 @@ async fn a_signing_failure_is_not_payment_completion() {
         [Err(dummy::Error::Scripted("sign failed"))],
     );
     assert_eq!(
-        run_scripted(&mut state, &mut io, Request::id).await,
+        run_scripted(&mut state, &mut io, Operation::id).await,
         Stopped::Closed
     );
     assert!(matches!(
@@ -429,7 +374,7 @@ async fn a_same_length_invalid_signature_cannot_be_finalized() {
         .lock()
         .await
         .corrupt = true;
-    run_scripted(&mut state, &mut io, Request::id).await;
+    run_scripted(&mut state, &mut io, Operation::id).await;
     assert!(matches!(
         state.transactions().values().next().unwrap().status(),
         Status::Failed(_)
@@ -462,7 +407,7 @@ async fn a_closed_signer_channel_fails_the_pending_signature() {
     drop(send);
 
     assert_eq!(
-        run_scripted(&mut state, &mut io, Request::id).await,
+        run_scripted(&mut state, &mut io, Operation::id).await,
         Stopped::Closed
     );
 
@@ -486,7 +431,7 @@ async fn a_signer_registered_later_is_visible_to_an_existing_executor_clone() {
     );
     io.executor = executor;
     assert_eq!(
-        run_scripted(&mut state, &mut io, Request::id).await,
+        run_scripted(&mut state, &mut io, Operation::id).await,
         Stopped::Closed
     );
 
@@ -503,7 +448,7 @@ async fn duplicate_signer_registration_keeps_the_original_usable() {
     assert!(!io.executor.signers.register(duplicate));
 
     assert_eq!(
-        run_scripted(&mut state, &mut io, Request::id).await,
+        run_scripted(&mut state, &mut io, Operation::id).await,
         Stopped::Closed
     );
     let tx = state.transactions().values().next().unwrap();
@@ -516,7 +461,7 @@ async fn an_input_without_a_signer_cannot_be_finalized() {
     let (mut state, mut io) = fixture_without_signers(false, 10_000, Weight::from_wu(70));
 
     assert_eq!(
-        run_scripted(&mut state, &mut io, Request::id).await,
+        run_scripted(&mut state, &mut io, Operation::id).await,
         Stopped::Closed
     );
 
@@ -559,7 +504,7 @@ async fn signing_results_must_preserve_the_prevout_and_finalize_a_key_spend() {
             .edit = Some(edit);
 
         assert_eq!(
-            run_scripted(&mut state, &mut io, Request::id).await,
+            run_scripted(&mut state, &mut io, Operation::id).await,
             Stopped::Closed
         );
 
@@ -575,7 +520,7 @@ async fn underestimated_input_weight_can_prevent_finalization() {
     let (mut state, mut io) = fixture_with_pricing(false, 10_000, Weight::ZERO);
 
     assert_eq!(
-        run_scripted(&mut state, &mut io, Request::id).await,
+        run_scripted(&mut state, &mut io, Operation::id).await,
         Stopped::Closed
     );
 
@@ -603,15 +548,14 @@ async fn two_inputs_of_one_transaction_can_be_signed_concurrently() {
     let mut held = None;
     let mut requests = BTreeSet::new();
     while let Decision::Schedule(scheduled) = state.decide(io.events.now) {
-        let request = scheduled.action;
-        state.apply(request.clone());
+        let id = scheduled.action.id();
+        let operation = dispatch(&mut state, scheduled.action);
         let executor = io.executor.clone();
-        let id = request.id();
         assert!(
             requests.insert(id.clone()),
             "repeated scripted request {id:?}"
         );
-        let mut future = Box::pin(async move { executor.execute(&request).await });
+        let mut future = Box::pin(async move { executor.execute(&operation).await });
         match futures::poll!(&mut future) {
             std::task::Poll::Pending => {
                 assert!(held.is_none());
@@ -639,7 +583,7 @@ async fn two_inputs_of_one_transaction_can_be_signed_concurrently() {
     send.send(()).unwrap();
     let (id, future) = held.unwrap();
     state.completed(id, future.await);
-    run_scripted(&mut state, &mut io, Request::id).await;
+    run_scripted(&mut state, &mut io, Operation::id).await;
     let transaction = state.transactions().values().next().unwrap();
     assert_eq!(transaction.payment().unwrap().transaction.input.len(), 2);
     assert_eq!(transaction.status(), &Status::Confirmed);
@@ -650,7 +594,7 @@ async fn two_inputs_of_one_transaction_can_be_signed_concurrently() {
 async fn confirmation_leaves_the_wallet_waiting_for_information() {
     let (mut state, mut io) = fixture();
     assert_eq!(
-        run_scripted(&mut state, &mut io, Request::id).await,
+        run_scripted(&mut state, &mut io, Operation::id).await,
         Stopped::Closed
     );
     assert_eq!(
@@ -664,11 +608,7 @@ async fn confirmation_leaves_the_wallet_waiting_for_information() {
 #[tokio::test]
 async fn constructs_signs_retains_publishes_and_observes_the_payment() {
     let (mut state, mut io) = fixture();
-    let request = next_request(&mut state, io.events.now);
-    assert_eq!(
-        run_scripted(&mut state, &mut io, Request::id).await,
-        Stopped::Closed
-    );
+    let operations = run_retaining(&mut state, &mut io).await;
     assert_eq!(
         *state.transactions().values().next().unwrap().status(),
         Status::Confirmed
@@ -718,12 +658,14 @@ async fn constructs_signs_retains_publishes_and_observes_the_payment() {
             .last(),
         Some(&Action::Publish)
     );
-    // Replay a completed operation: no new wallet operation or broadcast.
-    execute(&mut io, &request, Action::AllocateChange(0))
-        .await
-        .unwrap();
-    execute(&mut io, &request, Action::Record).await.unwrap();
-    execute(&mut io, &request, Action::Publish).await.unwrap();
+    // Replaying completed operations makes no new wallet request or broadcast.
+    for action in [Action::AllocateChange(0), Action::Record, Action::Publish] {
+        let operation = operations
+            .iter()
+            .find(|operation| operation.id().1 == action)
+            .unwrap();
+        io.executor.execute(operation).await.unwrap();
+    }
     assert_eq!(io.executor.recorder.lock().await.requests().len(), 1);
     assert_eq!(io.executor.change.lock().await.requests(), 1);
     assert_eq!(io.executor.broadcaster.lock().await.published.len(), 1);
@@ -736,7 +678,7 @@ async fn a_recording_failure_prevents_publication() {
     *io.executor.recorder.lock().await =
         dummy::Recorder::new([Err(dummy::Error::Scripted("record failed"))]);
     assert_eq!(
-        run_scripted(&mut state, &mut io, Request::id).await,
+        run_scripted(&mut state, &mut io, Operation::id).await,
         Stopped::Closed
     );
     assert!(matches!(
@@ -760,7 +702,7 @@ async fn failed_broadcast_retains_the_transaction_without_fulfilling_the_intents
     let (mut state, mut io) = fixture();
     io.executor.broadcaster.lock().await.fail = true;
     assert_eq!(
-        run_scripted(&mut state, &mut io, Request::id).await,
+        run_scripted(&mut state, &mut io, Operation::id).await,
         Stopped::Closed
     );
     assert!(matches!(
@@ -790,7 +732,7 @@ async fn invalidated_candidate_has_no_effects() {
         .unwrap()
         .push_back(Observation::Invalidated("coin spent elsewhere".into()));
     assert_eq!(
-        run_scripted(&mut state, &mut io, Request::id).await,
+        run_scripted(&mut state, &mut io, Operation::id).await,
         Stopped::Closed
     );
     assert!(matches!(
@@ -814,7 +756,7 @@ async fn broadcast_acceptance_waits_for_a_matching_confirmation() {
     let (mut state, mut io) = fixture();
     io.executor.broadcaster.lock().await.confirm = false;
     assert_eq!(
-        run_scripted(&mut state, &mut io, Request::id).await,
+        run_scripted(&mut state, &mut io, Operation::id).await,
         Stopped::Closed
     );
     assert_eq!(
@@ -828,7 +770,7 @@ async fn broadcast_acceptance_waits_for_a_matching_confirmation() {
         .unwrap()
         .push_back(Observation::Confirmed(Txid::all_zeros()));
     assert_eq!(
-        run_scripted(&mut state, &mut io, Request::id).await,
+        run_scripted(&mut state, &mut io, Operation::id).await,
         Stopped::Closed
     );
     assert_eq!(
@@ -851,7 +793,7 @@ async fn broadcast_acceptance_waits_for_a_matching_confirmation() {
         .unwrap()
         .push_back(Observation::Confirmed(txid));
     assert_eq!(
-        run_scripted(&mut state, &mut io, Request::id).await,
+        run_scripted(&mut state, &mut io, Operation::id).await,
         Stopped::Closed
     );
     assert_eq!(
@@ -862,7 +804,7 @@ async fn broadcast_acceptance_waits_for_a_matching_confirmation() {
     assert_eq!(state.pending().iter().count(), 0);
 }
 
-async fn pending_publication() -> (TestState, TestRuntime, Request) {
+async fn pending_publication() -> (TestState, TestRuntime, Operation) {
     let (mut state, io) = fixture();
     let request = pending_action(&mut state, &io, Action::Publish).await;
     (state, io, request)
@@ -948,7 +890,7 @@ async fn late_success_cannot_undo_confirmation() {
 async fn a_stale_action_cannot_undo_confirmation() {
     let (mut state, mut io) = fixture();
     let request = next_request(&mut state, io.events.now);
-    run_scripted(&mut state, &mut io, Request::id).await;
+    run_scripted(&mut state, &mut io, Operation::id).await;
     state.apply(request);
     assert_eq!(
         *state.transactions().values().next().unwrap().status(),
@@ -974,28 +916,6 @@ async fn a_late_failure_preserves_the_invalidation_reason() {
     );
     assert!(state.operations().next().is_none());
 }
-#[tokio::test]
-async fn publication_requires_recording() {
-    let (mut state, mut io) = fixture();
-    let request = next_request(&mut state, io.events.now);
-    execute(&mut io, &request, Action::Start).await.unwrap();
-    assert_eq!(
-        execute(&mut io, &request, Action::Record)
-            .await
-            .unwrap_err()
-            .0,
-        "transaction is not finalized"
-    );
-    assert_eq!(
-        execute(&mut io, &request, Action::Publish)
-            .await
-            .unwrap_err()
-            .0,
-        "transaction has not been retained"
-    );
-    assert!(io.executor.broadcaster.lock().await.published.is_empty());
-}
-
 #[test]
 fn invalidation_before_planning_keeps_the_intents_pending() {
     let (mut state, io) = fixture();
@@ -1016,7 +936,7 @@ async fn confirmation_recovers_a_failed_broadcast() {
     let (mut state, mut io) = fixture();
     io.executor.broadcaster.lock().await.fail = true;
     assert_eq!(
-        run_scripted(&mut state, &mut io, Request::id).await,
+        run_scripted(&mut state, &mut io, Operation::id).await,
         Stopped::Closed
     );
     let tx = state.transactions().values().next().unwrap();
@@ -1063,7 +983,7 @@ async fn recording_completed_after_invalidation_still_retains_the_payment() {
 async fn confirming_one_batch_keeps_the_other_intents_pending() {
     let (mut state, mut io) = split_batches();
     io.executor.broadcaster.lock().await.confirm = false;
-    run_scripted(&mut state, &mut io, Request::id).await;
+    run_scripted(&mut state, &mut io, Operation::id).await;
     assert_eq!(state.transactions().len(), 2);
     assert_eq!(state.pending().iter().count(), 2);
     assert_eq!(state.snapshot().coins.len(), 2);
@@ -1095,15 +1015,14 @@ async fn independent_batches_progress_while_one_signer_waits() {
     let mut held = None;
     let mut requests = BTreeSet::new();
     while let Decision::Schedule(scheduled) = state.decide(io.events.now) {
-        let request = scheduled.action;
-        state.apply(request.clone());
+        let id = scheduled.action.id();
+        let operation = dispatch(&mut state, scheduled.action);
         let executor = io.executor.clone();
-        let id = request.id();
         assert!(
             requests.insert(id.clone()),
             "repeated scripted request {id:?}"
         );
-        let future = async move { executor.execute(&request).await };
+        let future = async move { executor.execute(&operation).await };
         let mut future = Box::pin(future);
         match futures::poll!(&mut future) {
             std::task::Poll::Pending => {
@@ -1122,7 +1041,7 @@ async fn independent_batches_progress_while_one_signer_waits() {
     send.send(()).unwrap();
     let (id, future) = held.unwrap();
     state.completed(id, future.await);
-    run_scripted(&mut state, &mut io, Request::id).await;
+    run_scripted(&mut state, &mut io, Operation::id).await;
     assert_eq!(io.executor.broadcaster.lock().await.published.len(), 2);
     for outpoint in state.snapshot().coins.keys() {
         let signer = io.executor.signers.get(outpoint).unwrap();
