@@ -2,7 +2,10 @@
 
 use bitcoin::{Amount, FeeRate, OutPoint, TxOut, Weight};
 use rand::RngCore;
-use std::collections::{BTreeMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashSet},
+    num::NonZeroUsize,
+};
 
 use crate::action::Action;
 use crate::candidate::Candidate;
@@ -14,7 +17,7 @@ use crate::intent::Intent;
 use crate::queue::Queue;
 pub use crate::selection::random::RandomSelectionError as FundingError;
 use crate::selection::random::RandomSelector;
-use crate::selection::{CoinSelector, FundingRequest, cover_count_growth};
+use crate::selection::{CoinSelector, FundingRequest, cover_count_growth, shared_overhead};
 
 /// A coin the wallet can spend.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22,6 +25,7 @@ pub struct Utxo {
     pub(crate) outpoint: OutPoint,
     pub(crate) value: Amount,
     pub(crate) satisfaction_weight: Weight,
+    pub(crate) liability: Amount,
 }
 
 impl Utxo {
@@ -31,6 +35,9 @@ impl Utxo {
     pub fn value(&self) -> Amount {
         self.value
     }
+    pub fn liability(&self) -> Amount {
+        self.liability
+    }
 
     /// `satisfaction_weight` is the weight of the scriptSig and witness that spend this
     /// coin, excluding the outpoint and nsequence.
@@ -39,7 +46,14 @@ impl Utxo {
             outpoint,
             value,
             satisfaction_weight,
+            liability: Amount::ZERO,
         }
+    }
+
+    /// Attach a replacement fee liability that spending this coin must cover.
+    pub fn with_liability(mut self, liability: Amount) -> Self {
+        self.liability = liability;
+        self
     }
 }
 
@@ -67,18 +81,30 @@ impl<Q: Queue, U: UtxoSnapshot> WalletStateSnapshot<Q, U> {
 
     /// Fund the queue once using random coin selection and one change output.
     /// This is the single-outcome entry point, not a search for an optimal plan.
-    ///
-    /// # Panics
-    ///
-    /// If raising `feerate` to cover count growth overflows.
     pub fn funded_candidate<C: ChangeCosts, R: RngCore>(
         &self,
         feerate: FeeRate,
         rng: &mut R,
         costs: &C,
     ) -> Result<Option<Candidate<Q::Id>>, FundingError> {
+        self.funded_candidate_for_session(feerate, NonZeroUsize::MIN, rng, costs)
+    }
+
+    /// Fund this participant's intents and share of transaction overhead in a
+    /// `participants`-party session.
+    pub fn funded_candidate_for_session<C: ChangeCosts, R: RngCore>(
+        &self,
+        feerate: FeeRate,
+        participants: NonZeroUsize,
+        rng: &mut R,
+        costs: &C,
+    ) -> Result<Option<Candidate<Q::Id>>, FundingError> {
+        // The selector and change strategy share one feerate, so change outputs that grow the
+        // output count are covered too.
+        let feerate = cover_count_growth(feerate).ok_or(FundingError::Overflow)?;
         match self.fund_with(
             feerate,
+            shared_overhead(participants),
             &RandomSelector,
             rng,
             &ChangeStrategy::new(SingleOutputChangeSelector, costs),
@@ -92,6 +118,7 @@ impl<Q: Queue, U: UtxoSnapshot> WalletStateSnapshot<Q, U> {
     fn fund_with<S, C, A, R>(
         &self,
         feerate: FeeRate,
+        overhead: Weight,
         selector: &S,
         rng: &mut R,
         change_strategy: &ChangeStrategy<C, A>,
@@ -102,10 +129,6 @@ impl<Q: Queue, U: UtxoSnapshot> WalletStateSnapshot<Q, U> {
         A: ChangeCosts,
         R: RngCore,
     {
-        // The selector and change strategy share one feerate, so change outputs that grow the
-        // output count are covered too.
-        let feerate = cover_count_growth(feerate).expect("feerate overflows");
-
         // MVP: the decision space yields only the trivial partition: with one batch with all intents
         let Some(plan_intent) = DecisionSpace::new(&self.queue).iter().next() else {
             return Ok(None);
@@ -133,6 +156,7 @@ impl<Q: Queue, U: UtxoSnapshot> WalletStateSnapshot<Q, U> {
                     available: &available_utxos,
                     outputs: &payments,
                     feerate,
+                    overhead,
                 },
                 rng,
             )
@@ -267,6 +291,41 @@ mod tests {
                     dust: Amount::from_sat(474),
                 }),
             ])))
+        );
+    }
+
+    #[test]
+    fn a_two_party_session_charges_half_the_transaction_overhead() {
+        let queue = InMemoryQueue::new([intent(1_000)]);
+        let snapshot = WalletStateSnapshot::new(DummyUtxoSnapshot(vec![utxo(0, 10_000)]), queue);
+        let candidate = snapshot
+            .funded_candidate_for_session(
+                FeeRate::from_sat_per_vb(1).unwrap(),
+                NonZeroUsize::new(2).unwrap(),
+                &mut StdRng::seed_from_u64(0),
+                &DummyChangeCosts,
+            )
+            .unwrap()
+            .unwrap();
+        // 21 WU at 251 sat/kwu rounds up to 6 sats instead of 11 sats, leaving 5 sats more change.
+        assert_eq!(
+            candidate.change().next().unwrap().value,
+            Amount::from_sat(10_000 - 41 - 1_000 - 11 - 6 - 11)
+        );
+    }
+
+    #[test]
+    fn an_overflowing_feerate_returns_an_error() {
+        let queue = InMemoryQueue::new([intent(1_000)]);
+        let snapshot = WalletStateSnapshot::new(DummyUtxoSnapshot(vec![utxo(0, 10_000)]), queue);
+
+        assert_eq!(
+            snapshot.funded_candidate(
+                FeeRate::MAX,
+                &mut StdRng::seed_from_u64(0),
+                &DummyChangeCosts
+            ),
+            Err(FundingError::Overflow)
         );
     }
 

@@ -13,9 +13,11 @@ pub(crate) struct TreeNode<'a> {
     picked: u64,
 }
 
+pub(crate) const MAX_INPUTS: usize = u64::BITS as usize;
+
 impl<'a> TreeNode<'a> {
     pub(crate) fn new(utxos: &'a [Utxo]) -> Self {
-        assert!(utxos.len() <= 64, "Number of utxos is capped at 64");
+        assert!(utxos.len() <= MAX_INPUTS, "Number of utxos is capped at 64");
         Self {
             utxos,
             remaining: utxos,

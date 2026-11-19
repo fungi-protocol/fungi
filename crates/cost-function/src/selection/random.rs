@@ -1,10 +1,11 @@
 //! A [`CoinSelector`] that spends coins in random order until they cover the deficit.
 
-use bitcoin::{Amount, FeeRate, SignedAmount};
+use bitcoin::{FeeRate, SignedAmount};
 use rand::{RngCore, seq::SliceRandom};
 
-use super::{CoinSelector, FundingRequest, InputSelection, TX_OVERHEAD};
+use super::{CoinSelector, FundingRequest, InputSelection};
 use crate::blockspace::KnowsWeight;
+use crate::decision_tree::MAX_INPUTS;
 use crate::wallet::Utxo;
 
 /// Funds a request with the coins on offer, taken in random order.
@@ -17,26 +18,36 @@ impl CoinSelector for RandomSelector {
     /// effective value covers the deficit.
     ///
     /// The deficit is the effective cost of [`FundingRequest::outputs`] and the fee for
-    /// [`TX_OVERHEAD`]. The surplus is what the selection's effective value leaves over
-    /// the deficit.
-    ///
-    /// # Panics
-    ///
-    /// If the deficit, or the selection's effective value, overflows.
+    /// [`FundingRequest::overhead`]. The surplus is what the selection's effective value
+    /// leaves over the deficit.
     fn select<R: RngCore>(
         &self,
         request: FundingRequest<'_>,
         rng: &mut R,
     ) -> Result<InputSelection, Self::Error> {
+        if request
+            .outputs
+            .iter()
+            .any(|output| output.value < output.script_pubkey.minimal_non_dust())
+        {
+            return Err(RandomSelectionError::DustOutput);
+        }
         let feerate = request.feerate;
+        let overhead = feerate
+            .fee_wu(request.overhead)
+            .ok_or(RandomSelectionError::Overflow)?;
         let deficit = request
             .outputs
             .iter()
-            .map(|o| o.value + o.fee(feerate).expect("output fee overflows"))
-            .chain([feerate.fee_wu(TX_OVERHEAD).expect("overhead fee overflows")])
-            .fold(Amount::ZERO, |sum, cost| sum + cost)
+            .try_fold(overhead, |sum, o| {
+                let fee = o.fee(feerate).ok_or(RandomSelectionError::Overflow)?;
+                o.value
+                    .checked_add(fee)
+                    .and_then(|cost| sum.checked_add(cost))
+                    .ok_or(RandomSelectionError::Overflow)
+            })?
             .to_signed()
-            .expect("deficit overflows");
+            .map_err(|_| RandomSelectionError::Overflow)?;
 
         let mut coins: Vec<&Utxo> = request.available.iter().collect();
         coins.shuffle(rng);
@@ -44,9 +55,18 @@ impl CoinSelector for RandomSelector {
         let mut selected_inputs = Vec::new();
         let mut value = SignedAmount::ZERO;
         for coin in coins {
+            if selected_inputs.len() == MAX_INPUTS {
+                return Err(RandomSelectionError::InputLimitExceeded);
+            }
+            let worth = effective_value(coin, feerate).ok_or(RandomSelectionError::Overflow)?;
+            value = value
+                .checked_add(worth)
+                .ok_or(RandomSelectionError::Overflow)?;
             selected_inputs.push(coin.clone());
-            value += worth(std::iter::once(coin), feerate);
-            if let Ok(surplus) = (value - deficit).to_unsigned() {
+            if let Some(surplus) = value
+                .checked_sub(deficit)
+                .and_then(|diff| diff.to_unsigned().ok())
+            {
                 return Ok(InputSelection {
                     selected_inputs,
                     surplus,
@@ -57,22 +77,25 @@ impl CoinSelector for RandomSelector {
     }
 }
 
-/// Sum of the coins' effective values.
-///
-/// # Panics
-///
-/// If any of them, or the sum, overflows.
-fn worth<'a>(coins: impl Iterator<Item = &'a Utxo>, feerate: FeeRate) -> SignedAmount {
-    coins.fold(SignedAmount::ZERO, |sum, c| {
-        let fee = c.fee(feerate).expect("coin fee overflows");
-        sum + c.value.to_signed().expect("coin value overflows")
-            - fee.to_signed().expect("coin fee overflows")
-    })
+/// Effective value of spending `coin` at `feerate`, net of its input fee and any
+/// replacement liability attached to the coin.
+fn effective_value(coin: &Utxo, feerate: FeeRate) -> Option<SignedAmount> {
+    let cost = coin.fee(feerate)?.checked_add(coin.liability)?;
+    coin.value
+        .to_signed()
+        .ok()?
+        .checked_sub(cost.to_signed().ok()?)
 }
 
 /// Why coin selection could not fund a request.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RandomSelectionError {
+    /// A payment output is below its script's dust threshold.
+    DustOutput,
+    /// Fee or amount arithmetic overflowed.
+    Overflow,
+    /// Covering the deficit requires more than 64 inputs.
+    InputLimitExceeded,
     /// The coins on offer don't cover the deficit.
     NoCombinationCovers,
 }
@@ -80,6 +103,7 @@ pub enum RandomSelectionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::selection::TX_OVERHEAD;
     use bitcoin::{Amount, OutPoint, ScriptBuf, TxOut, Txid, Weight, hashes::Hash};
     use rand::{SeedableRng, rngs::StdRng};
 
@@ -119,6 +143,7 @@ mod tests {
                 available: coins,
                 outputs: &outputs,
                 feerate: FeeRate::from_sat_per_vb(1).unwrap(),
+                overhead: TX_OVERHEAD,
             },
             &mut StdRng::seed_from_u64(seed),
         )
@@ -153,14 +178,63 @@ mod tests {
         }
     }
 
-    /// Two coins together are worth more than a [`SignedAmount`] holds.
     #[test]
-    #[should_panic(expected = "SignedAmount addition error")]
-    fn a_combination_whose_worth_overflows_panics() {
+    fn dust_payment_outputs_are_refused() {
+        let coins = [coin(0, 10_000)];
+        let dust = p2tr().minimal_non_dust().to_sat() - 1;
+
+        assert_eq!(pay(&coins, dust), Err(RandomSelectionError::DustOutput));
+    }
+
+    #[test]
+    fn overflowing_fees_deficits_and_worths_are_refused() {
         let sats = (1 << 62) + 1_000;
         let coins = [coin(0, sats), coin(1, sats)];
+        assert_eq!(pay(&coins, sats), Err(RandomSelectionError::Overflow));
+        assert_eq!(
+            pay(&coins, (i64::MAX as u64) + 1),
+            Err(RandomSelectionError::Overflow)
+        );
 
-        let _ = pay(&coins, sats);
+        let outputs = [TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: p2tr(),
+        }];
+        assert_eq!(
+            RandomSelector.select(
+                FundingRequest {
+                    available: &[coin(0, 10_000)],
+                    outputs: &outputs,
+                    feerate: FeeRate::MAX,
+                    overhead: TX_OVERHEAD,
+                },
+                &mut StdRng::seed_from_u64(0),
+            ),
+            Err(RandomSelectionError::Overflow)
+        );
+    }
+
+    #[test]
+    fn exceeding_the_input_cap_is_refused() {
+        let coins: Vec<_> = (0..=MAX_INPUTS as u32).map(|i| coin(i, 1_000)).collect();
+        let target = 1_000 * MAX_INPUTS as u64;
+
+        assert_eq!(
+            pay(&coins, target),
+            Err(RandomSelectionError::InputLimitExceeded)
+        );
+    }
+
+    #[test]
+    fn coin_liability_reduces_the_surplus() {
+        let coins = [coin(0, 30_000).with_liability(Amount::from_sat(500))];
+        let selection = pay(&coins, 10_000).unwrap();
+
+        assert_eq!(
+            selection.surplus,
+            Amount::from_sat(20_000 - 58 - 43 - 11 - 500)
+        );
+        assert_eq!(coins[0].liability(), Amount::from_sat(500));
     }
 
     #[test]

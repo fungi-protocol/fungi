@@ -2,6 +2,7 @@
 
 use bitcoin::{Amount, FeeRate, TxOut, Weight};
 use rand::RngCore;
+use std::num::NonZeroUsize;
 
 use crate::wallet::Utxo;
 
@@ -11,6 +12,11 @@ use crate::wallet::Utxo;
 /// given feerate so that by the time 3 byte counts are required, the additional 2 bytes of
 /// shared overhead will be covered at the given feerate even when not accounted for explicitly.
 pub(crate) const TX_OVERHEAD: Weight = Weight::from_wu(42);
+
+/// Share of [`TX_OVERHEAD`] funded by one participant in a `participants`-party session.
+pub(crate) fn shared_overhead(participants: NonZeroUsize) -> Weight {
+    Weight::from_wu(TX_OVERHEAD.to_wu().div_ceil(participants.get() as u64))
+}
 
 /// Additional bytes required to encode an input or output count of 253 or more.
 const COUNT_GROWTH_VB: u64 = 2;
@@ -50,6 +56,9 @@ pub(crate) struct FundingRequest<'a> {
 
     /// Feerate the transaction pays, used to price spending and creating coins.
     pub(crate) feerate: FeeRate,
+
+    /// Transaction-header weight this participant is responsible for funding.
+    pub(crate) overhead: Weight,
 }
 
 /// What a `CoinSelector` returns.
@@ -200,6 +209,34 @@ mod tests {
 
             prop_assert!(raised >= sat_per_kwu);
             prop_assert!(raised <= sat_per_kwu + sat_per_kwu * 2 / (253 * 9) + 1);
+        }
+
+        /// Splitting [`TX_OVERHEAD`] across participants still covers the combined transaction,
+        /// including when each participant stays below 253 outputs and the combined count crosses.
+        #[test]
+        fn shared_overhead_pays_for_a_multiparty_transaction(
+            participants in 1..=4usize,
+            inputs_per_party in prop_oneof![1..=4usize, 126..=135usize],
+            outputs_per_party in prop_oneof![0..=4usize, 126..=135usize],
+            sat_per_kwu in 0..=250_000_000u64,
+        ) {
+            let feerate = FeeRate::from_sat_per_kwu(sat_per_kwu);
+            let raised = cover_count_growth(feerate).unwrap();
+            let (party_coins, party_tx) = transaction(inputs_per_party, outputs_per_party);
+            let (_, combined_tx) = transaction(
+                inputs_per_party * participants,
+                outputs_per_party * participants,
+            );
+            let overhead = shared_overhead(NonZeroUsize::new(participants).unwrap());
+            let party_fee: Amount = party_coins
+                .iter()
+                .map(|c| c.fee(raised).unwrap())
+                .chain(party_tx.output.iter().map(|o| o.fee(raised).unwrap()))
+                .chain([raised.fee_wu(overhead).unwrap()])
+                .sum();
+            let total_charged = Amount::from_sat(party_fee.to_sat() * participants as u64);
+
+            prop_assert!(total_charged >= needed(&combined_tx, feerate));
         }
     }
 }
