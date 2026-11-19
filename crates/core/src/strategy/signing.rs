@@ -1,7 +1,6 @@
 //! Apply verified P2TR signatures and check the signed transaction's feerate.
 
 use super::{Error, error};
-use crate::wallet::Snapshot;
 use bitcoin::{
     Amount, FeeRate, Psbt, Weight,
     hashes::Hash,
@@ -10,12 +9,7 @@ use bitcoin::{
     sighash::{Prevouts, SighashCache, TapSighashType},
 };
 
-pub(super) fn apply(
-    psbt: &mut Psbt,
-    snapshot: &Snapshot,
-    position: usize,
-    signed: psbt::Input,
-) -> Result<(), Error> {
+pub(super) fn apply(psbt: &mut Psbt, position: usize, signed: psbt::Input) -> Result<(), Error> {
     if signed
         .witness_utxo
         .as_ref()
@@ -33,14 +27,21 @@ pub(super) fn apply(
     else {
         return Err(error("expected a default-sighash P2TR key-spend witness"));
     };
-    // Freeze validates these prevouts against the pricing snapshot. Signers
-    // can only contribute the witness, so every signature uses the same prevouts.
+    // Freeze validates every input's witness_utxo before signing, including peer inputs
+    // that are absent from the local wallet snapshot.
     let prevouts: Vec<_> = psbt
-        .unsigned_tx
-        .input
+        .inputs
         .iter()
-        .map(|input| &snapshot.coins[&input.previous_output].txout)
+        .map(|input| {
+            input
+                .witness_utxo
+                .as_ref()
+                .expect("freeze validated every witness utxo")
+        })
         .collect();
+    if !prevouts[position].script_pubkey.is_p2tr() {
+        return Err(error("expected a P2TR prevout"));
+    }
     let sighash = SighashCache::new(&psbt.unsigned_tx)
         .taproot_key_spend_signature_hash(
             position,
@@ -75,6 +76,7 @@ pub(super) fn validate_feerate(fee: Amount, weight: Weight, feerate: FeeRate) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin::{OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness, absolute};
 
     #[test]
     fn the_required_fee_must_fit_amount_arithmetic() {
@@ -83,6 +85,34 @@ mod tests {
                 .unwrap_err()
                 .0,
             "fee overflow"
+        );
+    }
+
+    #[test]
+    fn non_p2tr_prevouts_are_rejected_without_panicking() {
+        let mut psbt = Psbt::from_unsigned_tx(Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![],
+        })
+        .unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: ScriptBuf::new(),
+        });
+        let signed = psbt::Input {
+            final_script_witness: Some(Witness::from_slice(&[[0u8; 64]])),
+            ..Default::default()
+        };
+        assert_eq!(
+            apply(&mut psbt, 0, signed).unwrap_err().0,
+            "expected a P2TR prevout"
         );
     }
 }

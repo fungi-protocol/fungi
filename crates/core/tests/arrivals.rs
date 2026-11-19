@@ -277,16 +277,83 @@ async fn an_intent_after_confirmation_starts_another_transaction() {
 }
 
 #[tokio::test]
-async fn an_infeasible_batch_waits_for_a_new_snapshot() {
+async fn an_underfunded_queue_warns_and_prioritizes_until_more_coins_arrive() {
     let now = Instant::now();
     let mut state = wallet(now);
-    // Fund only one coin, then add an intent the coin cannot cover alongside A.
+    // Fund only one 50,000-sat coin, then add a 45,000-sat intent it cannot cover
+    // alongside intent 0 (10,000 sats), followed by a 10,000-sat intent it can.
     state.observe(Observation::Snapshot(Snapshot {
         coins: coins().into_iter().take(1).collect(),
         ..Default::default()
     }));
     state.observe(Observation::Intent(payment_of(7, Amount::from_sat(45_000))));
+    state.observe(Observation::Intent(payment(8)));
+    assert!(start_time(&mut state, now).is_some());
+    assert_eq!(
+        state.warnings(),
+        ["payment queue exceeds available funding"]
+    );
+    assert!(state.planning_errors().is_empty());
+    let tx = state.transactions().values().next().unwrap();
+    assert_eq!(
+        tx.candidate()
+            .payments()
+            .map(|(&id, _)| id)
+            .collect::<Vec<_>>(),
+        [0, 2]
+    );
+
+    // Once the second coin arrives before start, all three intents fit together.
+    state.observe(Observation::Snapshot(Snapshot {
+        coins: coins(),
+        ..Default::default()
+    }));
+    let at = start_time(&mut state, now).unwrap();
+    assert!(state.warnings().is_empty());
+    assert!(state.planning_errors().is_empty());
+    assert!(at > now);
+    let tx = state.transactions().values().next().unwrap();
+    assert_eq!(tx.candidate().inputs().count(), 2);
+    assert_eq!(
+        tx.candidate()
+            .payments()
+            .map(|(&id, _)| id)
+            .collect::<Vec<_>>(),
+        [0, 1, 2]
+    );
+}
+
+#[tokio::test]
+async fn an_infeasible_queue_waits_for_a_new_snapshot() {
+    let now = Instant::now();
+    let small_outpoint = OutPoint::new(Txid::all_zeros(), 9);
+    let small_coin = Coin {
+        txout: TxOut {
+            value: Amount::from_sat(25_000),
+            script_pubkey: signing::script(small_outpoint),
+        },
+        satisfaction_weight: Weight::from_wu(70),
+    };
+    let mut state = State::new(
+        InMemoryQueue::new([
+            payment_of(4, Amount::from_sat(30_000)),
+            payment_of(7, Amount::from_sat(40_000)),
+        ]),
+        Snapshot {
+            coins: BTreeMap::from([(small_outpoint, small_coin)]),
+            ..Default::default()
+        },
+        FeeRate::from_sat_per_vb(2).unwrap(),
+        [1; 16],
+        dummy::Change::new(script(3), Weight::from_wu(70), []),
+        StdRng::seed_from_u64(0),
+        ScheduleGrid::new(now),
+    );
     assert_eq!(start_time(&mut state, now), None);
+    assert_eq!(
+        state.warnings(),
+        ["payment queue exceeds available funding"]
+    );
     assert_eq!(state.planning_errors().len(), 1);
 
     state.observe(Observation::Snapshot(Snapshot {
@@ -294,6 +361,7 @@ async fn an_infeasible_batch_waits_for_a_new_snapshot() {
         ..Default::default()
     }));
     let at = start_time(&mut state, now).unwrap();
+    assert!(state.warnings().is_empty());
     assert!(state.planning_errors().is_empty());
     assert!(at > now);
     let tx = state.transactions().values().next().unwrap();

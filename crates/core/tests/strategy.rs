@@ -1158,3 +1158,74 @@ fn a_failed_start_keeps_its_attempt() {
     assert_eq!(tx.operation_errors()[&Action::Start], failure);
     assert_eq!(tx.status(), &Status::Failed(failure));
 }
+
+#[test]
+fn a_dust_intent_records_a_planning_error_without_panicking() {
+    let now = Instant::now();
+    let dust = Intent::new(
+        Outcome::OutputCreation(FixedPaymentInstructions {
+            script_pubkey: script(2),
+            amount: Amount::ONE_SAT,
+        }),
+        PayoffCurve::new(0, [(60 * SLOTS_PER_SECOND, Amount::from_sat(100_000))]).unwrap(),
+    );
+    let mut state = State::new(
+        InMemoryQueue::new([dust]),
+        fixture(now, 1, true, false).snapshot().clone(),
+        FeeRate::from_sat_per_vb(2).unwrap(),
+        [1; 16],
+        dummy::Change::new(script(3), Weight::from_wu(70), []),
+        StdRng::seed_from_u64(0),
+        ScheduleGrid::new(now),
+    );
+    assert!(matches!(state.decide(now), Decision::Wait));
+    assert_eq!(state.planning_errors().len(), 1);
+    assert!(
+        state
+            .planning_errors()
+            .values()
+            .next()
+            .unwrap()
+            .0
+            .contains("DustOutput")
+    );
+}
+
+#[tokio::test]
+async fn a_signed_failed_outcome_attaches_replacement_liability_instead_of_locking_its_coin() {
+    let now = Instant::now();
+    let mut state = fixture(now, 1, true, true);
+    let start = scheduled(&mut state, now);
+    let baseline_cost = state.transactions()[&start.id().0]
+        .candidate()
+        .objective_cost()
+        .unwrap();
+    let io = executor();
+    for action in [
+        Action::Start,
+        Action::Input(0),
+        Action::CloseInputs,
+        Action::Output(0),
+        Action::AllocateChange(0),
+        Action::Output(1),
+        Action::CloseOutputs,
+        Action::Sign(0),
+    ] {
+        run_action(&mut state, &io, &start, action).await;
+    }
+    state.observe(Observation::TransactionInvalidated(
+        start.id().0,
+        "broadcast peer dropped".into(),
+    ));
+    // Add another 10,000-sat intent: the signed coin is NOT locked, so it funds
+    // the new intent, but its objective cost increases by the RBF replacement liability.
+    state.observe(Observation::Intent(payment(60)));
+    let next = scheduled(&mut state, now);
+    let replacement = &state.transactions()[&next.id().0];
+    let coin = replacement.candidate().inputs().next().unwrap();
+    assert!(coin.liability() > Amount::ZERO);
+    assert_eq!(
+        replacement.candidate().objective_cost().unwrap(),
+        baseline_cost + coin.liability().to_signed().unwrap()
+    );
+}

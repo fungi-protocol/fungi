@@ -2,7 +2,10 @@
 
 use super::{Action, Error, Payment, Plan, Update, error, signing, validate};
 use crate::wallet::{Coin, Snapshot};
-use bitcoin::{Amount, OutPoint, Psbt, ScriptBuf, Sequence, TxOut, absolute, psbt, transaction};
+use bitcoin::{
+    Amount, FeeRate, OutPoint, Psbt, ScriptBuf, Sequence, TxOut, Weight, absolute, psbt,
+    transaction,
+};
 use concurrent_psbt::{
     global::{
         PSBT_GLOBAL_SORT_KEY_DERIVATION_SUBTYPE, PSBT_GLOBAL_TX_UNORDERED_SUBTYPE,
@@ -59,7 +62,10 @@ fn priced_prevout<'a>(snapshot: &'a Snapshot, coin: &Utxo) -> Result<&'a Coin, E
         .coins
         .get(&outpoint)
         .ok_or_else(|| error("missing prevout"))?;
-    if Utxo::new(outpoint, prevout.txout.value, prevout.satisfaction_weight) != *coin {
+    if Utxo::new(outpoint, prevout.txout.value, prevout.satisfaction_weight)
+        .with_liability(coin.liability())
+        != *coin
+    {
         return Err(error("prevout differs from pricing snapshot"));
     }
     Ok(prevout)
@@ -100,6 +106,17 @@ impl Execution {
 
     pub(super) fn payment(&self) -> Option<&Payment> {
         self.payment.as_ref()
+    }
+
+    /// Replacement fee liability incurred once this frozen transaction has been signed.
+    pub(super) fn replacement_liability(&self) -> Option<Amount> {
+        let frozen = self.frozen.as_ref()?;
+        let witness_wu = 2 + 66 * frozen.psbt.inputs.len() as u64;
+        let weight = frozen.psbt.unsigned_tx.weight() + Weight::from_wu(witness_wu);
+        let bump = FeeRate::BROADCAST_MIN
+            .fee_wu(weight)
+            .expect("transaction weight fits");
+        frozen.fee.checked_add(bump)
     }
 
     /// Return the IO the action requires. This does not change the construction state.
@@ -173,7 +190,7 @@ impl Execution {
             }
             Action::Output(index) => {
                 let constructor = self.outputs();
-                let (id, output) = self.output(index)?;
+                let (id, output) = self.output(index);
                 self.psbt = constructor
                     .output(Output::new(id, output.value, output.script_pubkey))
                     .map_err(error)?
@@ -200,7 +217,9 @@ impl Execution {
                 let mut outputs = BTreeMap::new();
                 for (index, output) in ordered.outputs.iter().enumerate() {
                     let output = Output::try_from(output.clone()).map_err(error)?;
-                    if let Some(intent) = payment_id(output.unique_id().as_bytes())? {
+                    if let Some(&intent) =
+                        self.plan.payment_outputs.get(output.unique_id().as_bytes())
+                    {
                         outputs.insert(intent, index);
                     }
                 }
@@ -251,7 +270,7 @@ impl Execution {
             .iter()
             .position(|input| input.previous_output == outpoint)
             .expect("freezing verified the selected inputs");
-        signing::apply(&mut frozen.psbt, &self.plan.snapshot, position, signed)
+        signing::apply(&mut frozen.psbt, position, signed)
     }
 
     fn input(&self, index: usize) -> &Utxo {
@@ -281,27 +300,25 @@ impl Execution {
         Outputs::try_from_psbt(psbt).expect("the path adds outputs after closing inputs")
     }
 
-    fn output(&self, index: usize) -> Result<(UniqueId, TxOut), Error> {
+    fn output(&self, index: usize) -> (UniqueId, TxOut) {
         let payments = self.plan.candidate.payments().count();
-        let (tag, id, output) =
-            if let Some((&id, output)) = self.plan.candidate.payments().nth(index) {
-                (0, id, output.clone())
-            } else {
-                let change = index - payments;
-                assert!(
-                    self.completed.contains(&Action::AllocateChange(change)),
-                    "the path adds change after its allocation"
-                );
-                let priced = self
-                    .plan
-                    .candidate
-                    .change()
-                    .nth(change)
-                    .expect("a successful allocation has priced change");
-                (1, change as u64, self.change_output(change, priced))
-            };
-        let bytes = [vec![tag], id.to_be_bytes().to_vec()].concat();
-        Ok((UniqueId::try_from(bytes).map_err(error)?, output))
+        let output = if let Some((_, output)) = self.plan.candidate.payments().nth(index) {
+            output.clone()
+        } else {
+            let change = index - payments;
+            assert!(
+                self.completed.contains(&Action::AllocateChange(change)),
+                "the path adds change after its allocation"
+            );
+            let priced = self
+                .plan
+                .candidate
+                .change()
+                .nth(change)
+                .expect("a successful allocation has priced change");
+            self.change_output(change, priced)
+        };
+        (self.plan.output_ids[index].clone(), output)
     }
 
     fn change_output(&self, index: usize, priced: &OutputWithoutScriptpubkey) -> TxOut {
@@ -336,36 +353,22 @@ impl Execution {
             .collect();
         validate::transaction(psbt, expected_outputs, expected_inputs)?;
         validate::accounting(
-            self.plan.candidate.inputs().map(|coin| coin.value()),
+            psbt.inputs.iter().map(|input| {
+                input
+                    .witness_utxo
+                    .as_ref()
+                    .expect("validated input has witness utxo")
+                    .value
+            }),
             psbt.unsigned_tx.output.iter().map(|output| output.value),
+            self.plan.candidate.inputs().map(|coin| coin.value()),
+            self.plan.candidate.change().map(|change| change.value),
             self.plan
                 .candidate
                 .payments()
                 .map(|(_, output)| output.value),
             self.plan.candidate.objective_cost(),
         )
-    }
-}
-
-fn payment_id(bytes: &[u8]) -> Result<Option<u64>, Error> {
-    let Ok([tag, id @ ..]) = <[u8; 9]>::try_from(bytes) else {
-        return Err(error("unexpected contribution identity"));
-    };
-    Ok((tag == 0).then(|| u64::from_be_bytes(id)))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::payment_id;
-
-    #[test]
-    fn output_identity_distinguishes_intent_and_change() {
-        assert_eq!(payment_id(&[0, 0, 0, 0, 0, 0, 0, 1, 2]).unwrap(), Some(258));
-        assert_eq!(payment_id(&[1, 0, 0, 0, 0, 0, 0, 1, 2]).unwrap(), None);
-        assert_eq!(
-            payment_id(&[0; 8]).unwrap_err().0,
-            "unexpected contribution identity"
-        );
     }
 }
 
@@ -411,23 +414,30 @@ mod prevout_tests {
         );
         let feerate = FeeRate::ZERO;
         let change = dummy::Change::new(txout.script_pubkey, weight, []);
+        let mut rng = StdRng::seed_from_u64(0);
         let candidate = WalletStateSnapshot::new(snapshot.clone(), InMemoryQueue::new([intent]))
-            .funded_candidate(feerate, &mut StdRng::seed_from_u64(0), &change)
+            .funded_candidate(feerate, &mut rng, &change)
             .unwrap()
             .unwrap();
-        let mut execution = Execution::new(Arc::new(Plan {
-            execution_id: ExecutionId {
+        let mut execution = Execution::new(Arc::new(Plan::new(
+            ExecutionId {
                 wallet: [1; 16],
                 sequence: 0,
             },
             candidate,
             snapshot,
             feerate,
-            session_id: [1; 16],
-        }));
+            [1; 16],
+            &mut rng,
+        )));
         for action in [Action::Input(0), Action::CloseInputs, Action::Output(0)] {
             execution.complete(&action, Update::Applied).unwrap();
         }
+        // Output contribution identity is an opaque 16-byte random token, stable across reads.
+        assert_eq!(execution.output(0).0.as_bytes().len(), 16);
+        assert_eq!(execution.output(0).0, execution.plan.output_ids[0]);
+        assert_eq!(execution.replacement_liability(), None);
+
         execution.psbt.inputs[0]
             .witness_utxo
             .as_mut()
@@ -445,7 +455,7 @@ mod prevout_tests {
         let outpoint = OutPoint::null();
         let value = Amount::from_sat(50_000);
         let weight = Weight::from_wu(70);
-        let coin = Utxo::new(outpoint, value, weight);
+        let coin = Utxo::new(outpoint, value, weight).with_liability(Amount::from_sat(500));
         let prevout = Coin {
             txout: TxOut {
                 value,

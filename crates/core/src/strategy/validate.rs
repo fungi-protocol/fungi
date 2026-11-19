@@ -30,6 +30,13 @@ pub(super) fn transaction(
     {
         return Err(error("unexpected transaction fields"));
     }
+    if tx
+        .output
+        .iter()
+        .any(|output| output.value < output.script_pubkey.minimal_non_dust())
+    {
+        return Err(error("transaction output is below dust"));
+    }
     let mut actual_outputs = tx.output.clone();
     expected_outputs.sort();
     actual_outputs.sort();
@@ -49,22 +56,36 @@ pub(super) fn transaction(
     Ok(())
 }
 
+/// Check global input/output balance and verify that the local wallet's net outflow
+/// matches its planned objective cost without subsidizing peer outputs.
 pub(super) fn accounting(
-    inputs: impl Iterator<Item = Amount>,
-    outputs: impl Iterator<Item = Amount>,
-    payments: impl Iterator<Item = Amount>,
+    all_inputs: impl Iterator<Item = Amount>,
+    all_outputs: impl Iterator<Item = Amount>,
+    local_inputs: impl Iterator<Item = Amount>,
+    local_change: impl Iterator<Item = Amount>,
+    local_payments: impl Iterator<Item = Amount>,
     objective_cost: Option<SignedAmount>,
 ) -> Result<Amount, Error> {
-    let spent = sum(inputs, "input")?;
-    let total_outputs = sum(outputs, "output")?;
-    let fee = spent
+    let total_spent = sum(all_inputs, "input")?;
+    let total_outputs = sum(all_outputs, "output")?;
+    let fee = total_spent
         .checked_sub(total_outputs)
         .ok_or_else(|| error("transaction is unfunded"))?;
-    let total_payments = sum(payments, "payment")?;
-    let cost = total_payments
-        .checked_add(fee)
-        .and_then(|value| value.to_signed().ok())
-        .ok_or_else(|| error("objective cost overflow"))?;
+    let local_spent = sum(local_inputs, "local input")?;
+    let local_change_sum = sum(local_change, "change")?;
+    let local_payments_sum = sum(local_payments, "payment")?;
+    let local_outflow = local_spent
+        .checked_sub(local_change_sum)
+        .ok_or_else(|| error("local change exceeds local inputs"))?;
+    let local_fee = local_outflow
+        .checked_sub(local_payments_sum)
+        .ok_or_else(|| error("local inputs do not cover local outputs"))?;
+    if fee < local_fee {
+        return Err(error("peer outputs consume local fee"));
+    }
+    let cost = local_outflow
+        .to_signed()
+        .map_err(|_| error("objective cost overflow"))?;
     if Some(cost) != objective_cost {
         return Err(error("objective cost differs from final accounting"));
     }
@@ -145,6 +166,13 @@ mod tests {
         };
         validate(&psbt).unwrap();
 
+        psbt.unsigned_tx.output[0].value = Amount::ONE_SAT;
+        assert_eq!(
+            validate(&psbt).unwrap_err().0,
+            "transaction output is below dust"
+        );
+        psbt.unsigned_tx.output[0] = expected[0].clone();
+
         psbt.unsigned_tx.version = Version::ONE;
         assert_eq!(
             validate(&psbt).unwrap_err().0,
@@ -182,37 +210,80 @@ mod tests {
     }
 
     #[test]
-    fn objective_cost_is_payments_plus_fee() {
-        let accounting = |inputs: &[u64], outputs: &[u64], payments: &[u64], objective| {
-            accounting(
-                inputs.iter().copied().map(Amount::from_sat),
-                outputs.iter().copied().map(Amount::from_sat),
-                payments.iter().copied().map(Amount::from_sat),
-                Some(SignedAmount::from_sat(objective)),
-            )
-        };
+    fn objective_cost_and_multiparty_balance_are_checked_independently() {
+        let unilateral =
+            |inputs: &[u64], outputs: &[u64], change: &[u64], payments: &[u64], objective| {
+                accounting(
+                    inputs.iter().copied().map(Amount::from_sat),
+                    outputs.iter().copied().map(Amount::from_sat),
+                    inputs.iter().copied().map(Amount::from_sat),
+                    change.iter().copied().map(Amount::from_sat),
+                    payments.iter().copied().map(Amount::from_sat),
+                    Some(SignedAmount::from_sat(objective)),
+                )
+            };
         assert_eq!(
-            accounting(&[20_000], &[12_000, 7_900], &[12_000], 12_100),
+            unilateral(&[20_000], &[12_000, 7_900], &[7_900], &[12_000], 12_100),
             Ok(Amount::from_sat(100))
         );
         assert_eq!(
-            accounting(&[20_000], &[12_000, 7_900], &[12_000], 12_000)
+            unilateral(&[20_000], &[12_000, 7_900], &[7_900], &[12_000], 12_000)
                 .unwrap_err()
                 .0,
             "objective cost differs from final accounting"
         );
         assert_eq!(
-            accounting(&[19_000], &[20_000], &[20_000], 20_000)
+            unilateral(&[19_000], &[20_000], &[], &[20_000], 20_000)
                 .unwrap_err()
                 .0,
             "transaction is unfunded"
         );
         assert_eq!(
-            accounting(&[u64::MAX, 1], &[], &[], 0).unwrap_err().0,
+            unilateral(&[20_000], &[10_000], &[21_000], &[], 0)
+                .unwrap_err()
+                .0,
+            "local change exceeds local inputs"
+        );
+        assert_eq!(
+            unilateral(&[20_000], &[10_000], &[15_000], &[6_000], 5_000)
+                .unwrap_err()
+                .0,
+            "local inputs do not cover local outputs"
+        );
+        // Peer contributes 15,000 in and 14,920 out (80 sat peer fee): accepted.
+        assert_eq!(
+            accounting(
+                [20_000, 15_000].into_iter().map(Amount::from_sat),
+                [12_000, 7_900, 14_920].into_iter().map(Amount::from_sat),
+                [20_000].into_iter().map(Amount::from_sat),
+                [7_900].into_iter().map(Amount::from_sat),
+                [12_000].into_iter().map(Amount::from_sat),
+                Some(SignedAmount::from_sat(12_100)),
+            ),
+            Ok(Amount::from_sat(180))
+        );
+        // Peer contributes 15,000 in and 15,050 out (consumes 50 sats of local fee): rejected.
+        assert_eq!(
+            accounting(
+                [20_000, 15_000].into_iter().map(Amount::from_sat),
+                [12_000, 7_900, 15_050].into_iter().map(Amount::from_sat),
+                [20_000].into_iter().map(Amount::from_sat),
+                [7_900].into_iter().map(Amount::from_sat),
+                [12_000].into_iter().map(Amount::from_sat),
+                Some(SignedAmount::from_sat(12_100)),
+            )
+            .unwrap_err()
+            .0,
+            "peer outputs consume local fee"
+        );
+        assert_eq!(
+            unilateral(&[u64::MAX, 1], &[], &[], &[], 0).unwrap_err().0,
             "input value overflow"
         );
         assert_eq!(
-            super::accounting(
+            accounting(
+                [Amount::from_sat(u64::MAX)].into_iter(),
+                std::iter::empty(),
                 [Amount::from_sat(u64::MAX)].into_iter(),
                 std::iter::empty(),
                 std::iter::empty(),

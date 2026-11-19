@@ -4,6 +4,7 @@ use super::{
     Action, Error, Observation, Operation, Payment, Plan, Request, Status, Update,
     construction::Execution, error, path::Path,
 };
+use bitcoin::Amount;
 use cost_function::candidate::Candidate;
 use std::{
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
@@ -51,6 +52,18 @@ impl Transaction {
         self.completed.contains(&Action::Start)
             || self.pending.contains_key(&Action::Start)
             || self.operation_errors.contains_key(&Action::Start)
+    }
+
+    /// Replacement fee liability incurred if any signature has been dispatched or completed.
+    pub(super) fn replacement_liability(&self) -> Option<Amount> {
+        let signed = self
+            .completed
+            .iter()
+            .chain(self.pending.keys())
+            .any(|action| matches!(action, Action::Sign(_) | Action::Record | Action::Publish));
+        signed
+            .then(|| self.execution.replacement_liability())
+            .flatten()
     }
 
     /// Errors returned by dispatched operations, including late completions.

@@ -9,15 +9,16 @@ use crate::{
     wallet::Snapshot,
 };
 use bitcoin::{
-    Amount, FeeRate, Txid,
+    Amount, FeeRate, OutPoint, Txid,
     hashes::{Hash, sha256},
 };
+use concurrent_psbt::output::UniqueId;
 use cost_function::{
     candidate::Candidate,
     change::ChangeCosts,
     intent::{Intent, ScheduleGrid},
     queue::{InMemoryQueue, Queue},
-    wallet::WalletStateSnapshot,
+    wallet::{FundingError, Utxo, UtxoSnapshot, WalletStateSnapshot},
 };
 use rand::RngCore;
 use std::{
@@ -44,6 +45,66 @@ struct Plan {
     feerate: FeeRate,
     /// Shared construction-session UUID. The local tactic derives it from the execution identity.
     session_id: [u8; 16],
+    /// Opaque contribution identities for local payment and change outputs, stable across retries.
+    output_ids: Vec<UniqueId>,
+    /// Wallet-private mapping from payment output contribution identity bytes to queue intent ID.
+    payment_outputs: BTreeMap<Vec<u8>, u64>,
+}
+
+impl Plan {
+    fn new<R: RngCore>(
+        execution_id: ExecutionId,
+        candidate: Candidate<u64>,
+        snapshot: Snapshot,
+        feerate: FeeRate,
+        session_id: [u8; 16],
+        rng: &mut R,
+    ) -> Self {
+        let mut output_ids = Vec::new();
+        let mut payment_outputs = BTreeMap::new();
+        for (&intent_id, _) in candidate.payments() {
+            let id = random_output_id(rng, &output_ids);
+            payment_outputs.insert(id.as_bytes().to_vec(), intent_id);
+            output_ids.push(id);
+        }
+        for _ in candidate.change() {
+            let id = random_output_id(rng, &output_ids);
+            output_ids.push(id);
+        }
+        Self {
+            execution_id,
+            candidate,
+            snapshot,
+            feerate,
+            session_id,
+            output_ids,
+            payment_outputs,
+        }
+    }
+}
+
+fn random_output_id<R: RngCore>(rng: &mut R, existing: &[UniqueId]) -> UniqueId {
+    loop {
+        let mut bytes = [0u8; 16];
+        rng.fill_bytes(&mut bytes);
+        let id = UniqueId::try_from(bytes.to_vec()).expect("16-byte output identity is non-empty");
+        if !existing.contains(&id) {
+            return id;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::{SeedableRng, rngs::StdRng};
+
+    #[test]
+    fn output_identities_retry_on_collision() {
+        let first = random_output_id(&mut StdRng::seed_from_u64(0), &[]);
+        let second = random_output_id(&mut StdRng::seed_from_u64(0), std::slice::from_ref(&first));
+        assert_ne!(second.as_bytes(), first.as_bytes());
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -157,6 +218,7 @@ pub struct State<C, R> {
     grid: ScheduleGrid,
     /// Each batch holds intents outside started outcomes. Batches are disjoint.
     batches: Vec<BTreeSet<u64>>,
+    explicit_batches: bool,
     /// Each outcome holds the transactions funded by one evaluation.
     outcomes: Vec<BTreeSet<ExecutionId>>,
     /// This is set when information relevant to funding the unstarted batches arrives.
@@ -165,6 +227,7 @@ pub struct State<C, R> {
     next_sequence: u64,
     transactions: BTreeMap<ExecutionId, Transaction>,
     planning_errors: BTreeMap<ExecutionId, Error>,
+    warnings: Vec<String>,
 }
 
 impl<C: ChangeCosts, R: RngCore> State<C, R> {
@@ -188,12 +251,14 @@ impl<C: ChangeCosts, R: RngCore> State<C, R> {
             rng,
             grid,
             batches,
+            explicit_batches: false,
             outcomes: Vec::new(),
             stale: true,
             evaluated: false,
             next_sequence: 0,
             transactions: BTreeMap::new(),
             planning_errors: BTreeMap::new(),
+            warnings: Vec::new(),
         }
     }
 
@@ -224,6 +289,7 @@ impl<C: ChangeCosts, R: RngCore> State<C, R> {
             allocation.push(ids);
         }
         self.batches = allocation;
+        self.explicit_batches = true;
         Ok(self)
     }
 
@@ -239,6 +305,9 @@ impl<C: ChangeCosts, R: RngCore> State<C, R> {
     pub fn planning_errors(&self) -> &BTreeMap<ExecutionId, Error> {
         &self.planning_errors
     }
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
 
     /// Fund each batch again, replacing the outcomes that have not started.
     fn evaluate(&mut self) {
@@ -251,9 +320,12 @@ impl<C: ChangeCosts, R: RngCore> State<C, R> {
         let started: BTreeSet<_> = self.outcomes.iter().flatten().copied().collect();
         self.transactions.retain(|id, _| started.contains(id));
         self.planning_errors.clear();
-        // Started outcomes keep their intents. Only those without a failure keep
-        // their coins, so a failed attempt reserves no input.
+        self.warnings.clear();
+        // Started outcomes keep their intents. Active outcomes reserve their inputs;
+        // failed outcomes that already signed attach an RBF replacement liability to
+        // their coins instead of locking them or releasing them for free.
         let mut available = self.snapshot.clone();
+        let mut liabilities = BTreeMap::<OutPoint, Amount>::new();
         let mut bound = BTreeSet::new();
         for outcome in &self.outcomes {
             let outcome: Vec<_> = outcome.iter().map(|id| &self.transactions[id]).collect();
@@ -265,6 +337,11 @@ impl<C: ChangeCosts, R: RngCore> State<C, R> {
                 if !failed {
                     for coin in tx.candidate().inputs() {
                         available.coins.remove(&coin.outpoint());
+                    }
+                } else if let Some(liability) = tx.replacement_liability() {
+                    for coin in tx.candidate().inputs() {
+                        let entry = liabilities.entry(coin.outpoint()).or_insert(Amount::ZERO);
+                        *entry = (*entry).max(liability);
                     }
                 }
             }
@@ -283,14 +360,42 @@ impl<C: ChangeCosts, R: RngCore> State<C, R> {
             };
             // Identities are not reused, even for a candidate that never started.
             self.next_sequence += 1;
-            let queue = Batch {
-                queue: &self.pending,
-                ids,
+            let priced = PricedSnapshot {
+                snapshot: &available,
+                liabilities: &liabilities,
             };
-            let observed = WalletStateSnapshot::new(available.clone(), queue);
-            match observed.funded_candidate(self.feerate, &mut self.rng, &self.change) {
+            let observed = WalletStateSnapshot::new(
+                priced,
+                Batch {
+                    queue: &self.pending,
+                    ids,
+                },
+            );
+            let funded = match observed.funded_candidate(self.feerate, &mut self.rng, &self.change)
+            {
+                Ok(candidate) => Ok(candidate.expect("a batch is not empty")),
+                Err(FundingError::NoCombinationCovers) => {
+                    self.warnings
+                        .push("payment queue exceeds available funding".into());
+                    if !self.explicit_batches && ids.len() > 1 {
+                        prioritize_subset(
+                            &available,
+                            &liabilities,
+                            &self.pending,
+                            ids,
+                            self.feerate,
+                            &mut self.rng,
+                            &self.change,
+                        )
+                        .ok_or(FundingError::NoCombinationCovers)
+                    } else {
+                        Err(FundingError::NoCombinationCovers)
+                    }
+                }
+                Err(err) => Err(err),
+            };
+            match funded {
                 Ok(candidate) => {
-                    let candidate = candidate.expect("a batch is not empty");
                     for coin in candidate.inputs() {
                         available.coins.remove(&coin.outpoint());
                     }
@@ -303,13 +408,14 @@ impl<C: ChangeCosts, R: RngCore> State<C, R> {
                     session_id.copy_from_slice(&sha256::Hash::hash(&seed).to_byte_array()[..16]);
                     transactions.insert(
                         execution_id,
-                        Transaction::new(Arc::new(Plan {
+                        Transaction::new(Arc::new(Plan::new(
                             execution_id,
                             candidate,
-                            snapshot: self.snapshot.clone(),
-                            feerate: self.feerate,
+                            self.snapshot.clone(),
+                            self.feerate,
                             session_id,
-                        })),
+                            &mut self.rng,
+                        ))),
                     );
                 }
                 Err(err) => {
@@ -324,6 +430,58 @@ impl<C: ChangeCosts, R: RngCore> State<C, R> {
             self.transactions.extend(transactions);
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct PricedSnapshot<'a> {
+    snapshot: &'a Snapshot,
+    liabilities: &'a BTreeMap<OutPoint, Amount>,
+}
+
+impl UtxoSnapshot for PricedSnapshot<'_> {
+    fn iter(&self) -> impl Iterator<Item = Utxo> {
+        self.snapshot.coins.iter().map(|(&outpoint, coin)| {
+            let liability = self
+                .liabilities
+                .get(&outpoint)
+                .copied()
+                .unwrap_or(Amount::ZERO);
+            Utxo::new(outpoint, coin.txout.value, coin.satisfaction_weight)
+                .with_liability(liability)
+        })
+    }
+}
+
+fn prioritize_subset<C: ChangeCosts, R: RngCore>(
+    available: &Snapshot,
+    liabilities: &BTreeMap<OutPoint, Amount>,
+    pending: &InMemoryQueue,
+    ids: &BTreeSet<u64>,
+    feerate: FeeRate,
+    rng: &mut R,
+    change: &C,
+) -> Option<Candidate<u64>> {
+    let mut chosen = BTreeSet::new();
+    let mut funded = None;
+    for &id in ids {
+        let mut next = chosen.clone();
+        next.insert(id);
+        let trial = WalletStateSnapshot::new(
+            PricedSnapshot {
+                snapshot: available,
+                liabilities,
+            },
+            Batch {
+                queue: pending,
+                ids: &next,
+            },
+        );
+        if let Ok(Some(candidate)) = trial.funded_candidate(feerate, rng, change) {
+            chosen = next;
+            funded = Some(candidate);
+        }
+    }
+    funded
 }
 
 struct Batch<'a> {
@@ -412,6 +570,7 @@ impl<C: ChangeCosts, R: RngCore> Machine for State<C, R> {
                 self.pending.push(intent);
                 // Evaluation removes the intents of started outcomes.
                 self.batches = vec![self.pending.iter().map(|(id, _)| id).collect()];
+                self.explicit_batches = false;
                 self.stale = true;
                 return;
             }
