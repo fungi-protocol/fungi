@@ -14,7 +14,7 @@ use crate::intent::Intent;
 use crate::queue::Queue;
 pub use crate::selection::random::RandomSelectionError as FundingError;
 use crate::selection::random::RandomSelector;
-use crate::selection::{CoinSelector, FundingRequest};
+use crate::selection::{CoinSelector, FundingRequest, cover_count_growth};
 
 /// A coin the wallet can spend.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,6 +67,10 @@ impl<Q: Queue, U: UtxoSnapshot> WalletStateSnapshot<Q, U> {
 
     /// Fund the queue once using random coin selection and one change output.
     /// This is the single-outcome entry point, not a search for an optimal plan.
+    ///
+    /// # Panics
+    ///
+    /// If raising `feerate` to cover count growth overflows.
     pub fn funded_candidate<C: ChangeCosts, R: RngCore>(
         &self,
         feerate: FeeRate,
@@ -98,6 +102,10 @@ impl<Q: Queue, U: UtxoSnapshot> WalletStateSnapshot<Q, U> {
         A: ChangeCosts,
         R: RngCore,
     {
+        // The selector and change strategy share one feerate, so change outputs that grow the
+        // output count are covered too.
+        let feerate = cover_count_growth(feerate).expect("feerate overflows");
+
         // MVP: the decision space yields only the trivial partition: with one batch with all intents
         let Some(plan_intent) = DecisionSpace::new(&self.queue).iter().next() else {
             return Ok(None);
@@ -242,8 +250,9 @@ mod tests {
 
     #[test]
     fn the_best_plan_spends_the_coin_pays_every_intent_and_returns_change() {
-        // At 1 sat/vB the coin's input costs 40 sats, each payment 10 sats, the transaction
-        // overhead 11 sats and the change output 10 sats: 10,000 - 40 - 2,000 - 20 - 11 - 10.
+        // At 1 sat/vB, raised to 251 sat/kwu by `cover_count_growth`, the coin's input costs
+        // 41 sats, each payment 11 sats, the transaction overhead 11 sats and the change output
+        // 11 sats: 10,000 - 41 - 2,000 - 22 - 11 - 11.
         // The two payments are identical, and both are registered.
         assert_eq!(
             best_plan([utxo(0, 10_000)], &[1_000, 1_000]),
@@ -252,7 +261,7 @@ mod tests {
                 Action::RegisterOutput(op_true_output(1_000)),
                 Action::RegisterOutput(op_true_output(1_000)),
                 Action::RegisterChangeOutPut(OutputWithoutScriptpubkey {
-                    value: Amount::from_sat(7_919),
+                    value: Amount::from_sat(7_915),
                     weight: Weight::from_wu(40),
                     satisfaction_weight: Weight::ZERO,
                     dust: Amount::from_sat(474),

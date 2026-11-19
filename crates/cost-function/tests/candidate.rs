@@ -92,10 +92,10 @@ fn a_funded_candidate_retains_equal_payment_intents_and_exposes_cost() {
             .collect::<Vec<_>>(),
         [(outpoint, input_value)],
     );
-    assert_eq!(candidate.objective_cost().unwrap().to_sat(), 2_081);
+    assert_eq!(candidate.objective_cost().unwrap().to_sat(), 2_085);
     assert_eq!(
         candidate.change().next().unwrap().value,
-        Amount::from_sat(7_919)
+        Amount::from_sat(7_915)
     );
     let at = candidate.ready_at(start, grid).unwrap();
     assert!(at > start);
@@ -120,11 +120,11 @@ fn a_candidate_with_opposing_payoffs_wakes_at_the_first_negative_tick() {
     let twelve_hours = 12 * 60 * 60 * 10_000;
     let midpoint = grid.at_slot(twelve_hours / 2).unwrap();
     let value = 1_048_582;
-    // Two outputs and one input cost 71 sats at the fixture's fee rate.
+    // Two outputs and one input cost 74 sats at the fixture's fee rate.
     let queue = InMemoryQueue::new([
         payment(500_000, curve(0, [(0, 5), (twelve_hours, 1)])),
         payment(
-            value - 500_000 - 71,
+            value - 500_000 - 74,
             curve(0, [(0, 1_048_576), (twelve_hours, 1_048_582)]),
         ),
     ]);
@@ -152,10 +152,10 @@ fn reordering_and_splitting_the_same_payoff_preserves_the_decision() {
         )
     };
 
-    // Four payments and their fees cost 4101 sats. At the first coarse slot
+    // Four payments and their fees cost 4107 sats. At the first coarse slot
     // the step contributes 1 sat and the ramps add 1/2 + 1/3 + 1/6 sats.
-    let half = curve(0, [(0, 4_099), (4, 4_101)]);
-    let split_half = curve(0, [(0, 4_099), (2, 4_100), (2, 4_101)]);
+    let half = curve(0, [(0, 4_105), (4, 4_107)]);
+    let split_half = curve(0, [(0, 4_105), (2, 4_106), (2, 4_107)]);
     let third = curve(0, [(3, 1)]);
     let sixth = curve(0, [(6, 1)]);
     let step = curve(1, [(0, 1)]);
@@ -166,7 +166,7 @@ fn reordering_and_splitting_the_same_payoff_preserves_the_decision() {
     let tie = grid.at_slot(1).unwrap();
     let first = tie + ScheduleGrid::JIFFY;
     for candidate in [&original, &reordered, &split] {
-        assert_eq!(candidate.objective_cost().unwrap().to_sat(), 4_101);
+        assert_eq!(candidate.objective_cost().unwrap().to_sat(), 4_107);
         assert_eq!(candidate.ready_at(start, grid), Some(first));
         assert_eq!(candidate.ready_at(tie, grid), Some(first));
         assert_eq!(candidate.ready_at(first, grid), Some(first));

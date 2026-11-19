@@ -13,6 +13,7 @@
     packages = {
       cost-function = { };
       fungi-transport = { };
+      fungi-transport-testkit = { };
       fungi-transport-tor-socks = { };
     };
   };
