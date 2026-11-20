@@ -1,6 +1,6 @@
 //! Change strategy.
 
-use bitcoin::{Amount, FeeRate, ScriptBuf, TxOut, Weight};
+use bitcoin::{Amount, FeeRate, Weight};
 pub mod single_output;
 
 use crate::blockspace::KnowsWeight;
@@ -17,12 +17,11 @@ pub(crate) trait ChangeSelector {
     fn select(&self, request: &InputSelection) -> Result<ChangeSelection, Self::Error>;
 }
 
-/// The wallet's source of change scriptpubkeys.
+/// The characteristics used to price change before deriving its script.
 ///
 /// Reports what a change output will cost before any scriptpubkey is assigned, so change can
 /// be priced without deriving an address for a transaction that may never be broadcast.
-pub(crate) trait ScriptpubkeyAssigner {
-    type Error;
+pub trait ChangeCosts {
     /// Weight a change output adds to a transaction.
     fn output_weight(&self) -> Weight;
 
@@ -31,37 +30,30 @@ pub(crate) trait ScriptpubkeyAssigner {
 
     /// Smallest value relay policy accepts for a change output.
     fn dust(&self) -> Amount;
+}
 
-    /// Assign a scriptpubkey to each change output.
-    fn assign_scriptpubkey(
-        &self,
-        outputs: &[OutputWithoutScriptpubkey],
-    ) -> Result<Vec<ScriptBuf>, Self::Error>;
-
-    fn to_txouts(&self, outputs: &[OutputWithoutScriptpubkey]) -> Result<Vec<TxOut>, Self::Error> {
-        let scriptpubkeys = self.assign_scriptpubkey(outputs)?;
-        assert_eq!(outputs.len(), scriptpubkeys.len());
-        Ok(scriptpubkeys
-            .into_iter()
-            .zip(outputs)
-            .map(|(scriptpubkey, output)| TxOut {
-                value: output.value,
-                script_pubkey: scriptpubkey,
-            })
-            .collect())
+impl<T: ChangeCosts + ?Sized> ChangeCosts for &T {
+    fn output_weight(&self) -> Weight {
+        (**self).output_weight()
+    }
+    fn satisfaction_weight(&self) -> Weight {
+        (**self).satisfaction_weight()
+    }
+    fn dust(&self) -> Amount {
+        (**self).dust()
     }
 }
 
 /// A change output, with everything but its scriptpubkey.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct OutputWithoutScriptpubkey {
-    pub(crate) value: Amount,
+pub struct OutputWithoutScriptpubkey {
+    pub value: Amount,
     /// Weight the output adds to the transaction.
-    pub(crate) weight: Weight,
+    pub weight: Weight,
     /// Weight of the scriptSig and witness that will spend it.
-    pub(crate) satisfaction_weight: Weight,
+    pub satisfaction_weight: Weight,
     /// Smallest value relay policy accepts for it.
-    pub(crate) dust: Amount,
+    pub dust: Amount,
 }
 
 impl KnowsWeight for OutputWithoutScriptpubkey {
@@ -71,18 +63,18 @@ impl KnowsWeight for OutputWithoutScriptpubkey {
 }
 
 /// Turns an [`InputSelection`]'s surplus into change outputs, priced by a
-/// [`ScriptpubkeyAssigner`] without assigning scriptpubkeys.
+/// [`ChangeCosts`] without assigning scriptpubkeys.
 ///
 /// Each change output pays the fee for its own blockspace out of its value. A change output
 /// left below its dust value is dropped, so its value goes to the fee.
 pub(crate) struct ChangeStrategy<S, A> {
     selector: S,
-    assigner: A,
+    costs: A,
 }
 
-impl<S: ChangeSelector, A: ScriptpubkeyAssigner> ChangeStrategy<S, A> {
-    pub(crate) fn new(selector: S, assigner: A) -> Self {
-        Self { selector, assigner }
+impl<S: ChangeSelector, A: ChangeCosts> ChangeStrategy<S, A> {
+    pub(crate) fn new(selector: S, costs: A) -> Self {
+        Self { selector, costs }
     }
 
     pub(crate) fn change(
@@ -97,9 +89,9 @@ impl<S: ChangeSelector, A: ScriptpubkeyAssigner> ChangeStrategy<S, A> {
             .filter_map(|value| {
                 let mut output = OutputWithoutScriptpubkey {
                     value,
-                    weight: self.assigner.output_weight(),
-                    satisfaction_weight: self.assigner.satisfaction_weight(),
-                    dust: self.assigner.dust(),
+                    weight: self.costs.output_weight(),
+                    satisfaction_weight: self.costs.satisfaction_weight(),
+                    dust: self.costs.dust(),
                 };
                 output.value = output
                     .fee(feerate)
@@ -108,14 +100,6 @@ impl<S: ChangeSelector, A: ScriptpubkeyAssigner> ChangeStrategy<S, A> {
                 Some(output)
             })
             .collect())
-    }
-
-    /// Gives `outputs` their scriptpubkeys, once the transaction is going ahead.
-    pub(crate) fn assign(
-        &self,
-        outputs: &[OutputWithoutScriptpubkey],
-    ) -> Result<Vec<TxOut>, A::Error> {
-        self.assigner.to_txouts(outputs)
     }
 }
 
@@ -131,11 +115,9 @@ pub(crate) mod tests {
 
     /// Prices change as if paid to [`op_true`]: 40 WU, so 10 sats to create at 1 sat/vB, a
     /// dust value of 474 sats, and nothing to satisfy.
-    pub(crate) struct DummySPKAssigner;
+    pub(crate) struct DummyChangeCosts;
 
-    impl ScriptpubkeyAssigner for DummySPKAssigner {
-        type Error = Infallible;
-
+    impl ChangeCosts for DummyChangeCosts {
         fn output_weight(&self) -> Weight {
             let output = TxOut {
                 value: Amount::ZERO,
@@ -151,16 +133,9 @@ pub(crate) mod tests {
         fn dust(&self) -> Amount {
             op_true().minimal_non_dust()
         }
-
-        fn assign_scriptpubkey(
-            &self,
-            outputs: &[OutputWithoutScriptpubkey],
-        ) -> Result<Vec<ScriptBuf>, Infallible> {
-            Ok(vec![op_true(); outputs.len()])
-        }
     }
 
-    /// A change output priced by [`DummySPKAssigner`], worth `sats`.
+    /// A change output priced by [`DummyChangeCosts`], worth `sats`.
     fn output(sats: u64) -> OutputWithoutScriptpubkey {
         OutputWithoutScriptpubkey {
             value: Amount::from_sat(sats),
@@ -172,7 +147,7 @@ pub(crate) mod tests {
 
     fn change(surplus: u64) -> Result<Vec<OutputWithoutScriptpubkey>, Infallible> {
         let strategy =
-            ChangeStrategy::new(single_output::SingleOutputChangeSelector, DummySPKAssigner);
+            ChangeStrategy::new(single_output::SingleOutputChangeSelector, DummyChangeCosts);
         let request = InputSelection {
             selected_inputs: vec![],
             surplus: Amount::from_sat(surplus),

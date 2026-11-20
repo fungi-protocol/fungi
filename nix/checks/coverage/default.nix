@@ -31,6 +31,9 @@
                   buildPhaseCargoCommand = "bash ${./collect.sh} $out ${pkgs.lib.escapeShellArg cargoWorkspace.cargoManifestPath}";
                   installPhase = "true";
                 }
+                // pkgs.lib.optionalAttrs (cargoWorkspace.manifestPath == "Cargo.toml") {
+                  BITCOIND = pkgs.lib.getExe' pkgs.bitcoind "bitcoind";
+                }
               );
             in
             pkgs.runCommand "${workspaceName}-coverage" { nativeBuildInputs = [ pkgs.lcov ]; } ''
