@@ -34,6 +34,10 @@ impl Transaction {
     pub fn candidate(&self) -> &Candidate<u64> {
         &self.plan.candidate
     }
+    /// The construction-session UUID retained for this execution's retries.
+    pub fn construction_session_id(&self) -> [u8; 16] {
+        self.plan.session_id
+    }
     pub fn status(&self) -> &Status {
         &self.status
     }

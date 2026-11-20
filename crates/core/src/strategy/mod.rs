@@ -42,10 +42,7 @@ use crate::{
     driver::{Decision, Machine},
     wallet::Snapshot,
 };
-use bitcoin::{
-    Amount, FeeRate, OutPoint, Txid,
-    hashes::{Hash, sha256},
-};
+use bitcoin::{Amount, FeeRate, OutPoint, Txid};
 use concurrent_psbt::output::UniqueId;
 use cost_function::{
     candidate::Candidate,
@@ -54,7 +51,7 @@ use cost_function::{
     queue::{InMemoryQueue, Queue},
     wallet::WalletStateSnapshot,
 };
-use rand::RngCore;
+use rand::{RngCore, TryRngCore, rngs::OsRng};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -77,8 +74,16 @@ struct Plan {
     candidate: Candidate<u64>,
     snapshot: Snapshot,
     feerate: FeeRate,
-    /// Shared construction-session UUID. The local tactic derives it from the execution identity.
+    /// Fresh OS-random construction-session UUID, retained for execution retries.
     session_id: [u8; 16],
+}
+
+fn fresh_session_id() -> Result<[u8; 16], Error> {
+    let mut id = [0; 16];
+    OsRng
+        .try_fill_bytes(&mut id)
+        .map_err(|err| error(format!("construction session randomness: {err}")))?;
+    Ok(id)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -286,13 +291,13 @@ impl<C: ChangeCosts, R: RngCore> State<C, R> {
                     for coin in candidate.inputs() {
                         available.coins.remove(&coin.outpoint());
                     }
-                    let seed = [
-                        self.wallet_id.as_slice(),
-                        &execution_id.sequence.to_be_bytes(),
-                    ]
-                    .concat();
-                    let mut session_id = [0; 16];
-                    session_id.copy_from_slice(&sha256::Hash::hash(&seed).to_byte_array()[..16]);
+                    let session_id = match fresh_session_id() {
+                        Ok(id) => id,
+                        Err(err) => {
+                            self.planning_errors.insert(execution_id, err);
+                            return;
+                        }
+                    };
                     transactions.insert(
                         execution_id,
                         Transaction::new(Arc::new(Plan {
