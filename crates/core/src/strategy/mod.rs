@@ -54,10 +54,9 @@ struct Plan {
     payment_outputs: BTreeMap<Vec<u8>, u64>,
 }
 
-fn fresh_session_id() -> Result<[u8; 16], Error> {
+fn fresh_session_id_from<R: TryRngCore>(rng: &mut R) -> Result<[u8; 16], Error> {
     let mut id = [0; 16];
-    OsRng
-        .try_fill_bytes(&mut id)
+    rng.try_fill_bytes(&mut id)
         .map_err(|err| error(format!("construction session randomness: {err}")))?;
     Ok(id)
 }
@@ -128,6 +127,9 @@ fn random_output_id<R: RngCore>(rng: &mut R, existing: &[UniqueId]) -> UniqueId 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wallet::{Coin, dummy};
+    use bitcoin::{OutPoint, ScriptBuf, TxOut, Txid, Weight, hashes::Hash};
+    use cost_function::intent::{FixedPaymentInstructions, Outcome, PayoffCurve};
     use rand::{SeedableRng, rngs::StdRng};
 
     #[test]
@@ -135,6 +137,70 @@ mod tests {
         let first = random_output_id(&mut StdRng::seed_from_u64(0), &[]);
         let second = random_output_id(&mut StdRng::seed_from_u64(0), std::slice::from_ref(&first));
         assert_ne!(second.as_bytes(), first.as_bytes());
+    }
+
+    struct FailingRng;
+
+    impl TryRngCore for FailingRng {
+        type Error = &'static str;
+
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+            Err("injected entropy failure")
+        }
+
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+            Err("injected entropy failure")
+        }
+
+        fn try_fill_bytes(&mut self, _: &mut [u8]) -> Result<(), Self::Error> {
+            Err("injected entropy failure")
+        }
+    }
+
+    #[test]
+    fn session_entropy_failure_prevents_transaction_creation() {
+        let mut session_rng = FailingRng;
+        assert_eq!(session_rng.try_next_u32(), Err("injected entropy failure"));
+        assert_eq!(session_rng.try_next_u64(), Err("injected entropy failure"));
+
+        let now = Instant::now();
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        let coin = Coin {
+            txout: TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: script.clone(),
+            },
+            satisfaction_weight: Weight::from_wu(70),
+        };
+        let snapshot = Snapshot {
+            coins: BTreeMap::from([(OutPoint::new(Txid::all_zeros(), 1), coin)]),
+            ..Default::default()
+        };
+        let intent = Intent::new(
+            Outcome::OutputCreation(FixedPaymentInstructions {
+                script_pubkey: script.clone(),
+                amount: Amount::from_sat(10_000),
+            }),
+            PayoffCurve::new(0, [(60_000, Amount::from_sat(100_000))]).unwrap(),
+        );
+        let mut state = State::new_with_rngs(
+            InMemoryQueue::new(Some(intent)),
+            snapshot,
+            FeeRate::from_sat_per_vb(2).unwrap(),
+            [1; 16],
+            dummy::Change::new(script, Weight::from_wu(70), []),
+            (StdRng::seed_from_u64(0), session_rng),
+            ScheduleGrid::new(now),
+        );
+
+        assert!(matches!(state.decide(now), Decision::Wait));
+        assert!(state.transactions().is_empty());
+        assert_eq!(state.pending().iter().count(), 1);
+        assert_eq!(state.planning_errors().len(), 1);
+        assert_eq!(
+            state.planning_errors().values().next().unwrap().0,
+            "construction session randomness: injected entropy failure"
+        );
     }
 }
 
@@ -271,13 +337,14 @@ impl SessionEntry {
 }
 
 /// State holds wallet observations, the outcome for unstarted intents and transaction executions.
-pub struct State<C, R> {
+pub struct State<C, R, S = OsRng> {
     pending: InMemoryQueue,
     snapshot: Snapshot,
     feerate: FeeRate,
     wallet_id: [u8; 16],
     change: C,
     rng: R,
+    session_rng: S,
     grid: ScheduleGrid,
     /// Each batch holds intents outside started outcomes. Batches are disjoint.
     batches: Vec<BTreeSet<u64>>,
@@ -295,7 +362,7 @@ pub struct State<C, R> {
     warnings: Vec<String>,
 }
 
-impl<C: ChangeCosts, R: RngCore> State<C, R> {
+impl<C: ChangeCosts, R: RngCore> State<C, R, OsRng> {
     /// The schedule grid places all authored payoff slots for this wallet.
     pub fn new(
         pending: InMemoryQueue,
@@ -306,6 +373,29 @@ impl<C: ChangeCosts, R: RngCore> State<C, R> {
         rng: R,
         grid: ScheduleGrid,
     ) -> Self {
+        Self::new_with_rngs(
+            pending,
+            snapshot,
+            feerate,
+            wallet_id,
+            change_costs,
+            (rng, OsRng),
+            grid,
+        )
+    }
+}
+
+impl<C: ChangeCosts, R: RngCore, S: TryRngCore> State<C, R, S> {
+    fn new_with_rngs(
+        pending: InMemoryQueue,
+        snapshot: Snapshot,
+        feerate: FeeRate,
+        wallet_id: [u8; 16],
+        change_costs: C,
+        rngs: (R, S),
+        grid: ScheduleGrid,
+    ) -> Self {
+        let (rng, session_rng) = rngs;
         let batches = vec![pending.iter().map(|(id, _)| id).collect()];
         Self {
             pending,
@@ -314,6 +404,7 @@ impl<C: ChangeCosts, R: RngCore> State<C, R> {
             wallet_id,
             change: change_costs,
             rng,
+            session_rng,
             grid,
             batches,
             explicit_batches: false,
@@ -565,7 +656,7 @@ impl<C: ChangeCosts, R: RngCore> State<C, R> {
                     }
                     let session_id = match session_config {
                         Some(config) => config.id,
-                        None => match fresh_session_id() {
+                        None => match fresh_session_id_from(&mut self.session_rng) {
                             Ok(id) => id,
                             Err(err) => {
                                 self.planning_errors.insert(execution_id, err);
@@ -677,7 +768,7 @@ impl Queue for Batch<'_> {
     }
 }
 
-impl<C: ChangeCosts, R: RngCore> Machine for State<C, R> {
+impl<C: ChangeCosts, R: RngCore, S: TryRngCore> Machine for State<C, R, S> {
     type Action = Request;
     type Operation = Operation;
     type OperationId = OperationId;
