@@ -192,6 +192,29 @@ fn the_strategy_derives_a_candidate_without_consuming_the_intent() {
 }
 
 #[test]
+fn construction_sessions_are_fresh_and_stable_for_retries() {
+    let now = Instant::now();
+    let mut first = fixture(now, 1, true, true);
+    let first_request = scheduled(&mut first, now);
+    let first_id = first.transactions()[&first_request.id().0].construction_session_id();
+
+    let retry = scheduled(&mut first, now);
+    assert_eq!(retry.id(), first_request.id());
+    assert_eq!(
+        first.transactions()[&retry.id().0].construction_session_id(),
+        first_id
+    );
+
+    let mut second = fixture(now, 1, true, true);
+    let second_request = scheduled(&mut second, now);
+    assert_eq!(second_request.id(), first_request.id());
+    assert_ne!(
+        second.transactions()[&second_request.id().0].construction_session_id(),
+        first_id
+    );
+}
+
+#[test]
 fn future_payoff_uses_the_wallet_grid() {
     let origin = Instant::now();
     let mut state = fixture_with_start(origin, 1, true, true, 1);

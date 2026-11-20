@@ -8,10 +8,7 @@ use crate::{
     driver::{Decision, Machine},
     wallet::Snapshot,
 };
-use bitcoin::{
-    Amount, FeeRate, OutPoint, Txid,
-    hashes::{Hash, sha256},
-};
+use bitcoin::{Amount, FeeRate, OutPoint, Txid};
 use concurrent_psbt::output::UniqueId;
 use cost_function::{
     candidate::Candidate,
@@ -20,7 +17,7 @@ use cost_function::{
     queue::{InMemoryQueue, Queue},
     wallet::{FundingError, Utxo, UtxoSnapshot, WalletStateSnapshot},
 };
-use rand::RngCore;
+use rand::{RngCore, TryRngCore, rngs::OsRng};
 use std::{
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
     num::NonZeroUsize,
@@ -47,7 +44,7 @@ struct Plan {
     feerate: FeeRate,
     /// Collaborative construction-session configuration, or `None` when unilateral.
     session: Option<session::Config>,
-    /// PSBTv2 `PSBT_GLOBAL_TX_UUID`: shared across session peers, or derived locally when unilateral.
+    /// PSBTv2 `PSBT_GLOBAL_TX_UUID`: shared across session peers, or fresh OS-random when unilateral.
     session_id: [u8; 16],
     /// Opaque contribution identities for local payment and change outputs, stable across retries.
     output_ids: Vec<UniqueId>,
@@ -55,6 +52,14 @@ struct Plan {
     fee_id: UniqueId,
     /// Wallet-private mapping from payment output contribution identity bytes to queue intent ID.
     payment_outputs: BTreeMap<Vec<u8>, u64>,
+}
+
+fn fresh_session_id() -> Result<[u8; 16], Error> {
+    let mut id = [0; 16];
+    OsRng
+        .try_fill_bytes(&mut id)
+        .map_err(|err| error(format!("construction session randomness: {err}")))?;
+    Ok(id)
 }
 
 impl Plan {
@@ -560,16 +565,13 @@ impl<C: ChangeCosts, R: RngCore> State<C, R> {
                     }
                     let session_id = match session_config {
                         Some(config) => config.id,
-                        None => {
-                            let seed = [
-                                self.wallet_id.as_slice(),
-                                &execution_id.sequence.to_be_bytes(),
-                            ]
-                            .concat();
-                            let mut id = [0; 16];
-                            id.copy_from_slice(&sha256::Hash::hash(&seed).to_byte_array()[..16]);
-                            id
-                        }
+                        None => match fresh_session_id() {
+                            Ok(id) => id,
+                            Err(err) => {
+                                self.planning_errors.insert(execution_id, err);
+                                return;
+                            }
+                        },
                     };
                     let mut tx = Transaction::new(Arc::new(Plan::new(
                         execution_id,
