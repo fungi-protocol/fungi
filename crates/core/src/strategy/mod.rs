@@ -51,7 +51,7 @@ use cost_function::{
     queue::{InMemoryQueue, Queue},
     wallet::WalletStateSnapshot,
 };
-use rand::{RngCore, TryRngCore, rngs::OsRng};
+use rand::{CryptoRng, TryCryptoRng};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -74,11 +74,11 @@ struct Plan {
     candidate: Candidate<u64>,
     snapshot: Snapshot,
     feerate: FeeRate,
-    /// Fresh OS-random construction-session UUID, retained for execution retries.
+    /// Fresh construction-session UUID, retained for execution retries.
     session_id: [u8; 16],
 }
 
-fn fresh_session_id_from<R: TryRngCore>(rng: &mut R) -> Result<[u8; 16], Error> {
+fn fresh_session_id_from<R: TryCryptoRng>(rng: &mut R) -> Result<[u8; 16], Error> {
     let mut id = [0; 16];
     rng.try_fill_bytes(&mut id)
         .map_err(|err| error(format!("construction session randomness: {err}")))?;
@@ -188,7 +188,7 @@ mod validate;
 pub use transaction::Transaction;
 
 /// Wallet observations, one initial outcome, and its transaction executions.
-pub struct State<C, R, S = OsRng> {
+pub struct State<C, R, S> {
     pending: InMemoryQueue,
     snapshot: Snapshot,
     feerate: FeeRate,
@@ -203,31 +203,11 @@ pub struct State<C, R, S = OsRng> {
     planning_errors: BTreeMap<ExecutionId, Error>,
 }
 
-impl<C: ChangeCosts, R: RngCore> State<C, R, OsRng> {
+impl<C: ChangeCosts, R: CryptoRng, S: TryCryptoRng> State<C, R, S> {
     /// The schedule grid places all authored payoff slots for this wallet.
+    ///
+    /// `rngs` supplies coin-selection and construction-session entropy.
     pub fn new(
-        pending: InMemoryQueue,
-        snapshot: Snapshot,
-        feerate: FeeRate,
-        wallet_id: [u8; 16],
-        change_costs: C,
-        rng: R,
-        grid: ScheduleGrid,
-    ) -> Self {
-        Self::new_with_rngs(
-            pending,
-            snapshot,
-            feerate,
-            wallet_id,
-            change_costs,
-            (rng, OsRng),
-            grid,
-        )
-    }
-}
-
-impl<C: ChangeCosts, R: RngCore, S: TryRngCore> State<C, R, S> {
-    fn new_with_rngs(
         pending: InMemoryQueue,
         snapshot: Snapshot,
         feerate: FeeRate,
@@ -353,7 +333,7 @@ mod tests {
     use crate::wallet::{Coin, dummy};
     use bitcoin::{OutPoint, ScriptBuf, TxOut, Txid, Weight, hashes::Hash};
     use cost_function::intent::{FixedPaymentInstructions, Intent, Outcome, PayoffCurve};
-    use rand::{SeedableRng, rngs::StdRng};
+    use rand::{SeedableRng, TryRngCore, rngs::StdRng};
 
     struct FailingRng;
 
@@ -372,6 +352,9 @@ mod tests {
             Err("injected entropy failure")
         }
     }
+
+    // The blanket impl covers CryptoRng; this double is deliberately not one.
+    impl TryCryptoRng for FailingRng {}
 
     #[test]
     fn session_entropy_failure_prevents_transaction_creation() {
@@ -399,7 +382,7 @@ mod tests {
             }),
             PayoffCurve::new(0, [(60_000, Amount::from_sat(100_000))]).unwrap(),
         );
-        let mut state = State::new_with_rngs(
+        let mut state = State::new(
             InMemoryQueue::new(Some(intent)),
             snapshot,
             FeeRate::from_sat_per_vb(2).unwrap(),
@@ -431,7 +414,7 @@ impl Queue for Batch<'_> {
     }
 }
 
-impl<C: ChangeCosts, R: RngCore, S: TryRngCore> Machine for State<C, R, S> {
+impl<C: ChangeCosts, R: CryptoRng, S: TryCryptoRng> Machine for State<C, R, S> {
     type Action = Request;
     type Operation = Request;
     type OperationId = OperationId;

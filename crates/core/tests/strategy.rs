@@ -27,13 +27,16 @@ use fungi_core::{
     },
     wallet::{Coin, Snapshot, dummy},
 };
-use rand::{SeedableRng, rngs::StdRng};
+use rand::{
+    SeedableRng,
+    rngs::{OsRng, StdRng},
+};
 use std::{
     collections::BTreeMap,
     time::{Duration, Instant},
 };
 
-type Wallet = State<dummy::Change, StdRng>;
+type Wallet = State<dummy::Change, StdRng, OsRng>;
 
 const SLOTS_PER_SECOND: u64 = 1_000_000 / ScheduleGrid::AUTHORED_STEP.as_micros() as u64;
 
@@ -105,7 +108,7 @@ fn fixture_with_scripts(
         FeeRate::from_sat_per_vb(2).unwrap(),
         [wallet; 16],
         dummy::Change::new(change_template, Weight::from_wu(70), []),
-        StdRng::seed_from_u64(0),
+        (StdRng::seed_from_u64(0), OsRng),
         grid,
     )
 }
@@ -786,7 +789,7 @@ fn split_fixture(now: Instant, funded: bool) -> Wallet {
         FeeRate::from_sat_per_vb(2).unwrap(),
         [1; 16],
         dummy::Change::new(script(3), Weight::from_wu(70), []),
-        StdRng::seed_from_u64(0),
+        (StdRng::seed_from_u64(0), OsRng),
         grid,
     )
 }

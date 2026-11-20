@@ -176,7 +176,7 @@ async fn armins_candidate_is_signed_by_bdk_and_confirmed_on_regtest()
         feerate,
         [7; 16],
         adapter.clone(),
-        StdRng::seed_from_u64(0),
+        (StdRng::seed_from_u64(0), StdRng::seed_from_u64(1)),
         grid,
     );
     assert_eq!(

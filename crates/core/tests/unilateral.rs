@@ -85,7 +85,7 @@ type TestRuntime = Runtime<dummy::Change, signing::Signer, dummy::Recorder, Chai
 fn script(byte: u8) -> ScriptBuf {
     ScriptBuf::from_bytes([vec![0x51, 0x20], vec![byte; 32]].concat())
 }
-type TestState = State<dummy::Change, StdRng>;
+type TestState = State<dummy::Change, StdRng, StdRng>;
 fn fixture() -> (TestState, TestRuntime) {
     fixture_with_funding(false, 10_000)
 }
@@ -165,7 +165,7 @@ fn fixture_without_signers(
         feerate,
         [1; 16],
         dummy::Change::new(template, Weight::from_wu(70), []),
-        StdRng::seed_from_u64(0),
+        (StdRng::seed_from_u64(0), StdRng::seed_from_u64(1)),
         grid,
     );
     let inbox = Inbox::default();

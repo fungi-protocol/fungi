@@ -28,8 +28,9 @@ impl<
     B: Broadcaster,
     E: Events,
     P: cost_function::change::ChangeCosts,
-    G: rand::RngCore,
-> Environment<State<P, G>> for Runtime<C, S, R, B, E>
+    G: rand::CryptoRng,
+    H: rand::TryCryptoRng,
+> Environment<State<P, G, H>> for Runtime<C, S, R, B, E>
 {
     fn now(&self) -> Instant {
         self.events.now()
@@ -37,7 +38,7 @@ impl<
     fn execute(
         &mut self,
         operation: Request,
-    ) -> impl Future<Output = Result<Update, Error>> + use<C, S, R, B, E, P, G> {
+    ) -> impl Future<Output = Result<Update, Error>> + use<C, S, R, B, E, P, G, H> {
         let executor = self.executor.clone();
         async move { executor.execute(&operation).await }
     }
