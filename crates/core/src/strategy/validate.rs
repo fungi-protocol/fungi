@@ -41,7 +41,7 @@ pub(super) fn transaction(
             .remove(&input.previous_output)
             .ok_or_else(|| error("unknown or repeated prevout"))?;
         if data.witness_utxo.as_ref() != Some(prevout)
-            || input.sequence != Sequence::ENABLE_RBF_NO_LOCKTIME
+            || input.sequence != Sequence::ENABLE_LOCKTIME_NO_RBF
         {
             return Err(error("unexpected input data"));
         }
@@ -126,7 +126,7 @@ mod tests {
                 .map(|previous_output| TxIn {
                     previous_output,
                     script_sig: ScriptBuf::new(),
-                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    sequence: Sequence::ENABLE_LOCKTIME_NO_RBF,
                     witness: Witness::new(),
                 })
                 .collect(),

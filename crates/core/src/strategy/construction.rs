@@ -127,7 +127,7 @@ impl Execution {
                 }
                 let mut input = Input::new(&coin.outpoint());
                 input.set_witness_utxo(Some(prevout.txout.clone()));
-                input.set_sequence(Some(Sequence::ENABLE_RBF_NO_LOCKTIME));
+                input.set_sequence(Some(Sequence::ENABLE_LOCKTIME_NO_RBF));
                 self.construction = Construction::Active(
                     Inputs::try_from_psbt(self.active()?.clone())
                         .map_err(error)?
