@@ -7,6 +7,7 @@
     manifestPath = "Cargo.toml";
     packages = {
       cost-function = { };
+      fungi-messages = { };
       fungi-transport = { };
       fungi-transport-tor-socks = { };
     };
