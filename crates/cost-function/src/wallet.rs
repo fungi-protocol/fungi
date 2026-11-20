@@ -177,7 +177,7 @@ impl<Q: Queue, U: UtxoSnapshot> WalletStateSnapshot<Q, U> {
 
         actions
             .0
-            .extend(change.into_iter().map(Action::RegisterChangeOutPut));
+            .extend(change.into_iter().map(Action::RegisterChangeOutput));
 
         let payments = batch
             .intents
@@ -284,7 +284,7 @@ mod tests {
                 Action::RegisterInput(utxo(0, 10_000)),
                 Action::RegisterOutput(op_true_output(1_000)),
                 Action::RegisterOutput(op_true_output(1_000)),
-                Action::RegisterChangeOutPut(OutputWithoutScriptpubkey {
+                Action::RegisterChangeOutput(OutputWithoutScriptpubkey {
                     value: Amount::from_sat(7_915),
                     weight: Weight::from_wu(40),
                     satisfaction_weight: Weight::ZERO,

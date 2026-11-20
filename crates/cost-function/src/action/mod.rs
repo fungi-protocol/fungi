@@ -16,8 +16,8 @@ pub(crate) enum Action {
     RegisterInput(Utxo),
     /// Add an output to the transaction.
     RegisterOutput(TxOut),
-    /// Add an change output,
-    RegisterChangeOutPut(OutputWithoutScriptpubkey),
+    /// Add a change output.
+    RegisterChangeOutput(OutputWithoutScriptpubkey),
 }
 
 /// Actions without a known time of execution
@@ -36,7 +36,7 @@ impl UnSequencedActions {
     /// The coins the transaction pays back to the wallet.
     pub(crate) fn change(&self) -> impl Iterator<Item = &OutputWithoutScriptpubkey> {
         self.0.iter().filter_map(|action| match action {
-            Action::RegisterChangeOutPut(output) => Some(output),
+            Action::RegisterChangeOutput(output) => Some(output),
             _ => None,
         })
     }
@@ -97,7 +97,7 @@ mod tests {
         actions.extend(
             change
                 .iter()
-                .map(|&sats| Action::RegisterChangeOutPut(self::change(sats))),
+                .map(|&sats| Action::RegisterChangeOutput(self::change(sats))),
         );
         UnSequencedActions(actions)
     }
