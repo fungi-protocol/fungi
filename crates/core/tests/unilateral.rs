@@ -7,6 +7,10 @@ use scripted_driver::run as run_scripted;
 
 #[path = "support/signing.rs"]
 mod signing;
+
+#[path = "support/identity.rs"]
+mod identity;
+
 use bitcoin::{
     Amount, FeeRate, OutPoint, ScriptBuf, Transaction, TxOut, Txid, Weight, Witness, hashes::Hash,
 };
@@ -228,8 +232,18 @@ async fn pending_action(state: &mut TestState, io: &TestRuntime, action: Action)
 #[tokio::test]
 async fn a_late_signature_failure_preserves_the_first_failure() {
     let (mut state, io) = fixture_with_funding(true, 30_000);
-    let first = pending_action(&mut state, &io, Action::Sign(0)).await;
-    let second = pending_action(&mut state, &io, Action::Sign(1)).await;
+    let first = pending_action(
+        &mut state,
+        &io,
+        Action::Sign(OutPoint::new(Txid::all_zeros(), 0)),
+    )
+    .await;
+    let second = pending_action(
+        &mut state,
+        &io,
+        Action::Sign(OutPoint::new(Txid::all_zeros(), 1)),
+    )
+    .await;
     assert_eq!(state.operations().count(), 2);
 
     let first_error = fungi_core::strategy::Error("first signer failed".into());
@@ -242,8 +256,14 @@ async fn a_late_signature_failure_preserves_the_first_failure() {
     assert_eq!(
         tx.operation_errors(),
         &BTreeMap::from([
-            (Action::Sign(0), first_error),
-            (Action::Sign(1), second_error)
+            (
+                Action::Sign(OutPoint::new(Txid::all_zeros(), 0)),
+                first_error
+            ),
+            (
+                Action::Sign(OutPoint::new(Txid::all_zeros(), 1)),
+                second_error
+            )
         ])
     );
     assert!(tx.pending().next().is_none());
@@ -271,14 +291,14 @@ async fn only_finalization_can_complete_with_a_payment() {
     assert!(tx.payment().is_none());
 
     let (mut state, io) = fixture();
-    let start = pending_action(&mut state, &io, Action::Start).await;
+    let start = pending_action(&mut state, &io, Action::CloseInputs).await;
     state.completed(start.id(), Ok(payment));
     let tx = &state.transactions()[&start.id().0];
     let error = fungi_core::strategy::Error("unexpected effect result".into());
     assert_eq!(tx.status(), &Status::Failed(error.clone()));
     assert_eq!(
         tx.operation_errors(),
-        &BTreeMap::from([(Action::Start, error)])
+        &BTreeMap::from([(Action::CloseInputs, error)])
     );
     assert!(tx.payment().is_none());
 }
@@ -330,7 +350,13 @@ async fn constructs_and_finalizes_a_verified_payment() {
     drop(signer);
 
     // Replaying the action returns the same receipt without requesting another signature.
-    execute(&mut io, &request, Action::Sign(0)).await.unwrap();
+    execute(
+        &mut io,
+        &request,
+        Action::Sign(OutPoint::new(Txid::all_zeros(), 0)),
+    )
+    .await
+    .unwrap();
     let result = execute(&mut io, &request, Action::Finalize).await.unwrap();
     assert!(
         matches!(result, fungi_core::strategy::Update::Finalized(replay) if replay == *payment)
@@ -353,12 +379,18 @@ async fn constructs_and_finalizes_a_verified_payment() {
 async fn signing_and_finalization_require_their_predecessors() {
     let (mut state, mut io) = fixture();
     let request = next_request(&mut state, io.events.now);
-    execute(&mut io, &request, Action::Start).await.unwrap();
+    execute(&mut io, &request, Action::CloseInputs)
+        .await
+        .unwrap();
     assert_eq!(
-        execute(&mut io, &request, Action::Sign(0))
-            .await
-            .unwrap_err()
-            .0,
+        execute(
+            &mut io,
+            &request,
+            Action::Sign(OutPoint::new(Txid::all_zeros(), 0))
+        )
+        .await
+        .unwrap_err()
+        .0,
         "transaction has not been frozen and validated"
     );
     assert_eq!(
@@ -369,10 +401,14 @@ async fn signing_and_finalization_require_their_predecessors() {
         "signatures are incomplete"
     );
     assert_eq!(
-        execute(&mut io, &request, Action::Sign(1))
-            .await
-            .unwrap_err()
-            .0,
+        execute(
+            &mut io,
+            &request,
+            Action::Sign(OutPoint::new(Txid::all_zeros(), 1))
+        )
+        .await
+        .unwrap_err()
+        .0,
         "unknown input"
     );
     assert!(
@@ -468,7 +504,10 @@ async fn a_closed_signer_channel_fails_the_pending_signature() {
 
     let tx = state.transactions().values().next().unwrap();
     assert!(matches!(tx.status(), Status::Failed(err) if err.0 == "signer channel closed"));
-    assert!(!tx.completed().contains(&Action::Sign(0)));
+    assert!(
+        !tx.completed()
+            .contains(&Action::Sign(OutPoint::new(Txid::all_zeros(), 0)))
+    );
     assert!(tx.payment().is_none());
 }
 
@@ -491,7 +530,10 @@ async fn a_signer_registered_later_is_visible_to_an_existing_executor_clone() {
     );
 
     let tx = state.transactions().values().next().unwrap();
-    assert!(tx.completed().contains(&Action::Sign(0)));
+    assert!(
+        tx.completed()
+            .contains(&Action::Sign(OutPoint::new(Txid::all_zeros(), 0)))
+    );
     assert!(tx.payment().is_some());
 }
 
@@ -507,7 +549,10 @@ async fn duplicate_signer_registration_keeps_the_original_usable() {
         Stopped::Closed
     );
     let tx = state.transactions().values().next().unwrap();
-    assert!(tx.completed().contains(&Action::Sign(0)));
+    assert!(
+        tx.completed()
+            .contains(&Action::Sign(OutPoint::new(Txid::all_zeros(), 0)))
+    );
     assert!(tx.payment().is_some());
 }
 
@@ -565,7 +610,10 @@ async fn signing_results_must_preserve_the_prevout_and_finalize_a_key_spend() {
 
         let tx = state.transactions().values().next().unwrap();
         assert!(matches!(tx.status(), Status::Failed(err) if err.0 == reason));
-        assert!(!tx.completed().contains(&Action::Sign(0)));
+        assert!(
+            !tx.completed()
+                .contains(&Action::Sign(OutPoint::new(Txid::all_zeros(), 0)))
+        );
         assert!(tx.payment().is_none());
     }
 }
@@ -584,7 +632,10 @@ async fn underestimated_input_weight_can_prevent_finalization() {
         tx.status(),
         Status::Failed(err) if err.0 == "signed transaction is below the requested feerate"
     ));
-    assert!(tx.completed().contains(&Action::Sign(0)));
+    assert!(
+        tx.completed()
+            .contains(&Action::Sign(OutPoint::new(Txid::all_zeros(), 0)))
+    );
     assert!(tx.payment().is_none());
 }
 
@@ -719,9 +770,13 @@ async fn constructs_signs_retains_publishes_and_observes_the_payment() {
         Some(&Action::Publish)
     );
     // Replay a completed operation: no new wallet operation or broadcast.
-    execute(&mut io, &request, Action::AllocateChange(0))
-        .await
-        .unwrap();
+    execute(
+        &mut io,
+        &request,
+        Action::AllocateChange(identity::change(0)),
+    )
+    .await
+    .unwrap();
     execute(&mut io, &request, Action::Record).await.unwrap();
     execute(&mut io, &request, Action::Publish).await.unwrap();
     assert_eq!(io.executor.recorder.lock().await.requests().len(), 1);
@@ -978,7 +1033,9 @@ async fn a_late_failure_preserves_the_invalidation_reason() {
 async fn publication_requires_recording() {
     let (mut state, mut io) = fixture();
     let request = next_request(&mut state, io.events.now);
-    execute(&mut io, &request, Action::Start).await.unwrap();
+    execute(&mut io, &request, Action::CloseInputs)
+        .await
+        .unwrap();
     assert_eq!(
         execute(&mut io, &request, Action::Record)
             .await

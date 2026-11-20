@@ -50,7 +50,7 @@ impl<S: InputSigner> Signers<S> {
     }
 }
 
-/// Capabilities are independent of candidates; a Start request binds an execution.
+/// Capabilities are independent of candidates; CloseInputs binds an execution.
 pub struct Executor<C, S, R, B> {
     pub change: Arc<Mutex<C>>,
     pub signers: Arc<Signers<S>>,
@@ -81,7 +81,7 @@ impl<C: ChangeSource, S: InputSigner, R: TransactionRecorder, B: Broadcaster> Ex
             let mut transactions = self.transactions.lock().unwrap();
             match transactions.entry(request.plan.execution_id) {
                 Entry::Vacant(entry) => {
-                    if request.action != Action::Start {
+                    if request.action != Action::CloseInputs {
                         return Err(error("transaction construction has not started"));
                     }
                     entry
@@ -117,7 +117,6 @@ impl<C: ChangeSource, S: InputSigner, R: TransactionRecorder, B: Broadcaster> Ex
                     .complete_change(index, &priced, script)
             }
             Effect::Sign {
-                index,
                 position,
                 outpoint,
                 psbt,
@@ -131,7 +130,7 @@ impl<C: ChangeSource, S: InputSigner, R: TransactionRecorder, B: Broadcaster> Ex
                 execution
                     .lock()
                     .await
-                    .complete_sign(index, position, signed)
+                    .complete_sign(outpoint, position, signed)
             }
             Effect::Record(transaction) => {
                 let io = self.recorder.lock().await.record(&transaction);

@@ -1,15 +1,52 @@
 //! Wallet strategy and execution state.
 //!
-//! The current tactic funds one initial outcome consisting of disjoint transaction batches.
+//! The tactic chooses a complete outcome. A `Plan` binds one candidate, the
+//! snapshot used to price it and its execution identity. The executor realizes
+//! that candidate; it does not make coin-selection or output-policy decisions.
+//!
+//! # Construction state machine
+//!
+//! Unilateral construction is the semi-honest machine with one participant and
+//! no transport. The agreed contribution and witness sets are therefore the
+//! local sets, and readiness barriers complete without peer messages.
+//!
+//! ```text
+//! CloseInputs                       materialize and freeze the planned inputs
+//!   ├─ AllocateChange(change_id)    derive each change script
+//!   └─ CloseOutputs                 add payments and change, order and freeze
+//!        ├─ Sign(outpoint)          collect each local witness
+//!        └─ Finalize                join witnesses to the transaction
+//!             └─ Record
+//!                  └─ Publish
+//! ```
+//!
+//! `AllocateChange`, signing, recording and publication have external effects.
+//! The close and finalization actions are barriers. Pure restatements of the
+//! candidate, such as registering a planned input or payment output, are not
+//! actions.
+//!
+//! Inputs, signatures and witnesses are identified by outpoint. Outputs and
+//! change allocations use stable contribution identities. Numeric positions
+//! are derived only for sighash calculation and final serialization.
+//!
+//! `CloseOutputs` freezes an unsigned transaction and its prevouts. Witnesses
+//! accumulate separately by outpoint and join the transaction only at
+//! finalization. Signing never mutates the frozen template.
+//!
+//! The current executor interprets one fixed candidate. The planner does not
+//! yet retain a committed action sequence or revise a plan from peer input.
+//! Those are planner/executor interface work, not different construction
+//! semantics: the tactics model permits re-evaluation before phase closure.
 
 use crate::{
     driver::{Decision, Machine},
     wallet::Snapshot,
 };
 use bitcoin::{
-    Amount, FeeRate, Txid,
+    Amount, FeeRate, OutPoint, Txid,
     hashes::{Hash, sha256},
 };
+use concurrent_psbt::output::UniqueId;
 use cost_function::{
     candidate::Candidate,
     change::ChangeCosts,
@@ -44,18 +81,47 @@ struct Plan {
     session_id: [u8; 16],
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
-    Start,
-    Input(usize),
     CloseInputs,
-    AllocateChange(usize),
-    Output(usize),
+    AllocateChange(UniqueId),
     CloseOutputs,
-    Sign(usize),
+    Sign(OutPoint),
     Finalize,
     Record,
     Publish,
+}
+
+impl PartialOrd for Action {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Action {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        fn rank(action: &Action) -> u8 {
+            match action {
+                Action::CloseInputs => 0,
+                Action::AllocateChange(_) => 1,
+                Action::CloseOutputs => 2,
+                Action::Sign(_) => 3,
+                Action::Finalize => 4,
+                Action::Record => 5,
+                Action::Publish => 6,
+            }
+        }
+
+        rank(self)
+            .cmp(&rank(other))
+            .then_with(|| match (self, other) {
+                (Action::AllocateChange(left), Action::AllocateChange(right)) => {
+                    left.as_bytes().cmp(right.as_bytes())
+                }
+                (Action::Sign(left), Action::Sign(right)) => left.cmp(right),
+                _ => std::cmp::Ordering::Equal,
+            })
+    }
 }
 
 /// An action bound to the candidate evaluated by the decision process.
@@ -110,6 +176,7 @@ pub enum Status {
     Failed(Error),
 }
 
+mod identity;
 mod path;
 mod signing;
 mod transaction;

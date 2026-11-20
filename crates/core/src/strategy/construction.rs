@@ -1,6 +1,6 @@
 //! Construction state and effect receipts for one transaction.
 
-use super::{Action, Error, Payment, Plan, Update, error, signing, validate};
+use super::{Action, Error, Payment, Plan, Update, error, identity, signing, validate};
 use crate::wallet::{Coin, Snapshot};
 use bitcoin::{Amount, OutPoint, Psbt, ScriptBuf, Sequence, TxOut, absolute, psbt, transaction};
 use concurrent_psbt::{
@@ -47,7 +47,6 @@ pub(super) enum Effect {
         priced: OutputWithoutScriptpubkey,
     },
     Sign {
-        index: usize,
         position: usize,
         outpoint: OutPoint,
         psbt: Psbt,
@@ -112,58 +111,34 @@ impl Execution {
         if let Some(result) = self.results.get(action) {
             return Ok(Effect::Complete(result.clone()));
         }
-        match *action {
-            Action::Start => {}
-            Action::Input(index) => {
-                let coin = self
-                    .plan
-                    .candidate
-                    .inputs()
-                    .nth(index)
-                    .ok_or_else(|| error("unknown input"))?;
-                let prevout = priced_prevout(&self.plan.snapshot, coin)?;
-                if !prevout.txout.script_pubkey.is_p2tr() {
-                    return Err(error("PoC signer path only supports P2TR key spends"));
-                }
-                let mut input = Input::new(&coin.outpoint());
-                input.set_witness_utxo(Some(prevout.txout.clone()));
-                input.set_sequence(Some(Sequence::ENABLE_LOCKTIME_NO_RBF));
-                self.construction = Construction::Active(
-                    Inputs::try_from_psbt(self.active()?.clone())
-                        .map_err(error)?
-                        .input(input)
-                        .map_err(error)?
-                        .into_inner()
-                        .into_psbt(),
-                );
-            }
+        match action.clone() {
             Action::CloseInputs => {
-                if self
-                    .plan
-                    .candidate
-                    .inputs()
-                    .enumerate()
-                    .any(|(i, _)| !self.results.contains_key(&Action::Input(i)))
-                {
-                    return Err(error("input contributions are incomplete"));
+                let mut constructor =
+                    Inputs::try_from_psbt(self.active()?.clone()).map_err(error)?;
+                for coin in self.plan.candidate.inputs() {
+                    let prevout = priced_prevout(&self.plan.snapshot, coin)?;
+                    if !prevout.txout.script_pubkey.is_p2tr() {
+                        return Err(error("PoC signer path only supports P2TR key spends"));
+                    }
+                    let mut input = Input::new(&coin.outpoint());
+                    input.set_witness_utxo(Some(prevout.txout.clone()));
+                    input.set_sequence(Some(Sequence::ENABLE_LOCKTIME_NO_RBF));
+                    constructor = constructor.input(input).map_err(error)?;
                 }
-                self.construction = Construction::Active(
-                    Inputs::try_from_psbt(self.active()?.clone())
-                        .map_err(error)?
-                        .no_more_inputs()
-                        .into_inner()
-                        .into_psbt(),
-                );
+                self.construction =
+                    Construction::Active(constructor.no_more_inputs().into_inner().into_psbt());
             }
-            Action::AllocateChange(index) => {
+            Action::AllocateChange(id) => {
                 self.outputs()?;
-                let priced = self
+                let (index, priced) = self
                     .plan
                     .candidate
                     .change()
-                    .nth(index)
-                    .ok_or_else(|| error("unknown change"))?
-                    .clone();
+                    .enumerate()
+                    .find_map(|(index, priced)| {
+                        (identity::change(index) == id).then(|| (index, priced.clone()))
+                    })
+                    .ok_or_else(|| error("unknown change"))?;
                 if let Some(script) = self.scripts.get(&index) {
                     return self
                         .complete_change(index, &priced, script.clone())
@@ -171,24 +146,24 @@ impl Execution {
                 }
                 return Ok(Effect::AllocateChange { index, priced });
             }
-            Action::Output(index) => {
-                let constructor = self.outputs()?;
-                let (id, output) = self.output(index)?;
-                self.construction = Construction::Active(
-                    constructor
-                        .output(Output::new(id, output.value, output.script_pubkey))
-                        .map_err(error)?
-                        .into_inner()
-                        .into_psbt(),
-                );
-            }
             Action::CloseOutputs => {
-                let count =
-                    self.plan.candidate.payments().count() + self.plan.candidate.change().count();
-                if (0..count).any(|i| !self.results.contains_key(&Action::Output(i))) {
+                if self.plan.candidate.change().enumerate().any(|(index, _)| {
+                    !self
+                        .results
+                        .contains_key(&Action::AllocateChange(identity::change(index)))
+                }) {
                     return Err(error("output contributions are incomplete"));
                 }
-                let ordered = self.outputs()?.no_more_outputs().into_ordered_psbt();
+                let mut constructor = self.outputs()?;
+                let count =
+                    self.plan.candidate.payments().count() + self.plan.candidate.change().count();
+                for index in 0..count {
+                    let (id, output) = self.output(index)?;
+                    constructor = constructor
+                        .output(Output::new(id, output.value, output.script_pubkey))
+                        .map_err(error)?;
+                }
+                let ordered = constructor.no_more_outputs().into_ordered_psbt();
                 let tx = psbt_v2::v2::Signer::new(ordered.clone())
                     .map_err(error)?
                     .unsigned_tx();
@@ -208,14 +183,15 @@ impl Execution {
                 let fee = self.validate(&psbt)?;
                 self.construction = Construction::Frozen(Frozen { psbt, outputs, fee });
             }
-            Action::Sign(index) => {
-                let outpoint = self
+            Action::Sign(outpoint) => {
+                if !self
                     .plan
                     .candidate
                     .inputs()
-                    .nth(index)
-                    .ok_or_else(|| error("unknown input"))?
-                    .outpoint();
+                    .any(|coin| coin.outpoint() == outpoint)
+                {
+                    return Err(error("unknown input"));
+                }
                 let psbt = &self.construction.frozen()?.psbt;
                 let position = psbt
                     .unsigned_tx
@@ -224,7 +200,6 @@ impl Execution {
                     .position(|input| input.previous_output == outpoint)
                     .expect("freezing verified the selected inputs");
                 return Ok(Effect::Sign {
-                    index,
                     position,
                     outpoint,
                     psbt: psbt.clone(),
@@ -235,8 +210,7 @@ impl Execution {
                     .plan
                     .candidate
                     .inputs()
-                    .enumerate()
-                    .any(|(i, _)| !self.results.contains_key(&Action::Sign(i)))
+                    .any(|coin| !self.results.contains_key(&Action::Sign(coin.outpoint())))
                 {
                     return Err(error("signatures are incomplete"));
                 }
@@ -273,21 +247,23 @@ impl Execution {
         // Retain the allocation even if validation fails.
         self.scripts.entry(index).or_insert(script);
         validate::change(&self.change_output(index, priced), priced)?;
-        self.results
-            .insert(Action::AllocateChange(index), Update::Applied);
+        self.results.insert(
+            Action::AllocateChange(identity::change(index)),
+            Update::Applied,
+        );
         Ok(Update::Applied)
     }
 
     pub(super) fn complete_sign(
         &mut self,
-        index: usize,
+        outpoint: OutPoint,
         position: usize,
         signed: psbt::Input,
     ) -> Result<Update, Error> {
         let snapshot = &self.plan.snapshot;
         let psbt = &mut self.construction.frozen()?.psbt;
         signing::apply(psbt, snapshot, position, signed)?;
-        self.results.insert(Action::Sign(index), Update::Applied);
+        self.results.insert(Action::Sign(outpoint), Update::Applied);
         Ok(Update::Applied)
     }
 
@@ -317,24 +293,24 @@ impl Execution {
 
     fn output(&self, index: usize) -> Result<(UniqueId, TxOut), Error> {
         let payments = self.plan.candidate.payments().count();
-        let (tag, id, output) =
-            if let Some((&id, output)) = self.plan.candidate.payments().nth(index) {
-                (0, id, output.clone())
-            } else {
-                let change = index - payments;
-                if !self.results.contains_key(&Action::AllocateChange(change)) {
-                    return Err(error("change allocation has not succeeded"));
-                }
-                let priced = self
-                    .plan
-                    .candidate
-                    .change()
-                    .nth(change)
-                    .expect("a successful allocation has priced change");
-                (1, change as u64, self.change_output(change, priced))
-            };
-        let bytes = [vec![tag], id.to_be_bytes().to_vec()].concat();
-        Ok((UniqueId::try_from(bytes).map_err(error)?, output))
+        if let Some((&id, output)) = self.plan.candidate.payments().nth(index) {
+            return Ok((identity::payment(id), output.clone()));
+        }
+
+        let change = index - payments;
+        if !self
+            .results
+            .contains_key(&Action::AllocateChange(identity::change(change)))
+        {
+            return Err(error("change allocation has not succeeded"));
+        }
+        let priced = self
+            .plan
+            .candidate
+            .change()
+            .nth(change)
+            .expect("a successful allocation has priced change");
+        Ok((identity::change(change), self.change_output(change, priced)))
     }
 
     fn change_output(&self, index: usize, priced: &OutputWithoutScriptpubkey) -> TxOut {
@@ -405,19 +381,16 @@ mod tests {
 #[cfg(test)]
 mod prevout_tests {
     use super::*;
-    use bitcoin::{Amount, OutPoint, ScriptBuf, TxOut, Weight};
+    use crate::{strategy::ExecutionId, wallet::dummy};
+    use bitcoin::{Amount, FeeRate, OutPoint, ScriptBuf, TxOut, Weight};
+    use cost_function::{
+        intent::{FixedPaymentInstructions, Intent, Outcome, PayoffCurve},
+        queue::InMemoryQueue,
+        wallet::WalletStateSnapshot,
+    };
+    use rand::{SeedableRng, rngs::StdRng};
 
-    #[test]
-    fn closing_outputs_rejects_an_altered_prevout() {
-        use crate::{strategy::ExecutionId, wallet::dummy};
-        use bitcoin::FeeRate;
-        use cost_function::{
-            intent::{FixedPaymentInstructions, Intent, Outcome, PayoffCurve},
-            queue::InMemoryQueue,
-            wallet::WalletStateSnapshot,
-        };
-        use rand::{SeedableRng, rngs::StdRng};
-
+    fn execution(payment: Amount) -> Execution {
         let outpoint = OutPoint {
             vout: 0,
             ..OutPoint::null()
@@ -438,7 +411,7 @@ mod prevout_tests {
         let intent = Intent::new(
             Outcome::OutputCreation(FixedPaymentInstructions {
                 script_pubkey: txout.script_pubkey.clone(),
-                amount: txout.value,
+                amount: payment,
             }),
             PayoffCurve::new(0, []).unwrap(),
         );
@@ -448,7 +421,7 @@ mod prevout_tests {
             .funded_candidate(feerate, &mut StdRng::seed_from_u64(0), &change)
             .unwrap()
             .unwrap();
-        let mut execution = Execution::new(Arc::new(Plan {
+        Execution::new(Arc::new(Plan {
             execution_id: ExecutionId {
                 wallet: [1; 16],
                 sequence: 0,
@@ -458,10 +431,34 @@ mod prevout_tests {
             feerate,
             session_id: [1; 16],
         }))
-        .unwrap();
-        for action in [Action::Input(0), Action::CloseInputs, Action::Output(0)] {
-            execution.prepare(&action).unwrap();
-        }
+        .unwrap()
+    }
+
+    #[test]
+    fn output_guards_reject_unavailable_contributions() {
+        let mut execution = execution(Amount::from_sat(40_000));
+        assert_eq!(
+            execution
+                .prepare(&Action::AllocateChange(identity::change(0)))
+                .err()
+                .unwrap()
+                .0,
+            "outputs are not modifiable"
+        );
+
+        execution.prepare(&Action::CloseInputs).unwrap();
+        let payments = execution.plan.candidate.payments().count();
+        assert_eq!(execution.plan.candidate.change().count(), 1);
+        assert_eq!(
+            execution.output(payments).unwrap_err().0,
+            "change allocation has not succeeded"
+        );
+    }
+
+    #[test]
+    fn closing_outputs_rejects_an_altered_prevout() {
+        let mut execution = execution(Amount::from_sat(50_000));
+        execution.prepare(&Action::CloseInputs).unwrap();
         let mut psbt = execution.active().unwrap().clone();
         psbt.inputs[0].witness_utxo.as_mut().unwrap().value += Amount::ONE_SAT;
         execution.construction = Construction::Active(psbt);
