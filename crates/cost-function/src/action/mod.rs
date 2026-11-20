@@ -7,6 +7,10 @@ use crate::wallet::Utxo;
 
 /// One step in constructing a transaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "retain the planner action vocabulary"
+)]
 pub(crate) enum Action {
     /// Spend a coin the wallet holds.
     RegisterInput(Utxo),
