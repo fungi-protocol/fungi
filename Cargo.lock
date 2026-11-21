@@ -1130,6 +1130,7 @@ dependencies = [
 name = "fungi-messages"
 version = "0.0.0"
 dependencies = [
+ "bitcoin-units",
  "fungi-transport",
  "proptest",
  "thiserror 2.0.20",
