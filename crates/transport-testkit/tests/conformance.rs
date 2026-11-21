@@ -63,10 +63,13 @@ impl RecvChannel for Receiver {
 }
 
 #[tokio::test(start_paused = true)]
-async fn helpers_check_delivery_and_limits() {
+async fn helpers_check_delivery_limits_and_cancellation() {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         let (left, right) = pair(1024);
         testkit::roundtrip_both_directions(left, right).await;
+
+        let (left, right) = pair(1024);
+        testkit::recv_is_cancel_safe(left, right).await;
 
         let (left, right) = pair(8);
         testkit::too_large(left, right, 8, |error| {
@@ -88,6 +91,7 @@ async fn helpers_check_delivery_and_limits() {
 enum Fault {
     Intact,
     Corrupt,
+    Lose,
 }
 
 #[derive(Debug)]
@@ -103,6 +107,7 @@ impl RecvChannel for FaultyReceiver {
         match self.fault {
             Fault::Intact => {}
             Fault::Corrupt => message.push(0xff),
+            Fault::Lose => std::future::pending::<()>().await,
         }
         Ok(message)
     }
@@ -154,6 +159,57 @@ async fn roundtrip_rejects_corrupted_reply() {
         faulty(right, Fault::Intact),
     ))
     .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancellation_rejects_a_backend_that_consumes_then_suspends() {
+    let (left, right) = pair(1024);
+    rejected(testkit::recv_is_cancel_safe(
+        left,
+        faulty(right, Fault::Lose),
+    ))
+    .await;
+}
+
+#[derive(Debug)]
+struct YieldingReceiver(Receiver);
+impl RecvChannel for YieldingReceiver {
+    type RecvError = RecvError;
+    async fn recv(&mut self) -> Result<Vec<u8>, RecvError> {
+        let message = self.0.recv().await?;
+        tokio::task::yield_now().await;
+        Ok(message)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancellation_rejects_a_backend_that_consumes_then_yields() {
+    let (left, right) = pair(1024);
+    let (_, receiver) = right.into_parts();
+    rejected(testkit::recv_is_cancel_safe(
+        left,
+        YieldingReceiver(receiver),
+    ))
+    .await;
+}
+
+/// Answers every receive at once, so no receive is ever left to cancel.
+#[derive(Debug)]
+struct NonblockingReceiver;
+
+impl RecvChannel for NonblockingReceiver {
+    type RecvError = RecvError;
+
+    async fn recv(&mut self) -> Result<Vec<u8>, RecvError> {
+        Err(RecvError)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+#[should_panic(expected = "recv must wait while no message is available")]
+async fn cancellation_requires_a_receiver_that_waits() {
+    let (sender, _peer) = pair(1024);
+    testkit::recv_is_cancel_safe(sender, NonblockingReceiver).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -233,6 +289,38 @@ async fn recovery_rejects_a_channel_closed_by_the_rejection() {
         8,
         |_| true,
     ))
+    .await;
+}
+
+#[derive(Debug)]
+struct RetainingReceiver {
+    inner: Receiver,
+    saved: Option<Vec<u8>>,
+}
+
+impl RecvChannel for RetainingReceiver {
+    type RecvError = RecvError;
+    async fn recv(&mut self) -> Result<Vec<u8>, RecvError> {
+        if let Some(message) = self.saved.take() {
+            return Ok(message);
+        }
+        self.saved = Some(self.inner.recv().await?);
+        tokio::task::yield_now().await;
+        Ok(self.saved.take().unwrap())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancellation_accepts_a_backend_that_retains_a_partly_received_message() {
+    let (sender, receiver) = pair(1024);
+    let (_, receiver) = receiver.into_parts();
+    testkit::recv_is_cancel_safe(
+        sender,
+        RetainingReceiver {
+            inner: receiver,
+            saved: None,
+        },
+    )
     .await;
 }
 
