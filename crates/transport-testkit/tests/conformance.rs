@@ -63,7 +63,7 @@ impl RecvChannel for Receiver {
 }
 
 #[tokio::test(start_paused = true)]
-async fn helpers_check_delivery_limits_and_cancellation() {
+async fn helpers_check_delivery_limits_cancellation_and_bursts() {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         let (left, right) = pair(1024);
         testkit::roundtrip_both_directions(left, right).await;
@@ -82,6 +82,9 @@ async fn helpers_check_delivery_limits_and_cancellation() {
             matches!(error, SendError::TooLarge { max: 8 })
         })
         .await;
+
+        let (left, right) = pair(1024);
+        testkit::mutual_bursts_converge(left, right, 16).await;
     })
     .await
     .expect("conformance helpers must complete");
@@ -91,25 +94,55 @@ async fn helpers_check_delivery_limits_and_cancellation() {
 enum Fault {
     Intact,
     Corrupt,
+    Duplicate,
     Lose,
+    Reorder,
 }
 
 #[derive(Debug)]
 struct FaultyReceiver {
     inner: Receiver,
     fault: Fault,
+    saved: Option<Vec<u8>>,
 }
 
 impl RecvChannel for FaultyReceiver {
     type RecvError = RecvError;
     async fn recv(&mut self) -> Result<Vec<u8>, RecvError> {
-        let mut message = self.inner.recv().await?;
         match self.fault {
-            Fault::Intact => {}
-            Fault::Corrupt => message.push(0xff),
-            Fault::Lose => std::future::pending::<()>().await,
+            Fault::Intact => self.inner.recv().await,
+            Fault::Corrupt => {
+                let mut message = self.inner.recv().await?;
+                message.push(0xff);
+                Ok(message)
+            }
+            Fault::Duplicate => {
+                let message = self.inner.recv().await?;
+                if let Some(previous) = &self.saved {
+                    return Ok(previous.clone());
+                }
+                self.saved = Some(message.clone());
+                Ok(message)
+            }
+            Fault::Lose => {
+                self.inner.recv().await?;
+                std::future::pending().await
+            }
+            Fault::Reorder => {
+                if let Some(message) = self.saved.take() {
+                    return Ok(message);
+                }
+                let first = self.inner.recv().await?;
+                match self.inner.recv().await {
+                    Ok(second) => {
+                        self.saved = Some(first);
+                        Ok(second)
+                    }
+                    // Nothing follows the last message, so it goes out unswapped.
+                    Err(_) => Ok(first),
+                }
+            }
         }
-        Ok(message)
     }
 }
 
@@ -120,6 +153,7 @@ fn faulty(channel: BidirectionalChannel, fault: Fault) -> Duplex<Sender, FaultyR
         FaultyReceiver {
             inner: receiver,
             fault,
+            saved: None,
         },
     )
 }
@@ -139,6 +173,30 @@ async fn rejected(future: impl std::future::Future<Output = ()> + Send + 'static
             panic!("helper did not reject the backend within its deadline");
         }
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn bursts_reject_corruption_duplicates_and_loss() {
+    for fault in [Fault::Corrupt, Fault::Duplicate, Fault::Lose] {
+        let (left, right) = pair(1024);
+        rejected(testkit::mutual_bursts_converge(
+            faulty(left, fault),
+            faulty(right, fault),
+            300,
+        ))
+        .await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn bursts_accept_reordering_and_indices_beyond_one_byte() {
+    let (left, right) = pair(1024);
+    testkit::mutual_bursts_converge(
+        faulty(left, Fault::Reorder),
+        faulty(right, Fault::Reorder),
+        301,
+    )
+    .await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -322,6 +380,14 @@ async fn cancellation_accepts_a_backend_that_retains_a_partly_received_message()
         },
     )
     .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn bursts_accept_empty_and_single_message_exchanges() {
+    for burst in [0, 1] {
+        let (left, right) = pair(1024);
+        testkit::mutual_bursts_converge(left, right, burst).await;
+    }
 }
 
 #[tokio::test]
