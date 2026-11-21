@@ -1,4 +1,4 @@
-//! Effects, barriers and prerequisites for realizing one funded transaction.
+//! Effects and prerequisites for realizing one funded transaction.
 
 use super::{Action, identity};
 use bitcoin::OutPoint;
@@ -26,40 +26,18 @@ impl Path {
         let inputs: BTreeSet<_> = inputs.into_iter().collect();
         let mut changes: Vec<_> = changes.into_iter().collect();
         changes.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+
         let signatures: Vec<_> = inputs.iter().copied().map(Action::Sign).collect();
-        let allocations: Vec<_> = changes
-            .iter()
-            .cloned()
-            .map(Action::AllocateChange)
-            .collect();
+        let compositions: Vec<_> = changes.into_iter().map(Action::ComposeChange).collect();
+        let mut actions = BTreeMap::new();
 
-        let mut actions = BTreeMap::from([(Action::CloseInputs, vec![])]);
-
-        for allocation in &allocations {
-            actions.insert(allocation.clone(), vec![Action::CloseInputs]);
+        for composition in &compositions {
+            actions.insert(composition.clone(), vec![]);
         }
-
-        actions.insert(
-            Action::CloseOutputs,
-            allocations
-                .into_iter()
-                .chain([Action::CloseInputs])
-                .collect(),
-        );
-
         for sign in &signatures {
-            actions.insert(sign.clone(), vec![Action::CloseOutputs]);
+            actions.insert(sign.clone(), compositions.clone());
         }
-
-        actions.insert(
-            Action::Finalize,
-            signatures
-                .into_iter()
-                .chain([Action::CloseOutputs])
-                .collect(),
-        );
-        actions.insert(Action::Record, vec![Action::Finalize]);
-        actions.insert(Action::Publish, vec![Action::Record]);
+        actions.insert(Action::Publish, signatures);
 
         Self(actions)
     }
@@ -92,7 +70,7 @@ mod tests {
 
         assert_eq!(forward.0, reverse.0);
         assert!(forward.0.keys().all(|action| {
-            !matches!(action, Action::AllocateChange(id) if id.as_bytes().len() != 9)
+            !matches!(action, Action::ComposeChange(id) if id.as_bytes().len() != 9)
         }));
     }
 }

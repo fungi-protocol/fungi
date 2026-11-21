@@ -271,40 +271,29 @@ async fn a_late_signature_failure_preserves_the_first_failure() {
 }
 
 #[tokio::test]
-async fn only_finalization_can_complete_with_a_payment() {
+async fn only_signing_can_complete_with_a_payment() {
     let (mut state, io) = fixture();
-    let finalize = pending_action(&mut state, &io, Action::Finalize).await;
-    let payment = io.executor.execute(&finalize).await.unwrap();
-    assert!(matches!(
-        payment,
-        fungi_core::strategy::Update::Finalized(_)
-    ));
+    let publish = pending_action(&mut state, &io, Action::Publish).await;
+    let payment = state.transactions()[&publish.id().0]
+        .payment()
+        .unwrap()
+        .clone();
 
-    state.completed(finalize.id(), Ok(fungi_core::strategy::Update::Applied));
-    let tx = &state.transactions()[&finalize.id().0];
-    let error = fungi_core::strategy::Error("finalization did not return a transaction".into());
-    assert_eq!(tx.status(), &Status::Failed(error.clone()));
-    assert_eq!(
-        tx.operation_errors(),
-        &BTreeMap::from([(Action::Finalize, error)])
+    state.completed(
+        publish.id(),
+        Ok(fungi_core::strategy::Update::Complete(payment)),
     );
-    assert!(tx.payment().is_none());
-
-    let (mut state, io) = fixture();
-    let start = pending_action(&mut state, &io, Action::CloseInputs).await;
-    state.completed(start.id(), Ok(payment));
-    let tx = &state.transactions()[&start.id().0];
+    let tx = &state.transactions()[&publish.id().0];
     let error = fungi_core::strategy::Error("unexpected effect result".into());
     assert_eq!(tx.status(), &Status::Failed(error.clone()));
     assert_eq!(
         tx.operation_errors(),
-        &BTreeMap::from([(Action::CloseInputs, error)])
+        &BTreeMap::from([(Action::Publish, error)])
     );
-    assert!(tx.payment().is_none());
 }
 
 #[tokio::test]
-async fn constructs_and_finalizes_a_verified_payment() {
+async fn constructs_signs_and_retains_a_verified_payment() {
     let (mut state, mut io) = fixture();
     let request = next_request(&mut state, io.events.now);
     assert_eq!(
@@ -357,10 +346,14 @@ async fn constructs_and_finalizes_a_verified_payment() {
     )
     .await
     .unwrap();
-    let result = execute(&mut io, &request, Action::Finalize).await.unwrap();
-    assert!(
-        matches!(result, fungi_core::strategy::Update::Finalized(replay) if replay == *payment)
-    );
+    let result = execute(
+        &mut io,
+        &request,
+        Action::Sign(OutPoint::new(Txid::all_zeros(), 0)),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result, fungi_core::strategy::Update::Complete(replay) if replay == *payment));
     assert_eq!(
         io.executor
             .signers
@@ -376,12 +369,9 @@ async fn constructs_and_finalizes_a_verified_payment() {
 }
 
 #[tokio::test]
-async fn signing_and_finalization_require_their_predecessors() {
+async fn signing_requires_output_closure_and_a_known_input() {
     let (mut state, mut io) = fixture();
     let request = next_request(&mut state, io.events.now);
-    execute(&mut io, &request, Action::CloseInputs)
-        .await
-        .unwrap();
     assert_eq!(
         execute(
             &mut io,
@@ -391,14 +381,7 @@ async fn signing_and_finalization_require_their_predecessors() {
         .await
         .unwrap_err()
         .0,
-        "transaction has not been frozen and validated"
-    );
-    assert_eq!(
-        execute(&mut io, &request, Action::Finalize)
-            .await
-            .unwrap_err()
-            .0,
-        "signatures are incomplete"
+        "output contributions are incomplete"
     );
     assert_eq!(
         execute(
@@ -567,7 +550,10 @@ async fn an_input_without_a_signer_cannot_be_finalized() {
 
     let tx = state.transactions().values().next().unwrap();
     assert!(matches!(tx.status(), Status::Failed(err) if err.0 == "no signer for input"));
-    assert!(tx.completed().contains(&Action::CloseOutputs));
+    assert!(
+        tx.completed()
+            .contains(&Action::ComposeChange(identity::change(0)))
+    );
     assert!(tx.payment().is_none());
 }
 
@@ -619,7 +605,7 @@ async fn signing_results_must_preserve_the_prevout_and_finalize_a_key_spend() {
 }
 
 #[tokio::test]
-async fn underestimated_input_weight_can_prevent_finalization() {
+async fn underestimated_input_weight_prevents_completion() {
     let (mut state, mut io) = fixture_with_pricing(false, 10_000, Weight::ZERO);
 
     assert_eq!(
@@ -633,10 +619,33 @@ async fn underestimated_input_weight_can_prevent_finalization() {
         Status::Failed(err) if err.0 == "signed transaction is below the requested feerate"
     ));
     assert!(
-        tx.completed()
+        !tx.completed()
             .contains(&Action::Sign(OutPoint::new(Txid::all_zeros(), 0)))
     );
     assert!(tx.payment().is_none());
+}
+
+#[tokio::test]
+async fn failed_completion_retries_the_existing_signature() {
+    let (mut state, io) = fixture_with_pricing(false, 10_000, Weight::ZERO);
+    let outpoint = OutPoint::new(Txid::all_zeros(), 0);
+    let sign = pending_action(&mut state, &io, Action::Sign(outpoint)).await;
+
+    let error = io.executor.execute(&sign).await.unwrap_err();
+    assert_eq!(error.0, "signed transaction is below the requested feerate");
+    let retry = io.executor.execute(&sign).await.unwrap_err();
+    assert_eq!(retry, error);
+    assert_eq!(
+        io.executor
+            .signers
+            .get(&outpoint)
+            .unwrap()
+            .lock()
+            .await
+            .requests()
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -773,11 +782,10 @@ async fn constructs_signs_retains_publishes_and_observes_the_payment() {
     execute(
         &mut io,
         &request,
-        Action::AllocateChange(identity::change(0)),
+        Action::ComposeChange(identity::change(0)),
     )
     .await
     .unwrap();
-    execute(&mut io, &request, Action::Record).await.unwrap();
     execute(&mut io, &request, Action::Publish).await.unwrap();
     assert_eq!(io.executor.recorder.lock().await.requests().len(), 1);
     assert_eq!(io.executor.change.lock().await.requests(), 1);
@@ -806,8 +814,9 @@ async fn a_recording_failure_prevents_publication() {
             .next()
             .unwrap()
             .completed()
-            .contains(&Action::Record)
+            .contains(&Action::Sign(OutPoint::new(Txid::all_zeros(), 0)))
     );
+    assert_eq!(io.executor.recorder.lock().await.requests().len(), 1);
 }
 
 #[tokio::test]
@@ -834,6 +843,46 @@ async fn failed_broadcast_retains_the_transaction_without_fulfilling_the_intents
             .completed()
             .contains(&Action::Publish)
     );
+}
+
+#[tokio::test]
+async fn concluding_without_eager_publication_still_retains_the_payment() {
+    let (state, mut io) = fixture();
+    let mut state = state.without_eager_publishing();
+
+    assert_eq!(
+        run_scripted(&mut state, &mut io, Request::id).await,
+        Stopped::Closed
+    );
+
+    let tx = state.transactions().values().next().unwrap();
+    assert_eq!(tx.status(), &Status::AwaitingConfirmation);
+    assert!(!tx.completed().contains(&Action::Publish));
+    let payment = tx.payment().unwrap();
+    assert_eq!(
+        io.executor.recorder.lock().await.recorded(),
+        std::slice::from_ref(&payment.transaction)
+    );
+    assert!(io.executor.broadcaster.lock().await.published.is_empty());
+    assert!(
+        state
+            .snapshot()
+            .recorded
+            .contains_key(&payment.transaction.compute_txid())
+    );
+    assert_eq!(state.pending().iter().count(), 2);
+
+    let txid = payment.transaction.compute_txid();
+    io.events
+        .inbox
+        .lock()
+        .unwrap()
+        .push_back(Observation::Confirmed(txid));
+    assert_eq!(
+        run_scripted(&mut state, &mut io, Request::id).await,
+        Stopped::Closed
+    );
+    assert!(state.pending().iter().count() == 0);
 }
 
 #[tokio::test]
@@ -1030,19 +1079,9 @@ async fn a_late_failure_preserves_the_invalidation_reason() {
     assert!(state.operations().next().is_none());
 }
 #[tokio::test]
-async fn publication_requires_recording() {
+async fn publication_requires_a_complete_retained_transaction() {
     let (mut state, mut io) = fixture();
     let request = next_request(&mut state, io.events.now);
-    execute(&mut io, &request, Action::CloseInputs)
-        .await
-        .unwrap();
-    assert_eq!(
-        execute(&mut io, &request, Action::Record)
-            .await
-            .unwrap_err()
-            .0,
-        "transaction is not finalized"
-    );
     assert_eq!(
         execute(&mut io, &request, Action::Publish)
             .await
@@ -1099,17 +1138,21 @@ async fn confirmation_recovers_a_failed_broadcast() {
 }
 
 #[tokio::test]
-async fn recording_completed_after_invalidation_still_retains_the_payment() {
+async fn completion_after_invalidation_still_retains_the_payment() {
     let (mut state, io) = fixture();
-    let record = pending_action(&mut state, &io, Action::Record).await;
-    let tx = &state.transactions()[&record.id().0];
-    let txid = tx.payment().unwrap().transaction.compute_txid();
+    let sign = pending_action(
+        &mut state,
+        &io,
+        Action::Sign(OutPoint::new(Txid::all_zeros(), 0)),
+    )
+    .await;
+    let result = io.executor.execute(&sign).await;
 
     state.observe(Observation::Invalidated("coin spent elsewhere".into()));
-    let result = io.executor.execute(&record).await;
-    state.completed(record.id(), result);
+    state.completed(sign.id(), result);
 
-    let tx = &state.transactions()[&record.id().0];
+    let tx = &state.transactions()[&sign.id().0];
+    let txid = tx.payment().unwrap().transaction.compute_txid();
     assert!(matches!(tx.status(), Status::Failed(err) if err.0 == "coin spent elsewhere"));
     assert!(state.snapshot().recorded.contains_key(&txid));
     assert!(state.operations().next().is_none());

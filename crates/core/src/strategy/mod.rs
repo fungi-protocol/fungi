@@ -18,32 +18,45 @@
 //!
 //! # Construction state machine
 //!
-//! Unilateral construction is the semi-honest machine with one participant and
-//! no transport. The agreed contribution and witness sets are therefore the
-//! local sets, and readiness barriers complete without peer messages.
+//! Construction moves through inputs, outputs and signatures. A phase closes
+//! when every participant is done over the same registered contribution set.
+//! Closure is a predicate over observed session state, not an action or a
+//! separate event. Withholding a done declaration is not an action either.
+//!
+//! This PoC has one participant and no transport. Planned inputs and payment
+//! outputs enter the local set when execution starts; `ComposeChange` adds each
+//! change output. These loopback contributions preserve the same vocabulary
+//! without network messages. Output closure follows when every planned change
+//! has a receipt, and signature completeness follows when every input has a
+//! witness.
 //!
 //! ```text
-//! CloseInputs                       materialize and freeze the planned inputs
-//!   ├─ AllocateChange(change_id)    derive each change script
-//!   └─ CloseOutputs                 add payments and change, order and freeze
-//!        ├─ Sign(outpoint)          collect each local witness
-//!        └─ Finalize                join witnesses to the transaction
-//!             └─ Record
-//!                  └─ Publish
+//! ComposeChange(change_id)* ──(all planned outputs present)──▶ Sign(outpoint)*
+//!                                                               │
+//!                                    (all input witnesses present)
+//!                                                               │
+//!                                                               ▼
+//!                                                     retain ──▶ Publish?
 //! ```
 //!
-//! `AllocateChange`, signing, recording and publication have external effects.
-//! The close and finalization actions are barriers. Pure restatements of the
-//! candidate, such as registering a planned input or payment output, are not
-//! actions.
+//! Change amounts are already determined by the candidate. `ComposeChange`
+//! asks the wallet for a script and attaches it to the priced output. The
+//! script is retained by the change contribution's `UniqueId`, including when
+//! validation fails, so a retry cannot generate a different address.
 //!
 //! Inputs, signatures and witnesses are identified by outpoint. Outputs and
-//! change allocations use stable contribution identities. Numeric positions
-//! are derived only for sighash calculation and final serialization.
+//! change scripts use stable contribution identities. Numeric positions are
+//! derived only for sighash calculation and final serialization.
 //!
-//! `CloseOutputs` freezes an unsigned transaction and its prevouts. Witnesses
-//! accumulate separately by outpoint and join the transaction only at
-//! finalization. Signing never mutates the frozen template.
+//! The executor retains one unordered PSBT. Ordering and fee validation are
+//! derived on demand for signing and assembly. Witnesses remain beside the
+//! PSBT, keyed by outpoint, and join a derived copy only when assembling the
+//! complete transaction. There is no persistent frozen transaction state.
+//!
+//! Completing the signature set durably retains the transaction before its
+//! receipt is returned. `Publish` is a separate effect enabled by that complete
+//! set; driver policy may conclude without eagerly publishing. Retention still
+//! occurs in that case. There are no close, finalization or recording actions.
 //!
 //! The current executor interprets one fixed candidate. The planner does not
 //! yet retain a committed action sequence or revise a plan from peer input.
@@ -99,12 +112,8 @@ fn fresh_session_id_from<R: TryCryptoRng>(rng: &mut R) -> Result<[u8; 16], Error
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
-    CloseInputs,
-    AllocateChange(UniqueId),
-    CloseOutputs,
+    ComposeChange(UniqueId),
     Sign(OutPoint),
-    Finalize,
-    Record,
     Publish,
 }
 
@@ -118,20 +127,16 @@ impl Ord for Action {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         fn rank(action: &Action) -> u8 {
             match action {
-                Action::CloseInputs => 0,
-                Action::AllocateChange(_) => 1,
-                Action::CloseOutputs => 2,
-                Action::Sign(_) => 3,
-                Action::Finalize => 4,
-                Action::Record => 5,
-                Action::Publish => 6,
+                Action::ComposeChange(_) => 0,
+                Action::Sign(_) => 1,
+                Action::Publish => 2,
             }
         }
 
         rank(self)
             .cmp(&rank(other))
             .then_with(|| match (self, other) {
-                (Action::AllocateChange(left), Action::AllocateChange(right)) => {
+                (Action::ComposeChange(left), Action::ComposeChange(right)) => {
                     left.as_bytes().cmp(right.as_bytes())
                 }
                 (Action::Sign(left), Action::Sign(right)) => left.cmp(right),
@@ -173,7 +178,7 @@ pub struct Payment {
 #[derive(Clone, Debug)]
 pub enum Update {
     Applied,
-    Finalized(Payment),
+    Complete(Payment),
 }
 
 #[derive(Clone)]
@@ -211,6 +216,7 @@ pub struct State<C, R, S> {
     grid: ScheduleGrid,
     batches: Vec<BTreeSet<u64>>,
     planned: bool,
+    eager_publishing: bool,
     transactions: BTreeMap<ExecutionId, Transaction>,
     planning_errors: BTreeMap<ExecutionId, Error>,
 }
@@ -241,6 +247,7 @@ impl<C: ChangeCosts, R: CryptoRng, S: TryCryptoRng> State<C, R, S> {
             grid,
             batches,
             planned: false,
+            eager_publishing: true,
             transactions: BTreeMap::new(),
             planning_errors: BTreeMap::new(),
         }
@@ -271,6 +278,12 @@ impl<C: ChangeCosts, R: CryptoRng, S: TryCryptoRng> State<C, R, S> {
         }
         self.batches = allocation;
         Ok(self)
+    }
+
+    /// Retain complete transactions without eagerly broadcasting them.
+    pub fn without_eager_publishing(mut self) -> Self {
+        self.eager_publishing = false;
+        self
     }
 
     pub fn pending(&self) -> &InMemoryQueue {
@@ -316,13 +329,16 @@ impl<C: ChangeCosts, R: CryptoRng, S: TryCryptoRng> State<C, R, S> {
                     };
                     transactions.insert(
                         execution_id,
-                        Transaction::new(Arc::new(ExecutionContext {
-                            execution_id,
-                            candidate,
-                            snapshot: self.snapshot.clone(),
-                            feerate: self.feerate,
-                            session_id,
-                        })),
+                        Transaction::new(
+                            Arc::new(ExecutionContext {
+                                execution_id,
+                                candidate,
+                                snapshot: self.snapshot.clone(),
+                                feerate: self.feerate,
+                                session_id,
+                            }),
+                            self.eager_publishing,
+                        ),
                     );
                 }
                 Ok(None) => {}
@@ -478,8 +494,7 @@ impl<C: ChangeCosts, R: CryptoRng, S: TryCryptoRng> Machine for State<C, R, S> {
     fn completed(&mut self, id: OperationId, result: Self::Result) {
         if let Some(tx) = self.transactions.get_mut(&id.0) {
             tx.completed_operation(id, result);
-            if tx.completed().contains(&Action::Record) {
-                let payment = tx.payment().expect("recorded payment is finalized");
+            if let Some(payment) = tx.payment() {
                 self.snapshot.recorded.insert(
                     payment.transaction.compute_txid(),
                     payment.transaction.clone(),

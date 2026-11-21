@@ -15,18 +15,20 @@ pub struct Transaction {
     path: Path,
     status: Status,
     payment: Option<Payment>,
+    eager_publishing: bool,
     completed: BTreeSet<Action>,
     operation_errors: BTreeMap<Action, Error>,
     pending: BTreeMap<Action, Request>,
 }
 
 impl Transaction {
-    pub(super) fn new(context: Arc<ExecutionContext>) -> Self {
+    pub(super) fn new(context: Arc<ExecutionContext>, eager_publishing: bool) -> Self {
         Self {
             path: Path::new(&context.candidate),
             context,
             status: Status::Running,
             payment: None,
+            eager_publishing,
             completed: BTreeSet::new(),
             operation_errors: BTreeMap::new(),
             pending: BTreeMap::new(),
@@ -59,6 +61,7 @@ impl Transaction {
             .actions()
             .filter(|action| {
                 self.status == Status::Running
+                    && (self.eager_publishing || **action != Action::Publish)
                     && !self.pending.contains_key(action)
                     && self.path.enabled(action, &self.completed)
             })
@@ -97,14 +100,14 @@ impl Transaction {
         };
         let action = request.action;
         let result = match (&action, result) {
-            (Action::Finalize, Ok(Update::Finalized(payment))) => {
+            (Action::Sign(_), Ok(Update::Complete(payment))) => {
                 self.payment = Some(payment);
+                if !self.eager_publishing && self.status == Status::Running {
+                    self.status = Status::AwaitingConfirmation;
+                }
                 Ok(())
             }
-            (Action::Finalize, Ok(Update::Applied)) => {
-                Err(error("finalization did not return a transaction"))
-            }
-            (_, Ok(Update::Finalized(_))) => Err(error("unexpected effect result")),
+            (_, Ok(Update::Complete(_))) => Err(error("unexpected effect result")),
             (_, Ok(Update::Applied)) => Ok(()),
             (_, Err(err)) => Err(err),
         };

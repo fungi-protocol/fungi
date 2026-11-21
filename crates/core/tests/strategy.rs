@@ -123,7 +123,10 @@ fn schedule(decision: Decision<Request>) -> Option<Scheduled<Request>> {
 fn scheduled(state: &mut Wallet, now: Instant) -> Request {
     let scheduled = schedule(state.decide(now)).expect("expected a funded candidate");
     assert!(scheduled.at > now);
-    assert_eq!(scheduled.action.action, Action::CloseInputs);
+    assert_eq!(
+        scheduled.action.action,
+        Action::ComposeChange(identity::change(0))
+    );
     scheduled.action
 }
 
@@ -275,7 +278,7 @@ async fn a_bound_execution_rejects_another_plan_but_accepts_its_replay() {
     );
     let reevaluated = scheduled(&mut state, now);
     io.execute(&reevaluated).await.unwrap();
-    assert_eq!(io.change.lock().await.requests(), 0);
+    assert_eq!(io.change.lock().await.requests(), 1);
     assert!(
         io.signers
             .get(&OutPoint::new(Txid::all_zeros(), 1))
@@ -309,7 +312,10 @@ async fn the_driver_starts_the_planned_transaction_at_readiness() {
     assert_eq!(io.events.0, ready_at);
     let tx = &state.transactions()[&request.id().0];
     assert_eq!(tx.status(), &Status::AwaitingConfirmation);
-    assert!(tx.completed().contains(&Action::CloseInputs));
+    assert!(
+        tx.completed()
+            .contains(&Action::ComposeChange(identity::change(0)))
+    );
     assert!(tx.pending().next().is_none());
     assert_eq!(state.pending().iter().count(), 1);
     assert_eq!(
@@ -351,7 +357,7 @@ fn only_this_plans_pending_request_accepts_a_completion() {
     assert!(
         state.transactions()[&start.id().0]
             .completed()
-            .contains(&Action::CloseInputs)
+            .contains(&Action::ComposeChange(identity::change(0)))
     );
 }
 
@@ -378,7 +384,7 @@ async fn a_failed_start_stops_the_candidates_actions() {
     assert_eq!(tx.status(), &Status::Failed(failure.clone()));
     assert_eq!(
         tx.operation_errors(),
-        &BTreeMap::from([(Action::CloseInputs, failure)])
+        &BTreeMap::from([(Action::ComposeChange(identity::change(0)), failure)])
     );
     assert!(tx.completed().is_empty());
     state.apply(start);
@@ -403,36 +409,27 @@ fn the_decision_rejects_a_different_plan_for_the_same_execution() {
 }
 
 #[tokio::test]
-async fn a_non_close_inputs_request_cannot_bind_an_execution() {
-    let now = Instant::now();
-    let mut request = scheduled(&mut fixture(now, 1, true, true), now);
-    request.action = Action::AllocateChange(identity::change(0));
-    let io = executor();
-    assert_eq!(
-        io.execute(&request).await.unwrap_err().0,
-        "transaction construction has not started"
-    );
-    let other = scheduled(&mut fixture(now, 1, true, true), now);
-    io.execute(&other).await.unwrap();
-}
-
-#[tokio::test]
-async fn close_inputs_materializes_the_candidate_inputs() {
+async fn signing_requires_all_planned_change_contributions() {
     let now = Instant::now();
     let mut request = scheduled(&mut fixture(now, 1, true, true), now);
     let io = executor();
-    io.execute(&request).await.unwrap();
-    request.action = Action::CloseOutputs;
+    request.action = Action::Sign(OutPoint::new(Txid::all_zeros(), 1));
     assert_eq!(
         io.execute(&request).await.unwrap_err().0,
         "output contributions are incomplete"
     );
-    request.action = Action::CloseInputs;
+
+    request.action = Action::ComposeChange(identity::change(0));
     io.execute(&request).await.unwrap();
+    request.action = Action::Sign(OutPoint::new(Txid::all_zeros(), 1));
+    assert!(matches!(
+        io.execute(&request).await.unwrap(),
+        Update::Complete(_)
+    ));
 }
 
 #[tokio::test]
-async fn the_driver_materializes_and_closes_the_candidate_inputs() {
+async fn the_driver_composes_the_planned_contributions() {
     let now = Instant::now();
     let mut state = fixture(now, 1, true, true);
     let id = scheduled(&mut state, now).id().0;
@@ -448,7 +445,10 @@ async fn the_driver_materializes_and_closes_the_candidate_inputs() {
 
     let tx = &state.transactions()[&id];
     assert_eq!(tx.status(), &Status::AwaitingConfirmation);
-    assert!(tx.completed().contains(&Action::CloseInputs));
+    assert!(
+        tx.completed()
+            .contains(&Action::ComposeChange(identity::change(0)))
+    );
     assert!(tx.pending().next().is_none());
 }
 
@@ -475,11 +475,11 @@ async fn an_unsupported_prevout_cannot_be_contributed() {
 }
 
 #[test]
-fn the_decision_will_not_dispatch_an_allocation_before_close_inputs() {
+fn the_decision_rejects_signing_before_output_closure() {
     let now = Instant::now();
     let mut state = fixture(now, 1, true, true);
     let mut premature = scheduled(&mut state, now);
-    premature.action = Action::AllocateChange(identity::change(0));
+    premature.action = Action::Sign(OutPoint::new(Txid::all_zeros(), 1));
 
     state.apply(premature.clone());
 
@@ -505,19 +505,22 @@ async fn rejected_change_cannot_be_added_by_bypassing_the_decision_state() {
         Weight::from_wu(70),
         [Ok(ScriptBuf::new())],
     ));
-    run_action(&io, &start, Action::CloseInputs).await.unwrap();
-    let first = run_action(&io, &start, Action::AllocateChange(identity::change(0)))
+    let first = run_action(&io, &start, Action::ComposeChange(identity::change(0)))
         .await
         .unwrap_err();
-    assert_eq!(first.0, "allocated change differs from its priced template");
+    assert_eq!(first.0, "composed change differs from its priced template");
     assert_eq!(
-        run_action(&io, &start, Action::CloseOutputs)
-            .await
-            .unwrap_err()
-            .0,
+        run_action(
+            &io,
+            &start,
+            Action::Sign(OutPoint::new(Txid::all_zeros(), 1))
+        )
+        .await
+        .unwrap_err()
+        .0,
         "output contributions are incomplete"
     );
-    let replay = run_action(&io, &start, Action::AllocateChange(identity::change(0)))
+    let replay = run_action(&io, &start, Action::ComposeChange(identity::change(0)))
         .await
         .unwrap_err();
     assert_eq!(first, replay);
@@ -563,8 +566,9 @@ async fn concrete_change_scripts_do_not_change_candidate_cost_or_schedule() {
         let tx = &state.transactions()[&id];
         assert_eq!(tx.status(), &Status::AwaitingConfirmation);
         assert!(
-            tx.completed().contains(&Action::CloseOutputs),
-            "the allocated script must pass frozen output and accounting validation"
+            tx.completed()
+                .contains(&Action::ComposeChange(identity::change(0))),
+            "the assigned script must pass output and accounting validation"
         );
         assert_eq!(io.executor.change.lock().await.requests(), 1);
         assert!(
@@ -581,44 +585,37 @@ async fn concrete_change_scripts_do_not_change_candidate_cost_or_schedule() {
 }
 
 #[tokio::test]
-async fn outputs_require_closed_inputs_and_all_contributions_before_freezing() {
+async fn ordering_requires_every_change_contribution() {
     let now = Instant::now();
     let start = scheduled(&mut fixture(now, 1, true, true), now);
     let io = executor();
+    let sign = Action::Sign(OutPoint::new(Txid::all_zeros(), 1));
+
     assert_eq!(
-        run_action(&io, &start, Action::AllocateChange(identity::change(0)))
-            .await
-            .unwrap_err()
-            .0,
-        "transaction construction has not started"
-    );
-    run_action(&io, &start, Action::CloseInputs).await.unwrap();
-    assert_eq!(
-        run_action(&io, &start, Action::CloseOutputs)
-            .await
-            .unwrap_err()
-            .0,
+        run_action(&io, &start, sign.clone()).await.unwrap_err().0,
         "output contributions are incomplete"
     );
     assert_eq!(
-        run_action(&io, &start, Action::AllocateChange(identity::change(1)))
+        run_action(&io, &start, Action::ComposeChange(identity::change(1)))
             .await
             .unwrap_err()
             .0,
         "unknown change"
     );
-    for action in [
-        Action::AllocateChange(identity::change(0)),
-        Action::CloseOutputs,
-    ] {
-        run_action(&io, &start, action).await.unwrap();
-    }
+
+    run_action(&io, &start, Action::ComposeChange(identity::change(0)))
+        .await
+        .unwrap();
+    assert!(matches!(
+        run_action(&io, &start, sign).await.unwrap(),
+        Update::Complete(_)
+    ));
     assert_eq!(
-        run_action(&io, &start, Action::AllocateChange(identity::change(1)))
+        run_action(&io, &start, Action::ComposeChange(identity::change(1)))
             .await
             .unwrap_err()
             .0,
-        "transaction is frozen"
+        "unknown change"
     );
 }
 
@@ -629,22 +626,19 @@ async fn completed_effects_belong_to_their_transaction() {
     let second = scheduled(&mut fixture(now, 2, true, true), now);
     let io = executor();
     for request in [&first, &second] {
-        for action in [
-            Action::CloseInputs,
-            Action::AllocateChange(identity::change(0)),
-        ] {
-            run_action(&io, request, action).await.unwrap();
-        }
+        run_action(&io, request, Action::ComposeChange(identity::change(0)))
+            .await
+            .unwrap();
     }
     assert_eq!(io.change.lock().await.requests(), 2);
-    run_action(&io, &first, Action::AllocateChange(identity::change(0)))
+    run_action(&io, &first, Action::ComposeChange(identity::change(0)))
         .await
         .unwrap();
     assert_eq!(io.change.lock().await.requests(), 2);
 }
 
 #[tokio::test]
-async fn an_allocation_error_prevents_output_freezing() {
+async fn a_change_script_error_prevents_signing() {
     let now = Instant::now();
     let mut state = fixture(now, 1, true, true);
     let id = scheduled(&mut state, now).id().0;
@@ -665,7 +659,7 @@ async fn an_allocation_error_prevents_output_freezing() {
 
     let tx = &state.transactions()[&id];
     assert!(matches!(tx.status(), Status::Failed(err) if err.0 == "change source failed"));
-    assert!(!tx.completed().contains(&Action::CloseOutputs));
+    assert!(tx.completed().is_empty());
     assert!(tx.pending().next().is_none());
 }
 
@@ -717,7 +711,7 @@ async fn a_busy_signer_does_not_block_another_inputs_signer() {
                 ready: None,
             },
         ],
-        dummy::Recorder::new([]),
+        dummy::Recorder::new([Ok(()), Ok(())]),
         AcceptBroadcast,
     )
     .unwrap();
@@ -725,14 +719,8 @@ async fn a_busy_signer_does_not_block_another_inputs_signer() {
         (&mut first, OutPoint::new(Txid::all_zeros(), 1)),
         (&mut second, OutPoint::new(Txid::all_zeros(), 2)),
     ] {
-        for action in [
-            Action::CloseInputs,
-            Action::AllocateChange(identity::change(0)),
-            Action::CloseOutputs,
-        ] {
-            request.action = action;
-            io.execute(request).await.unwrap();
-        }
+        request.action = Action::ComposeChange(identity::change(0));
+        io.execute(request).await.unwrap();
         request.action = Action::Sign(outpoint);
     }
     let first_sign = io.execute(&first);
@@ -842,7 +830,7 @@ fn joint_outcome_readiness_uses_all_batches_without_reserving_wallet_coins() {
 }
 
 #[test]
-fn actions_after_close_inputs_inherit_the_complete_outcomes_readiness() {
+fn all_actions_inherit_the_complete_outcomes_readiness() {
     let now = Instant::now();
     let grid = ScheduleGrid::new(now);
     let mut state = split_fixture(now, true)
@@ -850,18 +838,24 @@ fn actions_after_close_inputs_inherit_the_complete_outcomes_readiness() {
         .unwrap();
     let start = schedule(state.decide(now)).unwrap();
     let execution = start.action.id().0;
-    assert_eq!(start.action.action, Action::CloseInputs);
+    assert_eq!(
+        start.action.action,
+        Action::ComposeChange(identity::change(0))
+    );
     let candidate = state.transactions()[&execution].candidate();
     assert!(candidate.ready_at(start.at, grid).unwrap() > start.at);
 
     state.apply(start.action);
-    state.completed((execution, Action::CloseInputs), Ok(Update::Applied));
+    state.completed(
+        (execution, Action::ComposeChange(identity::change(0))),
+        Ok(Update::Applied),
+    );
 
     let next = schedule(state.decide(start.at)).unwrap();
     assert_eq!(next.at, start.at);
     assert_eq!(
         next.action.id(),
-        (execution, Action::AllocateChange(identity::change(0)))
+        (execution, Action::Sign(OutPoint::new(Txid::all_zeros(), 2)))
     );
 }
 

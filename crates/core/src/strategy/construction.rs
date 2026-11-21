@@ -20,30 +20,10 @@ use std::{collections::BTreeMap, sync::Arc};
 type Inputs = Constructor<BothModifiable, Seeded<ExplicitKeysForbidden>>;
 type Outputs = Constructor<OutputsModifiable, Seeded<ExplicitKeysForbidden>>;
 
-enum Construction {
-    Active(psbt_v2::v2::Psbt),
-    Frozen(Frozen),
-}
-
-struct Frozen {
-    psbt: Psbt,
-    outputs: BTreeMap<u64, usize>,
-    fee: Amount,
-}
-
-impl Construction {
-    fn frozen(&mut self) -> Result<&mut Frozen, Error> {
-        match self {
-            Self::Frozen(frozen) => Ok(frozen),
-            Self::Active(_) => Err(error("transaction has not been frozen and validated")),
-        }
-    }
-}
-
 pub(super) enum Effect {
     Complete(Update),
-    AllocateChange {
-        index: usize,
+    ComposeChange {
+        id: UniqueId,
         priced: OutputWithoutScriptpubkey,
     },
     Sign {
@@ -51,15 +31,16 @@ pub(super) enum Effect {
         outpoint: OutPoint,
         psbt: Psbt,
     },
-    Record(bitcoin::Transaction),
     Publish(bitcoin::Transaction),
 }
 
 pub(super) struct Execution {
     pub(super) context: Arc<ExecutionContext>,
-    construction: Construction,
-    scripts: BTreeMap<usize, ScriptBuf>,
+    psbt: psbt_v2::v2::Psbt,
+    scripts: BTreeMap<Vec<u8>, ScriptBuf>,
+    witnesses: BTreeMap<OutPoint, psbt::Input>,
     results: BTreeMap<Action, Update>,
+    pub(super) retained: bool,
     pub(super) locks: BTreeMap<Action, Arc<Mutex<()>>>,
 }
 
@@ -97,13 +78,39 @@ impl Execution {
                 value,
             );
         }
-        Inputs::try_from_psbt(initial.clone()).map_err(error)?;
+
+        let mut inputs = Inputs::try_from_psbt(initial).map_err(error)?;
+        for coin in context.candidate.inputs() {
+            let prevout = priced_prevout(&context.snapshot, coin)?;
+            if !prevout.txout.script_pubkey.is_p2tr() {
+                return Err(error("PoC signer path only supports P2TR key spends"));
+            }
+
+            let mut input = Input::new(&coin.outpoint());
+            input.set_witness_utxo(Some(prevout.txout.clone()));
+            input.set_sequence(Some(Sequence::ENABLE_LOCKTIME_NO_RBF));
+            inputs = inputs.input(input).map_err(error)?;
+        }
+
+        let mut outputs = inputs.no_more_inputs();
+        for (&intent, output) in context.candidate.payments() {
+            outputs = outputs
+                .output(Output::new(
+                    identity::payment(intent),
+                    output.value,
+                    output.script_pubkey.clone(),
+                ))
+                .map_err(error)?;
+        }
+
         Ok(Self {
             context,
-            construction: Construction::Active(initial),
+            psbt: outputs.into_inner().into_psbt(),
             scripts: BTreeMap::new(),
+            witnesses: BTreeMap::new(),
             locks: BTreeMap::new(),
             results: BTreeMap::new(),
+            retained: false,
         })
     }
 
@@ -111,83 +118,25 @@ impl Execution {
         if let Some(result) = self.results.get(action) {
             return Ok(Effect::Complete(result.clone()));
         }
+
         match action.clone() {
-            Action::CloseInputs => {
-                let mut constructor =
-                    Inputs::try_from_psbt(self.active()?.clone()).map_err(error)?;
-                for coin in self.context.candidate.inputs() {
-                    let prevout = priced_prevout(&self.context.snapshot, coin)?;
-                    if !prevout.txout.script_pubkey.is_p2tr() {
-                        return Err(error("PoC signer path only supports P2TR key spends"));
-                    }
-                    let mut input = Input::new(&coin.outpoint());
-                    input.set_witness_utxo(Some(prevout.txout.clone()));
-                    input.set_sequence(Some(Sequence::ENABLE_LOCKTIME_NO_RBF));
-                    constructor = constructor.input(input).map_err(error)?;
-                }
-                self.construction =
-                    Construction::Active(constructor.no_more_inputs().into_inner().into_psbt());
-            }
-            Action::AllocateChange(id) => {
-                self.outputs()?;
-                let (index, priced) = self
+            Action::ComposeChange(id) => {
+                let priced = self
                     .context
                     .candidate
                     .change()
                     .enumerate()
                     .find_map(|(index, priced)| {
-                        (identity::change(index) == id).then(|| (index, priced.clone()))
+                        (identity::change(index) == id).then(|| priced.clone())
                     })
                     .ok_or_else(|| error("unknown change"))?;
-                if let Some(script) = self.scripts.get(&index) {
+
+                if let Some(script) = self.scripts.get(id.as_bytes()).cloned() {
                     return self
-                        .complete_change(index, &priced, script.clone())
+                        .complete_change(id, &priced, script)
                         .map(Effect::Complete);
                 }
-                return Ok(Effect::AllocateChange { index, priced });
-            }
-            Action::CloseOutputs => {
-                if self
-                    .context
-                    .candidate
-                    .change()
-                    .enumerate()
-                    .any(|(index, _)| {
-                        !self
-                            .results
-                            .contains_key(&Action::AllocateChange(identity::change(index)))
-                    })
-                {
-                    return Err(error("output contributions are incomplete"));
-                }
-                let mut constructor = self.outputs()?;
-                let count = self.context.candidate.payments().count()
-                    + self.context.candidate.change().count();
-                for index in 0..count {
-                    let (id, output) = self.output(index)?;
-                    constructor = constructor
-                        .output(Output::new(id, output.value, output.script_pubkey))
-                        .map_err(error)?;
-                }
-                let ordered = constructor.no_more_outputs().into_ordered_psbt();
-                let tx = psbt_v2::v2::Signer::new(ordered.clone())
-                    .map_err(error)?
-                    .unsigned_tx();
-                let mut psbt = Psbt::from_unsigned_tx(tx).map_err(error)?;
-                // This bridge only handles the metadata this executor constructs.
-                // External/general PSBT conversion must preserve additional fields.
-                for (to, from) in psbt.inputs.iter_mut().zip(&ordered.inputs) {
-                    to.witness_utxo = from.witness_utxo.clone();
-                }
-                let mut outputs = BTreeMap::new();
-                for (index, output) in ordered.outputs.iter().enumerate() {
-                    let output = Output::try_from(output.clone()).map_err(error)?;
-                    if let Some(intent) = payment_id(output.unique_id().as_bytes())? {
-                        outputs.insert(intent, index);
-                    }
-                }
-                let fee = self.validate(&psbt)?;
-                self.construction = Construction::Frozen(Frozen { psbt, outputs, fee });
+                Ok(Effect::ComposeChange { id, priced })
             }
             Action::Sign(outpoint) => {
                 if !self
@@ -198,65 +147,52 @@ impl Execution {
                 {
                     return Err(error("unknown input"));
                 }
-                let psbt = &self.construction.frozen()?.psbt;
+
+                if self.witnesses.contains_key(&outpoint) {
+                    return self.signature_update(outpoint).map(Effect::Complete);
+                }
+
+                let (psbt, _, _) = self.ordered()?;
                 let position = psbt
                     .unsigned_tx
                     .input
                     .iter()
                     .position(|input| input.previous_output == outpoint)
-                    .expect("freezing verified the selected inputs");
-                return Ok(Effect::Sign {
+                    .expect("ordering verified the selected inputs");
+                Ok(Effect::Sign {
                     position,
                     outpoint,
-                    psbt: psbt.clone(),
-                });
-            }
-            Action::Finalize => {
-                if self
-                    .context
-                    .candidate
-                    .inputs()
-                    .any(|coin| !self.results.contains_key(&Action::Sign(coin.outpoint())))
-                {
-                    return Err(error("signatures are incomplete"));
-                }
-                let Frozen { psbt, outputs, fee } = self.construction.frozen()?;
-                let transaction = psbt.clone().extract_tx().map_err(error)?;
-                signing::validate_feerate(*fee, transaction.weight(), self.context.feerate)?;
-                let result = Update::Finalized(Payment {
-                    transaction,
-                    outputs: outputs.clone(),
-                    fee: *fee,
-                });
-                self.results.insert(Action::Finalize, result.clone());
-                return Ok(Effect::Complete(result));
-            }
-            Action::Record => {
-                return Ok(Effect::Record(self.finalized_transaction()?.clone()));
+                    psbt,
+                })
             }
             Action::Publish => {
-                if !self.results.contains_key(&Action::Record) {
+                if !self.retained {
                     return Err(error("transaction has not been retained"));
                 }
-                return Ok(Effect::Publish(self.finalized_transaction()?.clone()));
+                Ok(Effect::Publish(self.payment()?.transaction))
             }
         }
-        Ok(Effect::Complete(self.applied(action.clone())))
     }
 
     pub(super) fn complete_change(
         &mut self,
-        index: usize,
+        id: UniqueId,
         priced: &OutputWithoutScriptpubkey,
         script: ScriptBuf,
     ) -> Result<Update, Error> {
-        // Retain the allocation even if validation fails.
-        self.scripts.entry(index).or_insert(script);
-        validate::change(&self.change_output(index, priced), priced)?;
-        self.results.insert(
-            Action::AllocateChange(identity::change(index)),
-            Update::Applied,
-        );
+        // A retry must reuse the script bound to this change contribution.
+        self.scripts.entry(id.as_bytes().to_vec()).or_insert(script);
+        validate::change(&self.change_output(&id, priced), priced)?;
+
+        let output = self.change_output(&id, priced);
+        let constructor = self.outputs()?;
+        self.psbt = constructor
+            .output(Output::new(id.clone(), output.value, output.script_pubkey))
+            .map_err(error)?
+            .into_inner()
+            .into_psbt();
+        self.results
+            .insert(Action::ComposeChange(id), Update::Applied);
         Ok(Update::Applied)
     }
 
@@ -266,11 +202,13 @@ impl Execution {
         position: usize,
         signed: psbt::Input,
     ) -> Result<Update, Error> {
-        let snapshot = &self.context.snapshot;
-        let psbt = &mut self.construction.frozen()?.psbt;
-        signing::apply(psbt, snapshot, position, signed)?;
-        self.results.insert(Action::Sign(outpoint), Update::Applied);
-        Ok(Update::Applied)
+        let (mut psbt, _, _) = self.ordered()?;
+        if psbt.unsigned_tx.input[position].previous_output != outpoint {
+            return Err(error("signed input position does not match its outpoint"));
+        }
+        signing::apply(&mut psbt, &self.context.snapshot, position, signed.clone())?;
+        self.witnesses.insert(outpoint, signed);
+        self.signature_update(outpoint)
     }
 
     pub(super) fn applied(&mut self, action: Action) -> Update {
@@ -278,51 +216,91 @@ impl Execution {
         Update::Applied
     }
 
-    fn finalized_transaction(&self) -> Result<&bitcoin::Transaction, Error> {
-        match self.results.get(&Action::Finalize) {
-            Some(Update::Finalized(payment)) => Ok(&payment.transaction),
-            _ => Err(error("transaction is not finalized")),
-        }
+    pub(super) fn mark_retained(&mut self) {
+        self.retained = true;
     }
 
-    fn active(&self) -> Result<&psbt_v2::v2::Psbt, Error> {
-        match &self.construction {
-            Construction::Active(psbt) => Ok(psbt),
-            Construction::Frozen(_) => Err(error("transaction is frozen")),
+    fn signature_update(&mut self, outpoint: OutPoint) -> Result<Update, Error> {
+        let complete = self
+            .context
+            .candidate
+            .inputs()
+            .all(|coin| self.witnesses.contains_key(&coin.outpoint()));
+        let result = if complete {
+            Update::Complete(self.payment()?)
+        } else {
+            Update::Applied
+        };
+        self.results.insert(Action::Sign(outpoint), result.clone());
+        Ok(result)
+    }
+
+    fn payment(&self) -> Result<Payment, Error> {
+        let (mut psbt, outputs, fee) = self.ordered()?;
+        for (outpoint, signed) in &self.witnesses {
+            let position = psbt
+                .unsigned_tx
+                .input
+                .iter()
+                .position(|input| input.previous_output == *outpoint)
+                .ok_or_else(|| error("witness does not belong to an ordered input"))?;
+            signing::apply(&mut psbt, &self.context.snapshot, position, signed.clone())?;
         }
+
+        let transaction = psbt.extract_tx().map_err(error)?;
+        signing::validate_feerate(fee, transaction.weight(), self.context.feerate)?;
+        Ok(Payment {
+            transaction,
+            outputs,
+            fee,
+        })
     }
 
     fn outputs(&self) -> Result<Outputs, Error> {
-        Outputs::try_from_psbt(self.active()?.clone())
-            .map_err(|_| error("outputs are not modifiable"))
+        Outputs::try_from_psbt(self.psbt.clone()).map_err(|_| error("outputs are not modifiable"))
     }
 
-    fn output(&self, index: usize) -> Result<(UniqueId, TxOut), Error> {
-        let payments = self.context.candidate.payments().count();
-        if let Some((&id, output)) = self.context.candidate.payments().nth(index) {
-            return Ok((identity::payment(id), output.clone()));
-        }
-
-        let change = index - payments;
-        if !self
-            .results
-            .contains_key(&Action::AllocateChange(identity::change(change)))
-        {
-            return Err(error("change allocation has not succeeded"));
-        }
-        let priced = self
+    fn ordered(&self) -> Result<(Psbt, BTreeMap<u64, usize>, Amount), Error> {
+        if self
             .context
             .candidate
             .change()
-            .nth(change)
-            .expect("a successful allocation has priced change");
-        Ok((identity::change(change), self.change_output(change, priced)))
+            .enumerate()
+            .any(|(index, _)| {
+                !self
+                    .results
+                    .contains_key(&Action::ComposeChange(identity::change(index)))
+            })
+        {
+            return Err(error("output contributions are incomplete"));
+        }
+
+        let ordered = self.outputs()?.no_more_outputs().into_ordered_psbt();
+        let tx = psbt_v2::v2::Signer::new(ordered.clone())
+            .map_err(error)?
+            .unsigned_tx();
+        let mut psbt = Psbt::from_unsigned_tx(tx).map_err(error)?;
+        // This bridge only handles the metadata this executor constructs.
+        // External/general PSBT conversion must preserve additional fields.
+        for (to, from) in psbt.inputs.iter_mut().zip(&ordered.inputs) {
+            to.witness_utxo = from.witness_utxo.clone();
+        }
+
+        let mut outputs = BTreeMap::new();
+        for (index, output) in ordered.outputs.iter().enumerate() {
+            let output = Output::try_from(output.clone()).map_err(error)?;
+            if let Some(intent) = payment_id(output.unique_id().as_bytes())? {
+                outputs.insert(intent, index);
+            }
+        }
+        let fee = self.validate(&psbt)?;
+        Ok((psbt, outputs, fee))
     }
 
-    fn change_output(&self, index: usize, priced: &OutputWithoutScriptpubkey) -> TxOut {
+    fn change_output(&self, id: &UniqueId, priced: &OutputWithoutScriptpubkey) -> TxOut {
         TxOut {
             value: priced.value,
-            script_pubkey: self.scripts[&index].clone(),
+            script_pubkey: self.scripts[id.as_bytes()].clone(),
         }
     }
 
@@ -337,7 +315,7 @@ impl Execution {
                     .candidate
                     .change()
                     .enumerate()
-                    .map(|(index, priced)| self.change_output(index, priced)),
+                    .map(|(index, priced)| self.change_output(&identity::change(index), priced)),
             )
             .collect();
         let expected_inputs = self
@@ -440,37 +418,91 @@ mod prevout_tests {
         .unwrap()
     }
 
-    #[test]
-    fn output_guards_reject_unavailable_contributions() {
-        let mut execution = execution(Amount::from_sat(40_000));
-        assert_eq!(
-            execution
-                .prepare(&Action::AllocateChange(identity::change(0)))
-                .err()
-                .unwrap()
-                .0,
-            "outputs are not modifiable"
-        );
+    fn compose_change(execution: &mut Execution) {
+        let id = identity::change(0);
+        let priced = execution.context.candidate.change().next().unwrap().clone();
+        let script = execution
+            .context
+            .snapshot
+            .coins
+            .values()
+            .next()
+            .unwrap()
+            .txout
+            .script_pubkey
+            .clone();
+        execution.complete_change(id, &priced, script).unwrap();
+    }
 
-        execution.prepare(&Action::CloseInputs).unwrap();
-        let payments = execution.context.candidate.payments().count();
+    #[test]
+    fn ordering_requires_all_change_contributions() {
+        let execution = execution(Amount::from_sat(40_000));
         assert_eq!(execution.context.candidate.change().count(), 1);
         assert_eq!(
-            execution.output(payments).unwrap_err().0,
-            "change allocation has not succeeded"
+            execution.ordered().unwrap_err().0,
+            "output contributions are incomplete"
         );
     }
 
     #[test]
-    fn closing_outputs_rejects_an_altered_prevout() {
-        let mut execution = execution(Amount::from_sat(50_000));
-        execution.prepare(&Action::CloseInputs).unwrap();
-        let mut psbt = execution.active().unwrap().clone();
-        psbt.inputs[0].witness_utxo.as_mut().unwrap().value += Amount::ONE_SAT;
-        execution.construction = Construction::Active(psbt);
+    fn ordering_rejects_an_altered_prevout() {
+        let mut execution = execution(Amount::from_sat(40_000));
+        execution.psbt.inputs[0]
+            .witness_utxo
+            .as_mut()
+            .unwrap()
+            .value += Amount::ONE_SAT;
+        compose_change(&mut execution);
 
-        let error = execution.prepare(&Action::CloseOutputs).err().unwrap();
-        assert_eq!(error.0, "unexpected input data");
+        assert_eq!(execution.ordered().unwrap_err().0, "unexpected input data");
+    }
+
+    #[test]
+    fn signing_rejects_a_position_for_another_outpoint() {
+        let mut execution = execution(Amount::from_sat(40_000));
+        compose_change(&mut execution);
+        let another_outpoint = OutPoint {
+            vout: 1,
+            ..OutPoint::null()
+        };
+
+        assert_eq!(
+            execution
+                .complete_sign(another_outpoint, 0, psbt::Input::default())
+                .unwrap_err()
+                .0,
+            "signed input position does not match its outpoint"
+        );
+    }
+
+    #[test]
+    fn assembly_rejects_a_witness_for_another_outpoint() {
+        let mut execution = execution(Amount::from_sat(40_000));
+        compose_change(&mut execution);
+        execution.witnesses.insert(
+            OutPoint {
+                vout: 1,
+                ..OutPoint::null()
+            },
+            psbt::Input::default(),
+        );
+
+        assert_eq!(
+            execution.payment().unwrap_err().0,
+            "witness does not belong to an ordered input"
+        );
+    }
+
+    #[test]
+    fn ordering_requires_modifiable_outputs() {
+        let mut execution = execution(Amount::from_sat(40_000));
+        compose_change(&mut execution);
+        execution.psbt.global.tx_modifiable_flags &= !2;
+
+        assert_eq!(
+            execution.ordered().unwrap_err().0,
+            "outputs are not modifiable"
+        );
     }
 
     #[test]

@@ -50,7 +50,7 @@ impl<S: InputSigner> Signers<S> {
     }
 }
 
-/// Capabilities are independent of candidates; CloseInputs binds an execution.
+/// Capabilities are independent of candidates; execution binds their planned contributions.
 pub struct Executor<C, S, R, B> {
     pub change: Arc<Mutex<C>>,
     pub signers: Arc<Signers<S>>,
@@ -80,16 +80,11 @@ impl<C: ChangeSource, S: InputSigner, R: TransactionRecorder, B: Broadcaster> Ex
         let execution = {
             let mut transactions = self.transactions.lock().unwrap();
             match transactions.entry(request.context.execution_id) {
-                Entry::Vacant(entry) => {
-                    if request.action != Action::CloseInputs {
-                        return Err(error("transaction construction has not started"));
-                    }
-                    entry
-                        .insert(Arc::new(Mutex::new(Execution::new(
-                            request.context.clone(),
-                        )?)))
-                        .clone()
-                }
+                Entry::Vacant(entry) => entry
+                    .insert(Arc::new(Mutex::new(Execution::new(
+                        request.context.clone(),
+                    )?)))
+                    .clone(),
                 Entry::Occupied(entry) => entry.get().clone(),
             }
         };
@@ -108,15 +103,15 @@ impl<C: ChangeSource, S: InputSigner, R: TransactionRecorder, B: Broadcaster> Ex
         // release execution/capability state before awaiting external IO.
         let _operation = operation.lock().await;
         let effect = execution.lock().await.prepare(&request.action)?;
-        match effect {
-            Effect::Complete(update) => Ok(update),
-            Effect::AllocateChange { index, priced } => {
+        let update = match effect {
+            Effect::Complete(update) => update,
+            Effect::ComposeChange { id, priced } => {
                 let io = self.change.lock().await.next_script();
                 let script = io.await.map_err(error)?;
                 execution
                     .lock()
                     .await
-                    .complete_change(index, &priced, script)
+                    .complete_change(id, &priced, script)?
             }
             Effect::Sign {
                 position,
@@ -132,19 +127,23 @@ impl<C: ChangeSource, S: InputSigner, R: TransactionRecorder, B: Broadcaster> Ex
                 execution
                     .lock()
                     .await
-                    .complete_sign(outpoint, position, signed)
-            }
-            Effect::Record(transaction) => {
-                let io = self.recorder.lock().await.record(&transaction);
-                io.await.map_err(error)?;
-                Ok(execution.lock().await.applied(Action::Record))
+                    .complete_sign(outpoint, position, signed)?
             }
             Effect::Publish(transaction) => {
                 let io = self.broadcaster.lock().await.broadcast(&transaction);
                 io.await.map_err(error)?;
-                Ok(execution.lock().await.applied(Action::Publish))
+                execution.lock().await.applied(Action::Publish)
             }
+        };
+
+        if let Update::Complete(payment) = &update
+            && !execution.lock().await.retained
+        {
+            let io = self.recorder.lock().await.record(&payment.transaction);
+            io.await.map_err(error)?;
+            execution.lock().await.mark_retained();
         }
+        Ok(update)
     }
 }
 

@@ -45,7 +45,7 @@ pub trait SnapshotSource: Send {
     ) -> impl Future<Output = Result<Snapshot, Self::Error>> + Send + use<Self>;
 }
 
-/// Script allocation is an effect; pricing change need not allocate a script.
+/// Assigning a script is an effect; pricing change need not query the wallet.
 pub trait ChangeSource: Send {
     type Error: Error + Send + Sync + 'static;
 

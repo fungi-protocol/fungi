@@ -1,4 +1,4 @@
-//! Verify change allocations and the ordered transaction before signing.
+//! Verify composed change outputs and the ordered transaction before signing.
 
 use super::{Error, error};
 use bitcoin::{
@@ -12,7 +12,7 @@ pub(super) fn change(output: &TxOut, priced: &OutputWithoutScriptpubkey) -> Resu
         || output.script_pubkey.minimal_non_dust() != priced.dust
         || output.value < priced.dust
     {
-        return Err(error("allocated change differs from its priced template"));
+        return Err(error("composed change differs from its priced template"));
     }
     Ok(())
 }
@@ -83,7 +83,7 @@ mod tests {
     use bitcoin::{ScriptBuf, Transaction, TxIn, Txid, Weight, Witness, hashes::Hash};
 
     #[test]
-    fn allocated_change_matches_weight_and_dust_price() {
+    fn composed_change_matches_weight_and_dust_price() {
         let script = ScriptBuf::from_bytes([vec![0x51, 0x20], vec![0; 32]].concat());
         let non_witness = ScriptBuf::from_bytes(vec![0x51; script.len()]);
         let at_dust = TxOut::minimal_non_dust(script);

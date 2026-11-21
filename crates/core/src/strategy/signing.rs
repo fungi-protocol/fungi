@@ -33,7 +33,7 @@ pub(super) fn apply(
     else {
         return Err(error("expected a default-sighash P2TR key-spend witness"));
     };
-    // Freeze validates these prevouts against the pricing snapshot. Signers
+    // Ordering validates these prevouts against the pricing snapshot. Signers
     // can only contribute the witness, so every signature uses the same prevouts.
     let prevouts: Vec<_> = psbt
         .unsigned_tx
