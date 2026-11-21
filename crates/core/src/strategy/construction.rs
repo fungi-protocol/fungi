@@ -1,6 +1,6 @@
 //! Construction state and effect receipts for one transaction.
 
-use super::{Action, Error, Payment, Plan, Update, error, identity, signing, validate};
+use super::{Action, Error, ExecutionContext, Payment, Update, error, identity, signing, validate};
 use crate::wallet::{Coin, Snapshot};
 use bitcoin::{Amount, OutPoint, Psbt, ScriptBuf, Sequence, TxOut, absolute, psbt, transaction};
 use concurrent_psbt::{
@@ -56,7 +56,7 @@ pub(super) enum Effect {
 }
 
 pub(super) struct Execution {
-    pub(super) plan: Arc<Plan>,
+    pub(super) context: Arc<ExecutionContext>,
     construction: Construction,
     scripts: BTreeMap<usize, ScriptBuf>,
     results: BTreeMap<Action, Update>,
@@ -76,7 +76,7 @@ fn priced_prevout<'a>(snapshot: &'a Snapshot, coin: &Utxo) -> Result<&'a Coin, E
 }
 
 impl Execution {
-    pub(super) fn new(plan: Arc<Plan>) -> Result<Self, Error> {
+    pub(super) fn new(context: Arc<ExecutionContext>) -> Result<Self, Error> {
         // These transaction fields and derived-key ordering are PoC policy choices.
         let mut initial = psbt_v2::v2::Creator::new()
             .transaction_version(transaction::Version::TWO)
@@ -86,7 +86,7 @@ impl Execution {
         for (subtype, value) in [
             (PSBT_GLOBAL_TX_UNORDERED_SUBTYPE, vec![3]),
             (PSBT_GLOBAL_SORT_KEY_DERIVATION_SUBTYPE, vec![1]),
-            (PSBT_GLOBAL_TX_UUID_SUBTYPE, plan.session_id.to_vec()),
+            (PSBT_GLOBAL_TX_UUID_SUBTYPE, context.session_id.to_vec()),
         ] {
             initial.global.proprietaries.insert(
                 psbt_v2::raw::ProprietaryKey {
@@ -99,7 +99,7 @@ impl Execution {
         }
         Inputs::try_from_psbt(initial.clone()).map_err(error)?;
         Ok(Self {
-            plan,
+            context,
             construction: Construction::Active(initial),
             scripts: BTreeMap::new(),
             locks: BTreeMap::new(),
@@ -115,8 +115,8 @@ impl Execution {
             Action::CloseInputs => {
                 let mut constructor =
                     Inputs::try_from_psbt(self.active()?.clone()).map_err(error)?;
-                for coin in self.plan.candidate.inputs() {
-                    let prevout = priced_prevout(&self.plan.snapshot, coin)?;
+                for coin in self.context.candidate.inputs() {
+                    let prevout = priced_prevout(&self.context.snapshot, coin)?;
                     if !prevout.txout.script_pubkey.is_p2tr() {
                         return Err(error("PoC signer path only supports P2TR key spends"));
                     }
@@ -131,7 +131,7 @@ impl Execution {
             Action::AllocateChange(id) => {
                 self.outputs()?;
                 let (index, priced) = self
-                    .plan
+                    .context
                     .candidate
                     .change()
                     .enumerate()
@@ -147,16 +147,22 @@ impl Execution {
                 return Ok(Effect::AllocateChange { index, priced });
             }
             Action::CloseOutputs => {
-                if self.plan.candidate.change().enumerate().any(|(index, _)| {
-                    !self
-                        .results
-                        .contains_key(&Action::AllocateChange(identity::change(index)))
-                }) {
+                if self
+                    .context
+                    .candidate
+                    .change()
+                    .enumerate()
+                    .any(|(index, _)| {
+                        !self
+                            .results
+                            .contains_key(&Action::AllocateChange(identity::change(index)))
+                    })
+                {
                     return Err(error("output contributions are incomplete"));
                 }
                 let mut constructor = self.outputs()?;
-                let count =
-                    self.plan.candidate.payments().count() + self.plan.candidate.change().count();
+                let count = self.context.candidate.payments().count()
+                    + self.context.candidate.change().count();
                 for index in 0..count {
                     let (id, output) = self.output(index)?;
                     constructor = constructor
@@ -185,7 +191,7 @@ impl Execution {
             }
             Action::Sign(outpoint) => {
                 if !self
-                    .plan
+                    .context
                     .candidate
                     .inputs()
                     .any(|coin| coin.outpoint() == outpoint)
@@ -207,7 +213,7 @@ impl Execution {
             }
             Action::Finalize => {
                 if self
-                    .plan
+                    .context
                     .candidate
                     .inputs()
                     .any(|coin| !self.results.contains_key(&Action::Sign(coin.outpoint())))
@@ -216,7 +222,7 @@ impl Execution {
                 }
                 let Frozen { psbt, outputs, fee } = self.construction.frozen()?;
                 let transaction = psbt.clone().extract_tx().map_err(error)?;
-                signing::validate_feerate(*fee, transaction.weight(), self.plan.feerate)?;
+                signing::validate_feerate(*fee, transaction.weight(), self.context.feerate)?;
                 let result = Update::Finalized(Payment {
                     transaction,
                     outputs: outputs.clone(),
@@ -260,7 +266,7 @@ impl Execution {
         position: usize,
         signed: psbt::Input,
     ) -> Result<Update, Error> {
-        let snapshot = &self.plan.snapshot;
+        let snapshot = &self.context.snapshot;
         let psbt = &mut self.construction.frozen()?.psbt;
         signing::apply(psbt, snapshot, position, signed)?;
         self.results.insert(Action::Sign(outpoint), Update::Applied);
@@ -292,8 +298,8 @@ impl Execution {
     }
 
     fn output(&self, index: usize) -> Result<(UniqueId, TxOut), Error> {
-        let payments = self.plan.candidate.payments().count();
-        if let Some((&id, output)) = self.plan.candidate.payments().nth(index) {
+        let payments = self.context.candidate.payments().count();
+        if let Some((&id, output)) = self.context.candidate.payments().nth(index) {
             return Ok((identity::payment(id), output.clone()));
         }
 
@@ -305,7 +311,7 @@ impl Execution {
             return Err(error("change allocation has not succeeded"));
         }
         let priced = self
-            .plan
+            .context
             .candidate
             .change()
             .nth(change)
@@ -322,12 +328,12 @@ impl Execution {
 
     fn validate(&self, psbt: &Psbt) -> Result<Amount, Error> {
         let expected_outputs = self
-            .plan
+            .context
             .candidate
             .payments()
             .map(|(_, output)| output.clone())
             .chain(
-                self.plan
+                self.context
                     .candidate
                     .change()
                     .enumerate()
@@ -335,23 +341,23 @@ impl Execution {
             )
             .collect();
         let expected_inputs = self
-            .plan
+            .context
             .candidate
             .inputs()
             .map(|coin| {
                 let outpoint = coin.outpoint();
-                (outpoint, &self.plan.snapshot.coins[&outpoint].txout)
+                (outpoint, &self.context.snapshot.coins[&outpoint].txout)
             })
             .collect();
         validate::transaction(psbt, expected_outputs, expected_inputs)?;
         validate::accounting(
-            self.plan.candidate.inputs().map(|coin| coin.value()),
+            self.context.candidate.inputs().map(|coin| coin.value()),
             psbt.unsigned_tx.output.iter().map(|output| output.value),
-            self.plan
+            self.context
                 .candidate
                 .payments()
                 .map(|(_, output)| output.value),
-            self.plan.candidate.objective_cost(),
+            self.context.candidate.objective_cost(),
         )
     }
 }
@@ -421,7 +427,7 @@ mod prevout_tests {
             .funded_candidate(feerate, &mut StdRng::seed_from_u64(0), &change)
             .unwrap()
             .unwrap();
-        Execution::new(Arc::new(Plan {
+        Execution::new(Arc::new(ExecutionContext {
             execution_id: ExecutionId {
                 wallet: [1; 16],
                 sequence: 0,
@@ -447,8 +453,8 @@ mod prevout_tests {
         );
 
         execution.prepare(&Action::CloseInputs).unwrap();
-        let payments = execution.plan.candidate.payments().count();
-        assert_eq!(execution.plan.candidate.change().count(), 1);
+        let payments = execution.context.candidate.payments().count();
+        assert_eq!(execution.context.candidate.change().count(), 1);
         assert_eq!(
             execution.output(payments).unwrap_err().0,
             "change allocation has not succeeded"

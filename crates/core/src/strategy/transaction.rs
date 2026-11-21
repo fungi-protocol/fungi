@@ -1,7 +1,8 @@
 //! The current execution path and results for one transaction.
 
 use super::{
-    Action, Error, Observation, Payment, Plan, Request, Status, Update, error, path::Path,
+    Action, Error, ExecutionContext, Observation, Payment, Request, Status, Update, error,
+    path::Path,
 };
 use cost_function::candidate::Candidate;
 use std::{
@@ -10,7 +11,7 @@ use std::{
 };
 
 pub struct Transaction {
-    plan: Arc<Plan>,
+    context: Arc<ExecutionContext>,
     path: Path,
     status: Status,
     payment: Option<Payment>,
@@ -20,10 +21,10 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    pub(super) fn new(plan: Arc<Plan>) -> Self {
+    pub(super) fn new(context: Arc<ExecutionContext>) -> Self {
         Self {
-            path: Path::new(&plan.candidate),
-            plan,
+            path: Path::new(&context.candidate),
+            context,
             status: Status::Running,
             payment: None,
             completed: BTreeSet::new(),
@@ -32,11 +33,11 @@ impl Transaction {
         }
     }
     pub fn candidate(&self) -> &Candidate<u64> {
-        &self.plan.candidate
+        &self.context.candidate
     }
     /// The construction-session UUID retained for this execution's retries.
     pub fn construction_session_id(&self) -> [u8; 16] {
-        self.plan.session_id
+        self.context.session_id
     }
     pub fn status(&self) -> &Status {
         &self.status
@@ -62,7 +63,7 @@ impl Transaction {
                     && self.path.enabled(action, &self.completed)
             })
             .map(|action| Request {
-                plan: self.plan.clone(),
+                context: self.context.clone(),
                 action: action.clone(),
             })
     }
@@ -71,7 +72,7 @@ impl Transaction {
         if self.status != Status::Running {
             return;
         }
-        if !Arc::ptr_eq(&self.plan, &request.plan)
+        if !Arc::ptr_eq(&self.context, &request.context)
             || !self.path.enabled(&request.action, &self.completed)
         {
             self.status = Status::Failed(error("action prerequisites are not satisfied"));

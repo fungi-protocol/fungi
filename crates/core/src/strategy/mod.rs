@@ -1,8 +1,20 @@
 //! Wallet strategy and execution state.
 //!
-//! The tactic chooses a complete outcome. A `Plan` binds one candidate, the
-//! snapshot used to price it and its execution identity. The executor realizes
-//! that candidate; it does not make coin-selection or output-policy decisions.
+//! Tactics generate potential outcomes and actions for consideration. These
+//! include outcomes from intent queue partitioning, coin selection and change
+//! making. After outcomes are evaluated, other tactics generate the decision
+//! tree. Its leaves are desired outcomes. A plan is a sequence of actions from
+//! the present state to one desired outcome; different plans make up the tree
+//! and can share prefix paths.
+//!
+//! This PoC generates one initial outcome consisting of disjoint transaction
+//! batches. For each batch, an `ExecutionContext` retains the selected
+//! `Candidate` and the feerate used to price it. It also retains the original
+//! planning-time wallet `Snapshot`—the owned coins and signed transactions
+//! observed then—for input validation and signing. `ExecutionId` is local: it
+//! pairs the wallet ID with the batch sequence, independently of the
+//! construction-session UUID shared with peers. The executor realizes the
+//! candidate; it does not make coin-selection or output-policy decisions.
 //!
 //! # Construction state machine
 //!
@@ -69,7 +81,7 @@ pub struct ExecutionId {
     pub sequence: u64,
 }
 
-struct Plan {
+struct ExecutionContext {
     execution_id: ExecutionId,
     candidate: Candidate<u64>,
     snapshot: Snapshot,
@@ -131,7 +143,7 @@ impl Ord for Action {
 /// An action bound to the candidate evaluated by the decision process.
 #[derive(Clone)]
 pub struct Request {
-    plan: Arc<Plan>,
+    context: Arc<ExecutionContext>,
     pub action: Action,
 }
 
@@ -139,7 +151,7 @@ pub type OperationId = (ExecutionId, Action);
 
 impl Request {
     pub fn id(&self) -> OperationId {
-        (self.plan.execution_id, self.action.clone())
+        (self.context.execution_id, self.action.clone())
     }
 }
 
@@ -304,7 +316,7 @@ impl<C: ChangeCosts, R: CryptoRng, S: TryCryptoRng> State<C, R, S> {
                     };
                     transactions.insert(
                         execution_id,
-                        Transaction::new(Arc::new(Plan {
+                        Transaction::new(Arc::new(ExecutionContext {
                             execution_id,
                             candidate,
                             snapshot: self.snapshot.clone(),
@@ -451,7 +463,7 @@ impl<C: ChangeCosts, R: CryptoRng, S: TryCryptoRng> Machine for State<C, R, S> {
     }
 
     fn apply(&mut self, request: Request) {
-        if let Some(tx) = self.transactions.get_mut(&request.plan.execution_id) {
+        if let Some(tx) = self.transactions.get_mut(&request.context.execution_id) {
             tx.apply(request);
         }
     }

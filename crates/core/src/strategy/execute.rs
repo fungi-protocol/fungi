@@ -79,13 +79,15 @@ impl<C: ChangeSource, S: InputSigner, R: TransactionRecorder, B: Broadcaster> Ex
     pub async fn execute(&self, request: &Request) -> Result<Update, Error> {
         let execution = {
             let mut transactions = self.transactions.lock().unwrap();
-            match transactions.entry(request.plan.execution_id) {
+            match transactions.entry(request.context.execution_id) {
                 Entry::Vacant(entry) => {
                     if request.action != Action::CloseInputs {
                         return Err(error("transaction construction has not started"));
                     }
                     entry
-                        .insert(Arc::new(Mutex::new(Execution::new(request.plan.clone())?)))
+                        .insert(Arc::new(Mutex::new(Execution::new(
+                            request.context.clone(),
+                        )?)))
                         .clone()
                 }
                 Entry::Occupied(entry) => entry.get().clone(),
@@ -93,7 +95,7 @@ impl<C: ChangeSource, S: InputSigner, R: TransactionRecorder, B: Broadcaster> Ex
         };
         let operation = {
             let mut state = execution.lock().await;
-            if !Arc::ptr_eq(&state.plan, &request.plan) {
+            if !Arc::ptr_eq(&state.context, &request.context) {
                 return Err(error("execution belongs to a different candidate"));
             }
             state
