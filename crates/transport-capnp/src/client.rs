@@ -15,7 +15,7 @@ pub(super) type PendingReceive = Option<oneshot::Receiver<Result<Vec<u8>, RecvEr
 
 pub(super) enum ChannelCommand {
     Send(Vec<u8>, Reply<Result<(), SendError>>, OwnedSemaphorePermit),
-    Recv(Reply<Result<Vec<u8>, RecvError>>),
+    Recv(Reply<Result<Vec<u8>, RecvError>>, usize),
 }
 #[derive(Debug)]
 pub(super) struct Link {
@@ -165,7 +165,7 @@ async fn dispatch_channel(remote: RemoteChannel, command: ChannelCommand) {
             let _ = reply.send(result);
             drop(permit);
         }
-        ChannelCommand::Recv(reply) => {
+        ChannelCommand::Recv(reply, max) => {
             let result = async {
                 let response = remote
                     .recv_request()
@@ -182,7 +182,14 @@ async fn dispatch_channel(remote: RemoteChannel, command: ChannelCommand) {
                     .map_err(capnp::Error::from)
                     .map_err(rpc_recv_error)?
                 {
-                    rpc_result::Ok(message) => Ok(message.map_err(rpc_recv_error)?.to_vec()),
+                    rpc_result::Ok(message) => {
+                        let message = message.map_err(rpc_recv_error)?;
+                        if message.len() > max {
+                            Err(RecvError::TooLarge { max })
+                        } else {
+                            Ok(message.to_vec())
+                        }
+                    }
                     rpc_result::Err(error) => match error
                         .map_err(rpc_recv_error)?
                         .which()
