@@ -10,7 +10,11 @@
       craneLib = toolchains.nightly;
       workspaceSpecs = import ./workspaces.nix { inherit pkgs; };
       repoRoot = ../.;
-      src = craneLib.cleanCargoSource repoRoot;
+      src = pkgs.lib.cleanSourceWith {
+        src = repoRoot;
+        name = "source";
+        filter = path: type: craneLib.filterCargoSources path type || pkgs.lib.hasSuffix ".capnp" path;
+      };
 
       mkWorkspace =
         name: spec:
@@ -26,6 +30,7 @@
           commonArgs = {
             inherit src;
             buildInputs = spec.buildInputs or [ ];
+            nativeBuildInputs = spec.nativeBuildInputs or [ ];
             cargoToml = manifest;
             pname = name;
             strictDeps = true;
