@@ -4,6 +4,8 @@
 
 mod amount;
 pub mod fields;
+#[expect(unused, reason = "no message is defined outside the tests yet")]
+mod tlv_struct;
 mod unique_id;
 
 #[cfg(test)]
@@ -22,6 +24,12 @@ pub enum Error {
     /// The fields of the value could not be read.
     #[error(transparent)]
     Fields(#[from] fields::Error),
+    /// A required field is absent.
+    #[error("missing field type {ty}")]
+    Missing {
+        /// The type of the field.
+        ty: u64,
+    },
     /// A fixed-size value has another length.
     #[error(transparent)]
     WrongLength(#[from] fields::WrongLength),
@@ -34,6 +42,15 @@ pub enum Error {
         /// The amount, in satoshis.
         amount: u64,
     },
+}
+
+impl From<fields::RequiredError> for Error {
+    fn from(error: fields::RequiredError) -> Self {
+        match error {
+            fields::RequiredError::Read(error) => Self::Fields(error),
+            fields::RequiredError::Missing { ty } => Self::Missing { ty },
+        }
+    }
 }
 
 /// A value that is the payload of one TLV record. The trait carries no record
