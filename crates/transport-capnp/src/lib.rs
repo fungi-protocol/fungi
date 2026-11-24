@@ -12,7 +12,7 @@ mod error;
 mod protocol;
 mod server;
 
-pub use builder::CapnpBuilder;
+pub use builder::{CapnpAcceptor, CapnpBuilder};
 pub use channel::{CapnpBidirectional, CapnpChannel, CapnpRecvHalf, CapnpSendHalf};
 pub use error::{BuildError, RecvError, SendError};
 pub use server::{serve, serve_builder};
