@@ -8,6 +8,7 @@ manifest_path=$2
 cargo llvm-cov nextest \
   --manifest-path "$manifest_path" \
   --workspace \
+  --all-features \
   --no-report \
   --remap-path-prefix
 
