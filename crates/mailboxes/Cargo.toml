@@ -1,0 +1,22 @@
+[package]
+name = "fungi-mailboxes"
+description = "Encrypted payloads for mailboxes derived from a shared secret"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+fungi-aead = { path = "../aead" }
+hkdf = "0.12"
+sha2 = { version = "0.10", default-features = false }
+thiserror = "2"
+zeroize = { version = "1", default-features = false, features = ["derive"] }
+
+[dev-dependencies]
+fungi-hpke = { path = "../hpke" }
+hpke = { version = "0.14.1", default-features = false, features = [
+  "mlkem",
+  "x25519",
+] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
