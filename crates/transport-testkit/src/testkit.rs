@@ -1,8 +1,11 @@
 //! Reusable conformance checks for byte channel implementations.
 //!
 //! Supply fresh channels and select checks for the backend's guarantees.
-//! Recovery after size rejection is an additional property, not a requirement
-//! of the traits.
+//! Cancellation safety and recovery after size rejection are additional
+//! properties, not requirements of the traits.
+
+use std::future::Future;
+use std::time::Duration;
 
 use fungi_transport::{RecvChannel, SendChannel};
 use futures_util::future::{Either, FusedFuture, FutureExt};
@@ -15,6 +18,68 @@ pub async fn roundtrip_both_directions<C: SendChannel<Vec<u8>> + RecvChannel<Vec
     assert_eq!(exchange(&mut left, &mut right, b"first").await, b"first");
     assert_eq!(exchange(&mut left, &mut right, b"second").await, b"second");
     assert_eq!(exchange(&mut right, &mut left, b"reply").await, b"reply");
+}
+
+/// Verify messages remain available across repeated receive cancellation.
+///
+/// The receiver must wait while no message is available; a receive that never
+/// waits has nothing to cancel.
+pub async fn recv_is_cancel_safe<S: SendChannel<Vec<u8>>, R: RecvChannel<Vec<u8>>>(
+    mut sender: S,
+    mut receiver: R,
+) {
+    for _ in 0..10 {
+        let attempt = tokio::time::timeout(Duration::from_millis(5), receiver.recv()).await;
+        assert!(
+            attempt.is_err(),
+            "recv must wait while no message is available"
+        );
+    }
+
+    // Cancel both when the accepted message may already be inside the receive
+    // future and after one further poll may have moved it there.
+    for poll_after_send in [false, true] {
+        let mut receiving = Box::pin(receiver.recv());
+        let state =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(receiving.as_mut().poll(cx))).await;
+        assert!(
+            state.is_pending(),
+            "recv must wait while no message is available"
+        );
+        let sending = sender.send(b"message".to_vec());
+        tokio::pin!(sending);
+        // Retain both futures so peer reception can release submission backpressure.
+        // Poll submission first so acceptance is observed before the receive
+        // future can return what it holds.
+        let state = tokio::select! {
+            biased;
+            sent = &mut sending => {
+                sent.unwrap();
+                if poll_after_send {
+                    std::future::poll_fn(|cx| std::task::Poll::Ready(receiving.as_mut().poll(cx)))
+                        .await
+                } else {
+                    std::task::Poll::Pending
+                }
+            }
+            message = &mut receiving => {
+                sending.await.unwrap();
+                std::task::Poll::Ready(message)
+            }
+        };
+        let completed = match state {
+            std::task::Poll::Ready(result) => Some(result),
+            std::task::Poll::Pending => None,
+        };
+        drop(receiving);
+        let message = match completed {
+            Some(result) => result,
+            None => tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+                .await
+                .expect("canceling receive must not lose an accepted message"),
+        };
+        assert_eq!(message.unwrap(), b"message");
+    }
 }
 
 /// Verify rejection of a payload above the declared limit.
