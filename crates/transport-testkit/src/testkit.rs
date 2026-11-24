@@ -1,13 +1,14 @@
 //! Reusable conformance checks for byte channel implementations.
 //!
 //! Supply fresh channels and select checks for the backend's guarantees.
-//! Cancellation safety and recovery after size rejection are additional
-//! properties, not requirements of the traits.
+//! Cancellation safety, duplicate-free delivery, and recovery after size
+//! rejection are additional properties, not requirements of the traits.
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::time::Duration;
 
-use fungi_transport::{RecvChannel, SendChannel};
+use fungi_transport::{Duplex, RecvChannel, SendChannel};
 use futures_util::future::{Either, FusedFuture, FutureExt};
 
 /// Verify intact delivery in both directions.
@@ -156,6 +157,55 @@ async fn submit_oversized<S: SendChannel<Vec<u8>>, E>(
             received.len()
         ),
     }
+}
+
+/// Verify that each side receives the peer's burst under backpressure, in any order.
+///
+/// Each of the `burst` receptions must be a distinct message of the burst;
+/// later receptions are not observed. Requires independent directions and
+/// completion within five seconds.
+pub async fn mutual_bursts_converge<S, R>(left: Duplex<S, R>, right: Duplex<S, R>, burst: usize)
+where
+    S: SendChannel<Vec<u8>>,
+    R: RecvChannel<Vec<u8>>,
+{
+    async fn drive<S, R>(channel: Duplex<S, R>, tag: u8, peer_tag: u8, burst: usize)
+    where
+        S: SendChannel<Vec<u8>>,
+        R: RecvChannel<Vec<u8>>,
+    {
+        let (mut sender, mut receiver) = channel.into_parts();
+        let sending = async move {
+            for index in 0..burst {
+                let message = std::iter::once(tag).chain(index.to_le_bytes()).collect();
+                sender.send(message).await.unwrap();
+            }
+        };
+        let receiving = async move {
+            let mut expected: BTreeSet<Vec<u8>> = (0..burst)
+                .map(|index| {
+                    std::iter::once(peer_tag)
+                        .chain(index.to_le_bytes())
+                        .collect()
+                })
+                .collect();
+            for _ in 0..burst {
+                let message = receiver.recv().await.unwrap();
+                assert!(
+                    expected.remove(&message),
+                    "unexpected or duplicate burst message: {message:?}"
+                );
+            }
+        };
+        futures_util::future::join(sending, receiving).await;
+    }
+    let bursts = futures_util::future::join(
+        drive(left, b'l', b'r', burst),
+        drive(right, b'r', b'l', burst),
+    );
+    tokio::time::timeout(Duration::from_secs(5), bursts)
+        .await
+        .expect("mutual bursts must make progress");
 }
 
 /// Send `message` while the other end receives it, failing as soon as either
