@@ -14,5 +14,9 @@ tokio = { version = "1", features = ["macros", "sync", "time"] }
 futures-util = "0.3"
 tokio = { version = "1", features = ["macros", "rt", "test-util"] }
 
+[[example]]
+name = "offline-peers"
+test = true
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
