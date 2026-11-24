@@ -31,3 +31,21 @@ pub enum RecvError {
     #[error("transport: {0}")]
     Transport(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
+
+/// A remote construction or RPC link failure.
+#[derive(Debug, thiserror::Error)]
+pub enum BuildError {
+    /// The RPC link or backend connection is unavailable.
+    #[error("RPC construction path unavailable")]
+    Unreachable,
+    /// The input is above what one RPC frame carries. Nothing was sent, and
+    /// the builder remains usable.
+    #[error("build input exceeds {max} bytes")]
+    InputTooLarge {
+        /// Largest accepted input in bytes.
+        max: usize,
+    },
+    /// An RPC or backend failure, preserving its cause locally.
+    #[error("transport: {0}")]
+    Transport(#[source] Box<dyn std::error::Error + Send + Sync>),
+}
