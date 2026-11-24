@@ -1,6 +1,6 @@
 [package]
 name = "fungi-mailboxes"
-description = "Encrypted payloads for mailboxes derived from a shared secret"
+description = "Encrypted simplex messages through mailboxes derived from a shared secret"
 version.workspace = true
 edition.workspace = true
 
@@ -16,6 +16,14 @@ fungi-hpke = { path = "../hpke" }
 hpke = { version = "0.14.1", default-features = false, features = [
   "mlkem",
   "x25519",
+] }
+proptest = "1"
+tokio = { version = "1", features = [
+  "macros",
+  "rt",
+  "sync",
+  "test-util",
+  "time",
 ] }
 
 [lints.rust]
