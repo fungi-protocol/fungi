@@ -24,10 +24,12 @@
                 cargoArtifacts = cargoWorkspace.cargoArtifactsDev;
                 CARGO_PROFILE = "dev";
                 pnameSuffix = "-mutants";
-                nativeBuildInputs = with pkgs; [
-                  cargo-mutants
-                  cargo-nextest
-                ];
+                nativeBuildInputs =
+                  cargoWorkspace.commonArgs.nativeBuildInputs
+                  ++ (with pkgs; [
+                    cargo-mutants
+                    cargo-nextest
+                  ]);
                 buildPhaseCargoCommand = "cargo mutants --manifest-path ${pkgs.lib.escapeShellArg "./${cargoWorkspace.cargoManifestPath}"} --workspace --in-place --test-tool nextest";
                 installPhase = "mkdir -p $out";
               }
