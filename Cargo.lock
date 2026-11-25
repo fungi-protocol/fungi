@@ -1127,6 +1127,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fungi-messages"
+version = "0.0.0"
+dependencies = [
+ "bitcoin-units",
+ "fungi-transport",
+ "proptest",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "fungi-ohttp"
 version = "0.0.0"
 dependencies = [

@@ -1,0 +1,16 @@
+[package]
+name = "fungi-messages"
+description = "Fungi protocol messages and their TLV encoding"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bitcoin-units = "=0.1.101"
+fungi-transport = { path = "../transport" }
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "=1.11.0"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
