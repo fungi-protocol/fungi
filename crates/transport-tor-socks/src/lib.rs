@@ -2,5 +2,13 @@
 
 //! Message channels through an external tor daemon.
 
+mod connector;
 pub mod message_stream;
 pub mod onion;
+mod socks5;
+
+pub use connector::{ConnectError, Connector, Identity};
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod testing;
