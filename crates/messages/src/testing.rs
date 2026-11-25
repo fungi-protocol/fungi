@@ -24,3 +24,11 @@ pub(crate) fn hex(encoded: &str) -> Vec<u8> {
         .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
         .collect()
 }
+
+/// Returns a fee contribution of `satoshis` whose ID is 16 bytes of 7.
+pub(crate) fn contribution(satoshis: u64) -> crate::FeeContribution {
+    crate::FeeContribution::new(
+        crate::UniqueId::from([7; 16]),
+        crate::Amount::from_sat(satoshis).try_into().unwrap(),
+    )
+}
