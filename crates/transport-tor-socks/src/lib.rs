@@ -2,4 +2,5 @@
 
 //! Message channels through an external tor daemon.
 
+pub mod message_stream;
 pub mod onion;
