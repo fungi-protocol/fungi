@@ -1,6 +1,6 @@
 //! What the wallet owns, and what it has been asked to do.
 
-use bitcoin::{Amount, FeeRate, OutPoint, TxIn, TxOut, Weight};
+use bitcoin::{Amount, FeeRate, OutPoint, TxOut, Weight};
 use rand::RngCore;
 use std::collections::{BTreeMap, HashSet};
 
@@ -28,15 +28,6 @@ impl Utxo {
             outpoint,
             value,
             satisfaction_weight,
-        }
-    }
-
-    pub(crate) fn to_txin(&self) -> TxIn {
-        TxIn {
-            previous_output: self.outpoint,
-            // TODO: nsequence must match wallet preferences and should be consistent across the
-            // whole collaborative session.
-            ..Default::default()
         }
     }
 }
@@ -75,7 +66,7 @@ impl<Q: Queue, U: UtxoSnapshot> WalletStateSnapshot<Q, U> {
         selector: &S,
         rng: &mut R,
         change_strategy: &ChangeStrategy<C, A>,
-    ) -> PlanResult<S::Error, C::Error, A::Error>
+    ) -> PlanResult<S::Error, C::Error>
     where
         S: CoinSelector,
         C: ChangeSelector,
@@ -116,7 +107,6 @@ impl<Q: Queue, U: UtxoSnapshot> WalletStateSnapshot<Q, U> {
         let change = change_strategy
             .change(&selection, feerate)
             .map_err(PlanError::Change)?;
-        let change = change_strategy.assign(&change).map_err(PlanError::Assign)?;
 
         let tree = DecisionTree::Leaf(Leaf {
             inputs: selection.selected_inputs,
@@ -134,22 +124,21 @@ impl<Q: Queue, U: UtxoSnapshot> WalletStateSnapshot<Q, U> {
 }
 
 /// The actions of the best plan, `None` if there is nothing to do.
-pub(crate) type PlanResult<S, C, A> = Result<Option<UnSequencedActions>, PlanError<S, C, A>>;
+pub(crate) type PlanResult<S, C> = Result<Option<UnSequencedActions>, PlanError<S, C>>;
 
 /// Why a plan could not be built.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum PlanError<S, C, A> {
+pub(crate) enum PlanError<S, C> {
     /// The coins could not fund the payments.
     Selection(S),
     /// The surplus could not be split into change.
     Change(C),
-    /// The change could not be given scriptpubkeys.
-    Assign(A),
 }
 
 #[cfg(test)]
 mod tests {
     use crate::action::Action;
+    use crate::change::OutputWithoutScriptpubkey;
     use crate::change::single_output::SingleOutputChangeSelector;
     use crate::change::tests::DummySPKAssigner;
     use crate::intent::{FixedPaymentInstructions, Outcome, PayoffCurve};
@@ -157,7 +146,7 @@ mod tests {
     use crate::selection::random::{RandomSelectionError, RandomSelector};
 
     use super::*;
-    use bitcoin::{ScriptBuf, Sequence, Txid, hashes::Hash};
+    use bitcoin::{ScriptBuf, Txid, hashes::Hash};
     use rand::{SeedableRng, rngs::StdRng};
     use std::convert::Infallible;
     use std::time::Instant;
@@ -187,7 +176,7 @@ mod tests {
         }
     }
 
-    type Plan = PlanResult<RandomSelectionError, Infallible, Infallible>;
+    type Plan = PlanResult<RandomSelectionError, Infallible>;
 
     fn best_plan(utxos: impl IntoIterator<Item = Utxo>, intents: &[u64]) -> Plan {
         let start = Instant::now();
@@ -221,10 +210,15 @@ mod tests {
         assert_eq!(
             best_plan([utxo(0, 10_000)], &[1_000, 1_000]),
             Ok(Some(UnSequencedActions(vec![
-                Action::RegisterInput(utxo(0, 10_000).to_txin()),
-                Action::RegisterOutput(op_true_output(1_000)),
-                Action::RegisterOutput(op_true_output(1_000)),
-                Action::RegisterOutput(op_true_output(7_919)),
+                Action::Input(utxo(0, 10_000)),
+                Action::Output(op_true_output(1_000)),
+                Action::Output(op_true_output(1_000)),
+                Action::SelfSpendOutput(OutputWithoutScriptpubkey {
+                    value: Amount::from_sat(7_919),
+                    weight: Weight::from_wu(40),
+                    satisfaction_weight: Weight::ZERO,
+                    dust: Amount::from_sat(474),
+                }),
             ])))
         );
     }
@@ -247,19 +241,6 @@ mod tests {
             Err(PlanError::Selection(
                 RandomSelectionError::NoCombinationCovers
             ))
-        );
-    }
-
-    #[test]
-    fn a_coin_becomes_an_unsigned_input_spending_its_outpoint() {
-        assert_eq!(
-            utxo(3, 10_000).to_txin(),
-            TxIn {
-                previous_output: OutPoint::new(Txid::all_zeros(), 3),
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
-                witness: bitcoin::Witness::new(),
-            }
         );
     }
 }

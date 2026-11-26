@@ -1,14 +1,21 @@
 //! Steps the wallet takes to construct a transaction.
 
-use bitcoin::{TxIn, TxOut};
+use bitcoin::TxOut;
+
+use crate::change::OutputWithoutScriptpubkey;
+use crate::wallet::Utxo;
 
 /// One step in constructing a transaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Action {
-    /// Add an input to the transaction.
-    RegisterInput(TxIn),
+    /// Spend a coin the wallet holds.
+    // TODO: nsequence must match wallet preferences and should be consistent across the
+    // whole collaborative session.
+    Input(Utxo),
     /// Add an output to the transaction.
-    RegisterOutput(TxOut),
+    Output(TxOut),
+    /// Add an output that pays back to the wallet.
+    SelfSpendOutput(OutputWithoutScriptpubkey),
 }
 
 /// Actions without a known time of execution

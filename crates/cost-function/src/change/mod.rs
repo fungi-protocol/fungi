@@ -190,4 +190,19 @@ pub(crate) mod tests {
     fn change_pushed_below_its_dust_value_by_its_fee_is_dropped() {
         assert_eq!(change(483), Ok(vec![]));
     }
+
+    #[test]
+    fn assigning_pays_each_output_its_value_at_its_scriptpubkey() {
+        let strategy =
+            ChangeStrategy::new(single_output::SingleOutputChangeSelector, DummySPKAssigner);
+        let txout = |sats| TxOut {
+            value: Amount::from_sat(sats),
+            script_pubkey: op_true(),
+        };
+
+        assert_eq!(
+            strategy.assign(&[output(474), output(500)]),
+            Ok(vec![txout(474), txout(500)])
+        );
+    }
 }
