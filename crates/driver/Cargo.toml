@@ -1,0 +1,11 @@
+[package]
+name = "fungi-driver"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+fungi-core = { path = "../core" }
+futures = "0.3"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }

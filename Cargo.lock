@@ -1118,6 +1118,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "fungi-driver"
+version = "0.0.0"
+dependencies = [
+ "fungi-core",
+ "futures",
+]
+
+[[package]]
 name = "fungi-hpke"
 version = "0.0.0"
 dependencies = [
