@@ -7,12 +7,13 @@ edition.workspace = true
 [dependencies]
 fungi-mailboxes = { path = "../mailboxes" }
 fungi-ohttp = { path = "../ohttp" }
+fungi-transport = { path = "../transport" }
 thiserror = "2"
 
 [dev-dependencies]
 bhttp = "0.7.2"
 bitcoin-ohttp = "0.6.0"
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { version = "1", features = ["macros", "rt", "test-util", "time"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
