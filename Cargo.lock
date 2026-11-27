@@ -1135,8 +1135,10 @@ dependencies = [
  "fungi-transport",
  "hkdf 0.12.4",
  "hpke",
+ "proptest",
  "sha2 0.10.9",
  "thiserror 2.0.20",
+ "tokio",
  "zeroize",
 ]
 
