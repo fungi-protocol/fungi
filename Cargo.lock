@@ -1111,6 +1111,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fungi-bip77-directory"
+version = "0.0.0"
+dependencies = [
+ "bhttp",
+ "bitcoin-ohttp",
+ "fungi-mailboxes",
+ "fungi-ohttp",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "fungi-core"
 version = "0.0.0"
 dependencies = [
