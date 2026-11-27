@@ -6,6 +6,7 @@ edition.workspace = true
 
 [dependencies]
 fungi-aead = { path = "../aead" }
+fungi-transport = { path = "../transport" }
 hkdf = "0.12"
 sha2 = { version = "0.10", default-features = false }
 thiserror = "2"

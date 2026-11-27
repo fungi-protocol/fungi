@@ -106,6 +106,7 @@ pub(crate) fn derive_mailbox_secret(shared_secret: &[u8; 32], index: u64) -> Mai
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
+    use fungi_transport::tlv::TypedSlice;
     use hpke::Kem as _;
 
     use super::*;
@@ -177,32 +178,40 @@ mod tests {
         let initiator = Sequences::derive(initiator_secret.as_bytes());
         let responder = Sequences::derive(responder_secret.as_bytes());
 
-        let to_responder = initiator
+        let to_responder = [TypedSlice {
+            ty: 0,
+            value: b"to responder".to_vec(),
+        }];
+        let to_initiator = [TypedSlice {
+            ty: 0,
+            value: b"to initiator".to_vec(),
+        }];
+        let sealed_to_responder = initiator
             .initiator_to_responder
             .mailbox(0)
-            .seal(b"to responder")
+            .seal(to_responder.clone())
             .unwrap();
-        let to_initiator = responder
+        let sealed_to_initiator = responder
             .responder_to_initiator
             .mailbox(0)
-            .seal(b"to initiator")
+            .seal(to_initiator.clone())
             .unwrap();
 
         assert_eq!(
             responder
                 .initiator_to_responder
                 .mailbox(0)
-                .open(&to_responder)
+                .open(&sealed_to_responder)
                 .unwrap(),
-            b"to responder"
+            to_responder
         );
         assert_eq!(
             initiator
                 .responder_to_initiator
                 .mailbox(0)
-                .open(&to_initiator)
+                .open(&sealed_to_initiator)
                 .unwrap(),
-            b"to initiator"
+            to_initiator
         );
     }
 }

@@ -1132,6 +1132,7 @@ version = "0.0.0"
 dependencies = [
  "fungi-aead",
  "fungi-hpke",
+ "fungi-transport",
  "hkdf 0.12.4",
  "hpke",
  "sha2 0.10.9",
